@@ -56,32 +56,102 @@ def cli(*args):
 # D1 — fallback must actually fall back  (both reviewers, independently)
 # ---------------------------------------------------------------------------
 
+def emitted_models(out):
+    """Every concrete model the route hands a consumer."""
+    return {m for m in [
+        out["selected_model"], out["review"]["judge_model"],
+        *out["review"]["reviewer_models"],
+    ] if m}
+
+
+# Routes chosen so that between them every role actually reaches the resolver.
+# The earlier version used one fixed route where worker_fast and
+# principal_architect were never resolved, so four of ten (role x runtime)
+# combinations were asserted about without ever being exercised.
+ROLE_FORCING_ROUTES = {
+    "worker_fast": dict(task_class="MECHANICAL"),
+    "worker_balanced": dict(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=1),
+    "senior_engineer": dict(task_class="IMPLEMENTATION", complexity=3, uncertainty=1,
+                            blast_radius=3, reversibility=2),
+    "reasoning_specialist": dict(task_class="INVESTIGATION", complexity=2, uncertainty=2,
+                                 blast_radius=2, reasoning_centric=True),
+    "principal_architect": dict(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                                blast_radius=3, reversibility=2, flags=["financial_sensitive"]),
+}
+
+
+def test_d1_every_role_is_actually_resolved_by_its_forcing_route():
+    """Guards the guard: if a route stops reaching its role, the fallback tests
+    below would pass vacuously without anyone noticing."""
+    for role, probe in ROLE_FORCING_ROUTES.items():
+        out = r(**probe)
+        touched = {out["selected_role"], *out["review"]["reviewers"], out["review"]["judge"]}
+        assert role in touched, f"{role} is never resolved by its probe route"
+
+
 def test_d1_no_fallback_returns_the_model_it_just_declared_unavailable():
-    """The原 defect: the degraded binding for a role often names the same model
-    as the default binding, so the 'fallback' was a no-op that still recorded a
-    downgrade in fallbacks_applied."""
-    for runtime, role in itertools.product(("claude_code", "codex"), ROLES):
-        out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2,
-                blast_radius=2, runtime=runtime, unavailable_roles=[role])
-        emitted = {out["selected_model"], *(m for m in out["review"]["reviewer_models"] if m)}
-        blocked = out["unavailable_models"]
-        assert not (emitted & blocked), (
-            f"{runtime}/{role}: emitted a model that was unavailable "
-            f"({emitted & blocked}); fallbacks={out['fallbacks_applied']}"
+    """The original defect: the degraded binding for a role often names the same
+    model as the default binding, so the 'fallback' was a no-op that still
+    recorded a downgrade in fallbacks_applied."""
+    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+                                                    ROLE_FORCING_ROUTES.items()):
+        out = r(**probe, runtime=runtime, unavailable_roles=[role])
+        blocked = set(out["unavailable_models"])
+        leak = emitted_models(out) & blocked
+        assert not leak, (
+            f"{runtime}/{role}: emitted an unavailable model ({leak}); "
+            f"fallbacks={out['fallbacks_applied']}"
         )
 
 
 def test_d1_fallback_note_is_only_recorded_when_the_model_actually_changed():
     """A recorded fallback that changed nothing is worse than no record — it
     reads as a managed degradation when none happened."""
-    for runtime, role in itertools.product(("claude_code", "codex"), ROLES):
-        out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2,
-                blast_radius=2, runtime=runtime, unavailable_roles=[role])
+    saw_a_real_fallback = False
+    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+                                                    ROLE_FORCING_ROUTES.items()):
+        out = r(**probe, runtime=runtime, unavailable_roles=[role])
         for note in out["fallbacks_applied"]:
             if "->" not in note:
                 continue
+            saw_a_real_fallback = True
             before, after = (s.strip() for s in note.split("->", 1))
             assert before.split(":")[-1].strip() != after, f"no-op fallback recorded: {note}"
+    assert saw_a_real_fallback, "the probe set never triggered a fallback — assertion was vacuous"
+
+
+def test_d1_bridge_down_never_crosses_the_provider_boundary():
+    """When the bridge is down the other family is unreachable by definition,
+    so naming a model from it produces a route that cannot be executed."""
+    families = {m["id"]: m["family"] for m in CFG["models"].values()}
+    local = {"claude_code": "claude", "codex": "openai"}
+    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+                                                    ROLE_FORCING_ROUTES.items()):
+        for unavailable in ([], [role]):
+            kw = dict(probe)
+            kw["flags"] = list(kw.get("flags", [])) + ["bridge_down"]
+            out = r(**kw, runtime=runtime, unavailable_roles=unavailable)
+            foreign = {m for m in emitted_models(out) if families[m] != local[runtime]}
+            assert not foreign, (
+                f"{runtime}/bridge_down/{role} unavailable={unavailable}: "
+                f"emitted unreachable-family model(s) {sorted(foreign)}"
+            )
+
+
+def test_d1_a_failed_model_is_never_re_emitted_under_a_new_role():
+    """Role-tier escalation alone is not enough: in a degraded binding the top
+    roles collapse onto one model, so 'escalating' re-ran what just failed
+    while recording a promotion that never happened."""
+    for runtime in ("claude_code", "codex"):
+        for prior in ("worker_balanced", "senior_engineer", "reasoning_specialist"):
+            out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=1, blast_radius=1,
+                    runtime=runtime, flags=["bridge_down"],
+                    prior_failures=1, prior_models=[prior])
+            if out["terminal"]:
+                continue          # failing closed is an acceptable outcome
+            failed = set(out["excluded_prior_failures"])
+            leak = emitted_models(out) & failed
+            assert not leak, f"{runtime}/{prior}: re-emitted the failed model {leak}"
 
 
 def test_d1_unavailable_accepts_model_ids_too():
@@ -89,16 +159,14 @@ def test_d1_unavailable_accepts_model_ids_too():
     for model_id in ids:
         out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2,
                 blast_radius=2, unavailable_models=[model_id])
-        emitted = {out["selected_model"], *(m for m in out["review"]["reviewer_models"] if m)}
-        assert model_id not in emitted
+        assert model_id not in emitted_models(out)
 
 
 def test_d1_multiple_simultaneous_unavailabilities():
     out = r(task_class="ARCHITECTURE", complexity=3, uncertainty=3, blast_radius=3,
             reversibility=2, flags=["financial_sensitive"],
             unavailable_roles=["principal_architect", "reasoning_specialist"])
-    emitted = {out["selected_model"], *(m for m in out["review"]["reviewer_models"] if m)}
-    assert not (emitted & out["unavailable_models"])
+    assert not (emitted_models(out) & set(out["unavailable_models"]))
     assert out["fallbacks_applied"]
 
 
@@ -170,17 +238,50 @@ def test_d4_unknown_isolation_is_never_reported_as_enforced():
     assert out["review"]["review_independence"] == "degraded"
 
 
-def test_d4_isolation_confirmed_yields_enforced():
+def test_d4_capability_attestation_alone_is_only_planned_not_enforced():
+    """A route is computed before any reviewer runs, so the caller saying
+    isolation is *possible* cannot establish that it *happened*. Treating the
+    attestation as proof let the flag alone clear the CRITICAL human gate."""
     out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
             isolation_available=True)
+    assert out["review"]["review_independence"] == "planned"
+
+
+def test_d4_only_post_dispatch_evidence_yields_enforced():
+    out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
+            isolation_available=True,
+            isolation_evidence=["session-a1b2", "session-c3d4"])
     assert out["review"]["review_independence"] == "enforced"
 
 
-def test_d4_degraded_critical_requires_human_confirmation():
+def test_d4_evidence_must_be_distinct_per_reviewer():
+    """Two reviewers in the same session is precisely the leak the requirement
+    exists to prevent, so a repeated identifier must not count."""
+    out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
+            isolation_available=True, isolation_evidence=["same", "same"])
+    assert out["review"]["review_independence"] != "enforced"
+
+
+def test_d4_confirmed_absence_is_distinguished_from_no_evidence():
+    """`unavailable` is positive evidence that isolation cannot be achieved;
+    `degraded` is the absence of evidence either way. Collapsing them makes a
+    confirmed gap indistinguishable from an unchecked one."""
+    unknown = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2)
+    confirmed_absent = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2,
+                         blast_radius=2, isolation_available=False)
+    assert unknown["review"]["review_independence"] == "degraded"
+    assert confirmed_absent["review"]["review_independence"] == "unavailable"
+
+
+@pytest.mark.parametrize("isolation,evidence", [
+    (None, []), (False, []), (True, []), (True, ["only-one"]),
+])
+def test_d4_critical_without_enforced_independence_requires_a_human(isolation, evidence):
     out = r(task_class="ARCHITECTURE", complexity=3, uncertainty=3, blast_radius=3,
-            reversibility=2, flags=["financial_sensitive"], isolation_available=False)
+            reversibility=2, flags=["financial_sensitive"],
+            isolation_available=isolation, isolation_evidence=evidence)
     assert out["review"]["band"] == "CRITICAL"
-    assert out["review"]["review_independence"] == "degraded"
+    assert out["review"]["review_independence"] != "enforced"
     assert out["requires_human_confirmation"] is True
 
 

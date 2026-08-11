@@ -6,7 +6,7 @@
 - [The four bands](#the-four-bands)
 - [Reviewer independence](#reviewer-independence)
 - [Enforcing isolation per runtime](#enforcing-isolation-per-runtime)
-- [When isolation is unavailable](#when-isolation-is-unavailable)
+- [Reporting what you actually got](#reporting-what-you-actually-got)
 - [Reviewer output contract](#reviewer-output-contract)
 - [Reading verdicts](#reading-verdicts)
 - [Disagreement resolution](#disagreement-resolution)
@@ -156,21 +156,39 @@ feature is enabled, but whether its context isolation matches the Claude
 isolation on the first dual review of a session, or run both Codex reviewers as
 separate `codex exec` processes, which is isolated for certain.
 
-## When isolation is unavailable
+## Reporting what you actually got
 
-If real isolation cannot be achieved, **do not claim independent review**.
-Instead:
+`independence_required` is what the band asks for. `review_independence` is
+what was established. Keeping them apart is the whole point — collapsing them
+converts a safety control into a false assurance, and false assurance is worse
+than no assurance because nobody goes looking for the problem.
 
-1. Run the reviewers sequentially, with the second explicitly instructed to
-   form its verdict *before* being shown anything else.
-2. Record `review_independence: degraded` in the metrics.
-3. Treat any `PASS + PASS` outcome at band `CRITICAL` as `PASS_WITH_CHANGES`
-   requiring human confirmation.
+| State | Meaning |
+|---|---|
+| `not_applicable` | the band does not require independence |
+| `degraded` | nobody established whether isolation is possible |
+| `unavailable` | positive evidence that it cannot be achieved here |
+| `planned` | attested achievable, not yet demonstrated |
+| `enforced` | one distinct session identifier per reviewer, supplied after dispatch |
 
-Claiming independence that was not structurally enforced is the most damaging
-failure this policy can produce, because it converts a safety control into a
-false assurance — and false assurance is worse than no assurance, since nobody
-goes looking for the problem.
+Two distinctions in that table are load-bearing.
+
+**`unavailable` is not `degraded`.** One is a confirmed gap, the other is an
+unchecked assumption, and they call for different responses. The config's own
+ledger records Codex native subagent isolation as flag-verified but
+semantics-unverified — exactly the case that needs its own state rather than
+being folded into "unknown".
+
+**`planned` is not `enforced`.** A route is computed before any reviewer runs,
+so nothing available at routing time can prove isolation happened. A caller's
+attestation that isolation is *achievable* is a capability claim; only distinct
+per-reviewer session identifiers, supplied afterwards, are evidence. Anything
+short of `enforced` at band `CRITICAL` requires human confirmation.
+
+When real isolation cannot be achieved, run the reviewers sequentially with the
+second explicitly instructed to form its verdict *before* being shown anything
+else, record the honest state, and treat `PASS + PASS` at `CRITICAL` as
+`PASS_WITH_CHANGES` pending a human.
 
 ## Reviewer output contract
 

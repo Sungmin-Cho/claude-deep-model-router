@@ -62,10 +62,12 @@ well-understood change — and it still must not ship on a single lightweight
 review, because the consequence of being wrong in an auth path is not
 proportional to the size of the diff.
 
-`review_independence=degraded` here is not a failure; it is the honest default.
-Isolation was never confirmed for this session, so the router declines to claim
-it. Pass `--isolation available` once you have verified it and this becomes
-`enforced`.
+`review_independence=degraded` here is not a failure; it is the honest default
+— nobody established whether isolation is possible for this session, so the
+router declines to say either way. `--isolation available` moves it to
+`planned`; only distinct per-reviewer session ids supplied after dispatch move
+it to `enforced`. A capability attestation is not evidence that the capability
+was used.
 
 ---
 
@@ -229,11 +231,17 @@ cross-family review happened.
 
 ```
 score=6  band=MEDIUM
-TERMINAL=HUMAN_REQUIRED       selected_model=null
+TERMINAL=HUMAN_REQUIRED
+selected_model=null   reviewer_models=[]   judge_model=null   review effort=null
 requires_human_confirmation=true
 ```
 
-**No executable route is emitted, and the CLI exits nonzero.**
+**No executable bindings are emitted at all, and the CLI exits nonzero.**
+
+Nulling only `selected_model` was not enough: a consumer could still read the
+reviewer models out of a route whose own rationale said it must not be
+executed. A terminal result now carries the review *policy* — which band, which
+roles — with every concrete binding withheld.
 
 Exhausting the retry budget is a normal terminal state, not an error — but a
 terminal state that still hands back a runnable model is not a stop, it is a

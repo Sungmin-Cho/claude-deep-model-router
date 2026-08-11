@@ -120,11 +120,26 @@ Other inputs worth knowing:
 | `--prior-failures N` | after a failed attempt; `--prior-models` accepts role aliases *or* model ids |
 | `--unavailable <role>` / `--unavailable-models <id>` | a specific role or model does not resolve |
 | `--flags bridge_down` | the whole cross-provider transport is unreachable — switches to the degraded single-provider binding |
-| `--isolation available\|unavailable` | whether you confirmed reviewer context isolation this session |
+| `--isolation available\|unavailable` | whether isolation *can* be achieved this session |
+| `--isolation-evidence <ids>` | distinct session ids, one per dispatched reviewer |
 
-**`--isolation` matters more than it looks.** Left unset, the router reports
-`review_independence: degraded` — it will not claim a safety property nobody
-established. Pass `available` only after confirming isolation actually holds.
+**Independence has five states, and only one of them is a claim.** A route is
+computed before any reviewer runs, so nothing known at routing time can prove
+isolation happened:
+
+| State | Meaning |
+|---|---|
+| `not_applicable` | the band does not ask for independence |
+| `degraded` | nobody established whether isolation is possible — the default |
+| `unavailable` | positive evidence it *cannot* be achieved here |
+| `planned` | attested achievable, not yet demonstrated |
+| `enforced` | one distinct session id per reviewer was supplied afterwards |
+
+`unavailable` and `degraded` are deliberately distinct: a confirmed gap and an
+unchecked one call for different responses. And a `CRITICAL` review that is not
+`enforced` requires human confirmation — the capability attestation alone must
+never clear that gate, because it is a statement about what the runtime *can*
+do, not about what it did.
 
 The script exits nonzero when the route reaches a terminal state. Those are
 normal outcomes that need a human, not routes to execute:
@@ -369,6 +384,7 @@ Every route reports:
 task_class:  complexity:  uncertainty:  blast_radius:  reversibility:
 reasoning_centric:
 risk_score:  risk_band:   band_overrides_applied: []   critical_flags: []
+band_overrides_redundant: []   # fired, but another rule had already got there
 route_path:                    # null, or "disagreement"
 terminal:                      # null, HUMAN_REQUIRED, or ESCALATE_ROUTING
 selected_role:  selected_model:  selected_effort:  selected_effort_native:
@@ -380,7 +396,9 @@ review:
   judge:  judge_model:
 cross_family_review: true | false
 fallbacks_applied: []          # only recorded when the model actually changed
+fallback_compensations_applied: []
 unavailable_models: []
+excluded_prior_failures: []    # models withheld because they already failed
 escalation_count:  retry_count:
 routing_confidence:
 requires_human_confirmation:
@@ -392,8 +410,10 @@ Two pairs in there are deliberately not collapsed:
 - **`independence_required` vs `review_independence`.** The first is policy; the
   second is evidence. Reporting policy as if it were evidence is how a control
   becomes a false assurance.
-- **`selected_model` vs `terminal`.** A terminal state emits no model. A route
-  you must not execute should not look executable.
+- **`selected_model` vs `terminal`.** A terminal state emits *no* execution
+  bindings — not the worker, not the reviewers, not the judge. Nulling only the
+  worker still left a consumer able to dispatch the reviewers from a route the
+  rationale said must not be executed.
 
 Optimize expected **total** task cost — correctness, engineering quality,
 latency, money, and human intervention together. Not the unit price of one

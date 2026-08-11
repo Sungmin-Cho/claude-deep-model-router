@@ -96,7 +96,7 @@ Three situations page a human rather than proceeding:
 | Situation | Why |
 |---|---|
 | Retry budget exhausted | Four attempts without success means the task is not what the classification said it was |
-| `PASS + PASS` on `CRITICAL` with degraded independence | The safety control did not actually run; a human decides whether to accept it |
+| `CRITICAL` review whose independence is anything but `enforced` | The safety control was requested but not demonstrated; a human decides whether to accept it |
 | Routing confidence below 0.60 | The router does not trust its own classification, and classification errors propagate everywhere downstream |
 
 ## Observability
@@ -119,7 +119,7 @@ routing_metrics:
   selected_effort:
   review_band:
   reviewers: []
-  review_independence: enforced | degraded | not_applicable
+  review_independence: enforced | planned | degraded | unavailable | not_applicable
   cross_family_review: true | false
   fallbacks_applied: []
   escalation_count:

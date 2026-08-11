@@ -7,28 +7,27 @@ input and computes everything downstream — score, band, overrides, worker,
 effort, review policy, and the concrete model bindings — the same way every
 time.
 
-That split is the whole point. The subjective step is where routers go wrong in
-interesting ways; the deterministic step is where they go wrong in boring,
-testable ways, so it belongs in code with tests around it.
+Two properties are load-bearing and were each broken once before:
 
-The taxonomy (bands, roles, task classes, flags, efforts) and the override
-rules are read from config/model-routing.yaml rather than restated here. A
-constant duplicated in code is a second source of truth that drifts silently,
-and the config's claim to be authoritative has to be true to be useful.
+1. **The emitted route must be executable as written.** Every model named has
+   been checked against what the caller said is unavailable, against the
+   provider boundary when the bridge is down, and against what already failed.
+2. **A recorded change must be a real change.** A fallback is recorded only
+   when the model actually differs; an escalation only when the model actually
+   moves. Recording a degradation or a promotion that did not happen is worse
+   than recording nothing, because it reads as a managed decision.
+
+The taxonomy and the override rules are read from the config rather than
+restated here — a constant duplicated in code is a second source of truth that
+drifts silently.
 
 Usage:
     route_task.py --class DEBUGGING --complexity 2 --uncertainty 3 \\
                   --blast-radius 2 --reversibility 1 \\
                   --flags auth_sensitive,unknown_root_cause
 
-    route_task.py --json '{"task_class": "ARCHITECTURE", "complexity": 3, ...}'
-
-Exit status is nonzero when the route reaches a terminal state — retry budget
-exhausted, or routing confidence below the escalation floor. Those are normal
-outcomes that need a human, not routes to execute.
-
-Requires PyYAML to read the config. There is deliberately no embedded copy of
-the policy.
+Exit status is 1 for a terminal state (retry budget spent, or confidence below
+the escalation floor), 2 for invalid input, 0 otherwise.
 """
 
 from __future__ import annotations
@@ -36,46 +35,113 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "model-routing.yaml"
+
+MAX_PROMOTION_PASSES = 4   # bounded fixed point; the band ladder is only 4 deep
 
 
 class ValidationError(ValueError):
     """Raised for any malformed routing input, from the CLI or the API."""
 
 
+class ConfigError(RuntimeError):
+    """Raised when the policy config cannot be read or is internally invalid."""
+
+
 def load_config(path: Path = CONFIG_PATH) -> dict:
+    """Read the policy. Raises rather than exiting, so importing this module
+    can never terminate the interpreter."""
     try:
         import yaml
-    except ImportError:  # pragma: no cover - environment-dependent
-        sys.exit(
-            "route_task.py needs PyYAML to read the policy config.\n"
-            "  pip install pyyaml\n"
+    except ImportError as exc:  # pragma: no cover - environment-dependent
+        raise ConfigError(
+            "route_task.py needs PyYAML to read the policy config (pip install pyyaml). "
             "The policy is not duplicated in this script on purpose — one source of truth."
-        )
-    with open(path) as f:
-        return yaml.safe_load(f)
+        ) from exc
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f)
+    except OSError as exc:
+        raise ConfigError(f"cannot read policy config at {path}: {exc}") from exc
 
-
-_CFG = load_config()
 
 # --------------------------------------------------------------------------
-# Taxonomy, derived from the config so there is exactly one source of truth.
+# Policy — the taxonomy derived from one config, so `route(task, cfg)` honours
+# the config it was given all the way down to input validation.
 # --------------------------------------------------------------------------
 
-BANDS: list[str] = sorted(_CFG["router"]["bands"], key=lambda b: _CFG["router"]["bands"][b]["ordinal"])
-EFFORTS: list[str] = list(_CFG["effort_levels"])
-ROLES: list[str] = list(_CFG["role_tiers"])
-TASK_CLASSES: list[str] = list(_CFG["worker_selection"])
-CRITICAL_DOMAIN_FLAGS: tuple[str, ...] = tuple(_CFG["flags"]["critical_domain"])
-KNOWN_FLAGS: frozenset[str] = frozenset(f for group in _CFG["flags"].values() for f in group)
-RUNTIMES: frozenset[str] = frozenset(_CFG["effort_map"])
-MODEL_KEYS: frozenset[str] = frozenset(_CFG["models"])
-MODEL_IDS: frozenset[str] = frozenset(m["id"] for m in _CFG["models"].values())
-MODEL_ID_TO_KEY: dict[str, str] = {m["id"]: k for k, m in _CFG["models"].items()}
+class Policy:
+    """Everything derivable from a config, computed once per config."""
+
+    _cache: dict[int, "Policy"] = {}
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.bands: list[str] = sorted(cfg["router"]["bands"], key=lambda b: cfg["router"]["bands"][b]["ordinal"])
+        self.efforts: list[str] = list(cfg["effort_levels"])
+        self.roles: list[str] = list(cfg["role_tiers"])
+        self.task_classes: list[str] = list(cfg["worker_selection"])
+        self.critical_domain_flags: tuple[str, ...] = tuple(cfg["flags"]["critical_domain"])
+        self.known_flags: frozenset[str] = frozenset(f for g in cfg["flags"].values() for f in g)
+        self.runtimes: frozenset[str] = frozenset(cfg["effort_map"])
+        self.model_ids: frozenset[str] = frozenset(m["id"] for m in cfg["models"].values())
+        self.id_to_key: dict[str, str] = {m["id"]: k for k, m in cfg["models"].items()}
+        self.family_of: dict[str, str] = {m["id"]: m["family"] for m in cfg["models"].values()}
+        # Which family survives when the cross-provider bridge is down.
+        self.local_family: dict[str, str] = {
+            runtime: cfg["models"][cfg["role_bindings"][binding]["worker_fast"]]["family"]
+            for runtime, binding in (("claude_code", "claude_only"), ("codex", "openai_only"))
+        }
+
+    @classmethod
+    def of(cls, cfg: dict) -> "Policy":
+        key = id(cfg)
+        if key not in cls._cache:
+            cls._cache[key] = cls(cfg)
+        return cls._cache[key]
+
+    # ordered-enum helpers, bound to this policy's vocabulary
+    def band_max(self, a, b): return self.bands[max(self.bands.index(a), self.bands.index(b))]
+    def effort_max(self, a, b): return self.efforts[max(self.efforts.index(a), self.efforts.index(b))]
+    def effort_up(self, e, n=1): return self.efforts[min(self.efforts.index(e) + n, len(self.efforts) - 1)]
+    def role_max(self, a, b): return self.roles[max(self.roles.index(a), self.roles.index(b))]
+    def role_above(self, r, n=1): return self.roles[min(self.roles.index(r) + n, len(self.roles) - 1)]
+    def at_ceiling(self, r): return self.roles.index(r) == len(self.roles) - 1
+
+
+_DEFAULT_CFG: dict | None = None
+
+
+def default_config() -> dict:
+    """Lazy so a missing or broken config surfaces at call time, not import."""
+    global _DEFAULT_CFG
+    if _DEFAULT_CFG is None:
+        _DEFAULT_CFG = load_config()
+    return _DEFAULT_CFG
+
+
+def _default_policy() -> Policy:
+    return Policy.of(default_config())
+
+
+# Module-level vocabulary, kept for callers that import these names. They
+# describe the default config; `route(task, cfg)` uses the cfg it was handed.
+def __getattr__(name: str):
+    p = _default_policy()
+    mapping = {
+        "BANDS": p.bands, "EFFORTS": p.efforts, "ROLES": p.roles,
+        "TASK_CLASSES": p.task_classes,
+        "CRITICAL_DOMAIN_FLAGS": p.critical_domain_flags,
+        "KNOWN_FLAGS": p.known_flags, "MODEL_IDS": p.model_ids,
+        "RUNTIMES": p.runtimes,
+    }
+    if name in mapping:
+        return mapping[name]
+    raise AttributeError(name)
 
 
 # --------------------------------------------------------------------------
@@ -99,34 +165,42 @@ class Task:
     flags: list[str] = field(default_factory=list)
     prior_failures: int = 0
     prior_models: list[str] = field(default_factory=list)
-    implementation_role: str | None = None      # for REVIEW tasks
+    implementation_role: str | None = None
     runtime: str = "claude_code"
     unavailable_roles: list[str] = field(default_factory=list)
     unavailable_models: list[str] = field(default_factory=list)
-    isolation_available: bool | None = None     # None = not established
+    # Caller's attestation that reviewer isolation *can* be achieved. This is a
+    # capability claim, not proof that it happened — see `isolation_evidence`.
+    isolation_available: bool | None = None
+    # Post-dispatch proof: one distinct session/process identifier per
+    # reviewer. Only this can raise independence to `enforced`.
+    isolation_evidence: list[str] = field(default_factory=list)
+    # Set by route(); not part of the caller's input contract.
+    _policy: Any = field(default=None, repr=False, compare=False)
 
-    def __post_init__(self):
-        self._require_choice("task_class", self.task_class, TASK_CLASSES)
+    def validate(self, policy: Policy) -> None:
+        self._require_choice("task_class", self.task_class, policy.task_classes)
         for name in ("complexity", "uncertainty", "blast_radius", "reversibility"):
             self._require_score(name, getattr(self, name))
         self._require_bool("reasoning_centric", self.reasoning_centric)
         self._require_int("prior_failures", self.prior_failures, minimum=0)
-        self._require_choice("runtime", self.runtime, sorted(RUNTIMES))
-
-        self._require_str_list("flags", self.flags, KNOWN_FLAGS, "flag")
-        self._require_str_list("unavailable_roles", self.unavailable_roles, frozenset(ROLES), "role")
-        self._require_str_list("unavailable_models", self.unavailable_models, MODEL_IDS, "model id")
-        # prior_models accepts either a role alias or a concrete model id,
-        # because selected_model is emitted as an id and feeding it back to the
-        # next round has to work.
-        self._require_str_list(
-            "prior_models", self.prior_models, frozenset(ROLES) | MODEL_IDS, "role or model id"
-        )
-
+        self._require_choice("runtime", self.runtime, sorted(policy.runtimes))
+        self._require_str_list("flags", self.flags, policy.known_flags, "flag")
+        self._require_str_list("unavailable_roles", self.unavailable_roles,
+                               frozenset(policy.roles), "role")
+        self._require_str_list("unavailable_models", self.unavailable_models,
+                               policy.model_ids, "model id")
+        # prior_models accepts a role alias or a concrete model id, because
+        # selected_model is emitted as an id and feeding it back must work.
+        self._require_str_list("prior_models", self.prior_models,
+                               frozenset(policy.roles) | policy.model_ids, "role or model id")
         if self.implementation_role is not None:
-            self._require_choice("implementation_role", self.implementation_role, ROLES)
+            self._require_choice("implementation_role", self.implementation_role, policy.roles)
         if self.isolation_available is not None:
             self._require_bool("isolation_available", self.isolation_available)
+        if isinstance(self.isolation_evidence, str) or not isinstance(self.isolation_evidence, (list, tuple)):
+            raise ValidationError("isolation_evidence: expected a list of session identifiers")
+        self._policy = policy
 
     # -- validators ------------------------------------------------------
 
@@ -137,7 +211,6 @@ class Task:
 
     @staticmethod
     def _require_int(name, value, minimum=None):
-        # bool is a subclass of int; True as a dimension score is a type error.
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValidationError(f"{name}: expected an integer, got {type(value).__name__}")
         if minimum is not None and value < minimum:
@@ -152,9 +225,7 @@ class Task:
     @staticmethod
     def _require_bool(name, value):
         if not isinstance(value, bool):
-            raise ValidationError(
-                f"{name}: expected a boolean, got {type(value).__name__} {value!r}"
-            )
+            raise ValidationError(f"{name}: expected a boolean, got {type(value).__name__} {value!r}")
 
     @staticmethod
     def _require_str_list(name, value, allowed, label):
@@ -171,46 +242,31 @@ class Task:
     def has(self, flag: str) -> bool:
         return flag in self.flags
 
-    @property
-    def critical_flags(self) -> list[str]:
-        return [f for f in CRITICAL_DOMAIN_FLAGS if f in self.flags]
+    def critical_flags(self, policy: Policy) -> list[str]:
+        return [f for f in policy.critical_domain_flags if f in self.flags]
 
-    @property
-    def failed_roles(self) -> list[str]:
-        """Prior failures normalized to role aliases."""
+    def failed_roles(self, policy: Policy, binding: dict) -> list[str]:
+        """Prior failures normalized to role aliases, resolved against the
+        binding actually in force — mapping through the default binding would
+        misread a degraded-binding model as a different (usually higher) role."""
         out = []
         for item in self.prior_models:
-            if item in ROLES:
+            if item in policy.roles:
                 out.append(item)
             else:
-                key = MODEL_ID_TO_KEY[item]
-                out.extend(r for r, k in _CFG["role_bindings"]["default"].items()
-                           if k == key and r in ROLES)
+                key = policy.id_to_key[item]
+                out.extend(r for r, k in binding.items() if k == key and r in policy.roles)
         return out
 
-
-# --------------------------------------------------------------------------
-# Ordered-enum helpers
-# --------------------------------------------------------------------------
-
-def band_max(a: str, b: str) -> str:
-    return BANDS[max(BANDS.index(a), BANDS.index(b))]
-
-
-def effort_max(a: str, b: str) -> str:
-    return EFFORTS[max(EFFORTS.index(a), EFFORTS.index(b))]
-
-
-def effort_up(effort: str, steps: int = 1) -> str:
-    return EFFORTS[min(EFFORTS.index(effort) + steps, len(EFFORTS) - 1)]
-
-
-def role_max(a: str, b: str) -> str:
-    return ROLES[max(ROLES.index(a), ROLES.index(b))]
-
-
-def role_above(role: str, steps: int = 1) -> str:
-    return ROLES[min(ROLES.index(role) + steps, len(ROLES) - 1)]
+    def failed_model_ids(self, policy: Policy, binding: dict) -> set[str]:
+        """Concrete models that already failed, whether named as a role or an id."""
+        out = set()
+        for item in self.prior_models:
+            if item in policy.model_ids:
+                out.add(item)
+            elif item in binding:
+                out.add(policy.cfg["models"][binding[item]]["id"])
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -219,29 +275,28 @@ def role_above(role: str, steps: int = 1) -> str:
 
 def score(task: Task, cfg: dict) -> int:
     w = cfg["router"]["score_weights"]
-    return (
-        task.complexity * w["complexity"]
-        + task.uncertainty * w["uncertainty"]
-        + task.blast_radius * w["blast_radius"]
-        + task.reversibility * w["reversibility"]
-    )
+    return (task.complexity * w["complexity"] + task.uncertainty * w["uncertainty"]
+            + task.blast_radius * w["blast_radius"] + task.reversibility * w["reversibility"])
 
 
-def band_from_score(value: int, cfg: dict) -> str:
-    for name in BANDS:
-        b = cfg["router"]["bands"][name]
+def band_from_score(value: int, policy: Policy) -> str:
+    for name in policy.bands:
+        b = policy.cfg["router"]["bands"][name]
         if b["min"] <= value <= b["max"]:
             return name
-    raise ValidationError(f"score {value} falls outside every band — check score_weights")
+    raise ConfigError(f"score {value} falls outside every band — check score_weights")
 
 
 # --------------------------------------------------------------------------
-# Stage 3 — overrides, evaluated from config. Unconditional, never early-returns.
+# Stage 3 — overrides, evaluated from config
 # --------------------------------------------------------------------------
+
+KNOWN_EFFECT_KEYS = frozenset({"band_at_least", "band_exactly", "route"})
+
 
 def _predicate(node: Any, task: Task, cfg: dict) -> bool:
     if not isinstance(node, dict) or len(node) != 1:
-        raise ValidationError(f"malformed override predicate: {node!r}")
+        raise ConfigError(f"malformed override predicate: {node!r}")
     (op, arg), = node.items()
     if op == "flag":
         return task.has(arg)
@@ -254,41 +309,65 @@ def _predicate(node: Any, task: Task, cfg: dict) -> bool:
         return all(_predicate(sub, task, cfg) for sub in arg)
     if op == "any":
         return any(_predicate(sub, task, cfg) for sub in arg)
-    raise ValidationError(f"unknown override operator: {op!r}")
+    raise ConfigError(f"unknown override operator: {op!r}")
 
 
-def apply_overrides(task: Task, band: str, cfg: dict) -> tuple[str, list[str], str | None]:
+def apply_overrides(task: Task, band: str, policy: Policy) -> tuple[str, list[str], list[str], str | None]:
+    """Returns (band, fired_overrides, redundant_overrides, route_path).
+
+    An unknown effect key raises rather than being skipped. The asymmetry the
+    other way round — strict about operators, lax about effects — let a single
+    typo turn a safety rule into decoration that still reported itself as
+    applied, and no test could tell the difference.
+
+    `redundant` means the override fired and asked for a band the task had
+    already reached by another rule. That is expected and healthy: several
+    rules independently agreeing on CRITICAL is redundancy by design, not a
+    rule that failed to work. It is reported separately only so the rationale
+    can show which rule actually moved the number.
+    """
+    cfg = policy.cfg
     applied: list[str] = []
+    redundant: list[str] = []
     route_path: str | None = None
 
     for entry in cfg["overrides"]:
+        effect = entry["effect"]
+        unknown = set(effect) - KNOWN_EFFECT_KEYS
+        if unknown:
+            raise ConfigError(
+                f"override {entry['name']!r} has unknown effect key(s) {sorted(unknown)}; "
+                f"known keys are {sorted(KNOWN_EFFECT_KEYS)}"
+            )
         if not _predicate(entry["when"], task, cfg):
             continue
-        effect = entry["effect"]
+
         changed = False
         if "band_at_least" in effect:
-            new = band_max(band, effect["band_at_least"])
-            changed = new != band
+            new = policy.band_max(band, effect["band_at_least"])
+            changed |= new != band
             band = new
         if "band_exactly" in effect:
-            changed = changed or band != effect["band_exactly"]
+            changed |= band != effect["band_exactly"]
             band = effect["band_exactly"]
         if "route" in effect:
             route_path = effect["route"]
             changed = True
-        # Record the override whenever its predicate held, even if the band was
-        # already high enough — the rationale should show what fired, not only
-        # what moved the number.
-        applied.append(entry["name"])
 
-    return band, applied, route_path
+        applied.append(entry["name"])
+        if not changed:
+            redundant.append(entry["name"])
+
+    return band, applied, redundant, route_path
 
 
 # --------------------------------------------------------------------------
 # Stage 4 — worker
 # --------------------------------------------------------------------------
 
-def select_worker(task: Task, band: str, cfg: dict) -> tuple[str, list[str]]:
+def select_worker(task: Task, band: str, policy: Policy, binding: dict) -> tuple[str, list[str], bool]:
+    """Returns (worker, notes, ceiling_exhausted)."""
+    cfg = policy.cfg
     notes: list[str] = []
     cell = cfg["worker_selection"][task.task_class][band]
     if cell == "by_reasoning_centric":
@@ -304,49 +383,54 @@ def select_worker(task: Task, band: str, cfg: dict) -> tuple[str, list[str]]:
 
     if task.task_class == "DEBUGGING" and task.has("unknown_root_cause") and task.prior_failures >= 2:
         target = "reasoning_specialist" if task.reasoning_centric else "senior_engineer"
-        if ROLES.index(target) > ROLES.index(worker):
+        if policy.roles.index(target) > policy.roles.index(worker):
             worker = target
             notes.append("debugging promotion: unknown root cause after 2+ failures")
 
     if task.task_class == "INVESTIGATION" and task.has("unknown_root_cause"):
-        if ROLES.index("worker_balanced") > ROLES.index(worker):
+        if policy.roles.index("worker_balanced") > policy.roles.index(worker):
             worker = "worker_balanced"
             notes.append("investigation promotion: unknown root cause")
 
-    if task.critical_flags:
-        promoted = role_max(worker, cfg["router"]["floors"]["critical_domain_worker"])
+    if task.critical_flags(policy):
+        promoted = policy.role_max(worker, cfg["router"]["floors"]["critical_domain_worker"])
         if promoted != worker:
             notes.append("critical-domain floor raised worker to worker_balanced")
             worker = promoted
 
-    # Never hand the task back to a tier that already failed. When the caller
-    # reported failures but named no model, escalate anyway — the retry rule is
-    # the loop-prevention control, and letting it lapse on a missing optional
-    # field defeats it exactly when it matters.
+    ceiling_exhausted = False
     if task.prior_failures >= 1:
-        failed = task.failed_roles
+        failed = task.failed_roles(policy, binding)
         if failed:
-            highest = max(failed, key=ROLES.index)
-            promoted = role_max(worker, role_above(highest))
+            highest = max(failed, key=policy.roles.index)
+            if policy.at_ceiling(highest):
+                # There is no tier above the ceiling. Silently clamping here
+                # produced an "escalation" that re-ran the same model.
+                ceiling_exhausted = True
+                notes.append(f"retry ladder exhausted: {highest} is the top tier")
+            promoted = policy.role_max(worker, policy.role_above(highest))
             if promoted != worker:
                 notes.append(f"escalated above failed tier {highest}")
                 worker = promoted
         else:
-            promoted = role_above(worker, task.prior_failures)
+            if policy.at_ceiling(worker):
+                ceiling_exhausted = True
+                notes.append("retry ladder exhausted: already at the top tier")
+            promoted = policy.role_above(worker, task.prior_failures)
             if promoted != worker:
-                notes.append(
-                    f"escalated above failed tier (unnamed) after {task.prior_failures} failure(s)"
-                )
+                notes.append(f"escalated above failed tier (unnamed) after "
+                             f"{task.prior_failures} failure(s)")
                 worker = promoted
 
-    return worker, notes
+    return worker, notes, ceiling_exhausted
 
 
 # --------------------------------------------------------------------------
 # Stage 5 — effort
 # --------------------------------------------------------------------------
 
-def select_effort(task: Task, band: str, cfg: dict) -> tuple[str, list[str]]:
+def select_effort(task: Task, band: str, policy: Policy) -> tuple[str, list[str]]:
+    cfg = policy.cfg
     notes: list[str] = []
     table = cfg["effort_by_work"]
 
@@ -369,14 +453,13 @@ def select_effort(task: Task, band: str, cfg: dict) -> tuple[str, list[str]]:
     for condition, floor, why in (
         (band == "HIGH", floors["band_HIGH"], "band HIGH"),
         (band == "CRITICAL", floors["band_CRITICAL"], "band CRITICAL"),
-        (bool(task.critical_flags), floors["any_critical_domain"], "critical-domain flag"),
+        (bool(task.critical_flags(policy)), floors["any_critical_domain"], "critical-domain flag"),
     ):
         if condition:
-            raised = effort_max(effort, floor)
+            raised = policy.effort_max(effort, floor)
             if raised != effort:
                 notes.append(f"{why} floored effort at {floor}")
                 effort = raised
-
     return effort, notes
 
 
@@ -384,15 +467,36 @@ def select_effort(task: Task, band: str, cfg: dict) -> tuple[str, list[str]]:
 # Stage 6 — review, by band alone
 # --------------------------------------------------------------------------
 
-def select_review(band: str, worker: str, cfg: dict) -> dict:
+def select_review(band: str, worker: str, policy: Policy, resolver: "Resolver") -> dict:
+    """Review depth follows the band. Which concrete reviewer fills a MEDIUM
+    slot additionally considers availability and family, because picking a
+    reviewer that then falls back to the implementer's own family throws away
+    the diversity that is the point of the slot."""
+    cfg = policy.cfg
     spec = dict(cfg["review"][band])
 
     if band == "MEDIUM":
+        worker_family = resolver.family_for_role(worker)
         preferred = spec["preferred_by_implementer"].get(worker)
-        candidates = spec["candidates"]
-        chosen = preferred if preferred in candidates else candidates[0]
+        ordered = [c for c in ([preferred] if preferred else []) + list(spec["candidates"]) if c]
+        seen, ranked = set(), []
+        for c in ordered:
+            if c not in seen:
+                seen.add(c)
+                ranked.append(c)
+        chosen = None
+        for candidate in ranked:                       # first cross-family and available
+            model = resolver.peek(candidate)
+            if model and policy.family_of[model] != worker_family:
+                chosen = candidate
+                break
+        if chosen is None:
+            for candidate in ranked:                   # then merely available
+                if resolver.peek(candidate):
+                    chosen = candidate
+                    break
         spec = {
-            "reviewers": [chosen],
+            "reviewers": [chosen or ranked[0]],
             "effort": spec["effort"],
             "independent": spec["independent"],
             "prefer_cross_family": spec["prefer_cross_family"],
@@ -404,81 +508,117 @@ def select_review(band: str, worker: str, cfg: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Stage 7 — resolve roles to concrete models
+# Stage 7 — resolution
 # --------------------------------------------------------------------------
 
-def _blocked_models(task: Task, cfg: dict, binding: dict) -> set[str]:
-    """Every model id the caller told us not to emit."""
-    blocked = set(task.unavailable_models)
-    for role in task.unavailable_roles:
-        key = binding.get(role)
-        if key:
-            blocked.add(cfg["models"][key]["id"])
-    return blocked
+class Resolver:
+    """Turns role aliases into concrete models, honouring every constraint the
+    caller supplied and the provider boundary implied by the runtime state."""
 
+    def __init__(self, task: Task, policy: Policy):
+        self.task = task
+        self.policy = policy
+        cfg = policy.cfg
 
-def _candidates_for(role: str, task: Task, cfg: dict, binding: dict) -> list[str]:
-    """Ordered registry keys to try for a role, best first."""
-    ordered: list[str] = []
-    primary = binding.get(role)
-    if primary:
-        ordered.append(primary)
-    ordered.extend(cfg["fallbacks"].get(task.runtime, {}).get(role, []))
-    # Degraded single-provider binding, then the role-tier ladder upward and
-    # downward. Upward first: a stronger substitute is a safer degradation than
-    # a weaker one.
-    degraded_name = "claude_only" if task.runtime == "claude_code" else "openai_only"
-    degraded = cfg["role_bindings"][degraded_name].get(role)
-    if degraded:
-        ordered.append(degraded)
-    index = ROLES.index(role)
-    for other in ROLES[index + 1:] + ROLES[:index][::-1]:
-        key = binding.get(other)
-        if key:
-            ordered.append(key)
-    seen: set[str] = set()
-    return [k for k in ordered if not (k in seen or seen.add(k))]
+        self.bridge_down = task.has("bridge_down")
+        self.binding_name = "default"
+        self.notes: list[str] = []
+        if self.bridge_down:
+            self.binding_name = "claude_only" if task.runtime == "claude_code" else "openai_only"
+            self.notes.append(f"binding degraded to {self.binding_name} (cross-provider bridge down)")
+        self.binding = cfg["role_bindings"][self.binding_name]
 
+        # When the bridge is down the opposite family is unreachable by
+        # definition — a fallback that crosses it names a model that cannot be
+        # invoked, which is the one thing a route must never do.
+        self.allowed_family = policy.local_family[task.runtime] if self.bridge_down else None
 
-def resolve(roles: list[str], task: Task, cfg: dict) -> tuple[dict[str, str], list[str], set[str]]:
-    binding_name = "default"
-    fallbacks: list[str] = []
-    if task.has("bridge_down"):
-        binding_name = "claude_only" if task.runtime == "claude_code" else "openai_only"
-        fallbacks.append(f"binding degraded to {binding_name} (cross-provider bridge down)")
+        blocked = set(task.unavailable_models)
+        for role in task.unavailable_roles:
+            for b in (cfg["role_bindings"]["default"], self.binding):
+                key = b.get(role)
+                if key:
+                    blocked.add(cfg["models"][key]["id"])
+        # A tier that already failed must not be re-emitted under a new label.
+        # Role-level escalation alone is not enough: in a degraded binding the
+        # top roles collapse onto one model, so "escalating" changed nothing.
+        self.failed = task.failed_model_ids(policy, self.binding)
+        self.blocked = blocked
+        self.unusable = blocked | self.failed
 
-    binding = cfg["role_bindings"][binding_name]
-    blocked = _blocked_models(task, cfg, cfg["role_bindings"]["default"]) | _blocked_models(task, cfg, binding)
-    resolved: dict[str, str] = {}
-
-    for role in roles:
-        primary_key = binding.get(role)
-        primary_id = cfg["models"][primary_key]["id"] if primary_key else None
-        chosen_key = None
-        for key in _candidates_for(role, task, cfg, binding):
-            model_id = cfg["models"][key]["id"]
-            if model_id in blocked:
+    def _candidates(self, role: str) -> list[str]:
+        cfg = self.policy.cfg
+        ordered: list[str] = []
+        if (primary := self.binding.get(role)):
+            ordered.append(primary)
+        ordered.extend(cfg["fallbacks"].get(self.task.runtime, {}).get(role, []))
+        degraded_name = "claude_only" if self.task.runtime == "claude_code" else "openai_only"
+        if (d := cfg["role_bindings"][degraded_name].get(role)):
+            ordered.append(d)
+        index = self.policy.roles.index(role)
+        for other in self.policy.roles[index + 1:] + self.policy.roles[:index][::-1]:
+            if (k := self.binding.get(other)):
+                ordered.append(k)
+        seen: set[str] = set()
+        out = []
+        for k in ordered:
+            if k in seen:
                 continue
-            chosen_key = key
-            break
-        if chosen_key is None:
-            raise ValidationError(
-                f"no available model for role {role!r}: every candidate is unavailable. "
-                "This is an operational failure, not a route."
-            )
-        chosen_id = cfg["models"][chosen_key]["id"]
-        resolved[role] = chosen_id
-        # Only record a fallback when the emitted model actually changed. A
-        # recorded no-op reads as a managed degradation when none occurred.
-        if primary_id is not None and chosen_id != primary_id:
-            fallbacks.append(f"{role}: {primary_id} unavailable -> {chosen_id}")
+            seen.add(k)
+            if self.allowed_family and cfg["models"][k]["family"] != self.allowed_family:
+                continue
+            out.append(k)
+        return out
 
-    return resolved, fallbacks, blocked
+    def peek(self, role: str) -> str | None:
+        """The model this role would resolve to, or None if nothing is usable."""
+        cfg = self.policy.cfg
+        for key in self._candidates(role):
+            model_id = cfg["models"][key]["id"]
+            if model_id not in self.unusable:
+                return model_id
+        return None
 
+    def family_for_role(self, role: str) -> str | None:
+        model = self.peek(role)
+        return self.policy.family_of[model] if model else None
 
-def families(resolved: dict[str, str], cfg: dict) -> dict[str, str]:
-    by_id = {m["id"]: m["family"] for m in cfg["models"].values()}
-    return {role: by_id[model_id] for role, model_id in resolved.items()}
+    def resolve(self, roles: list[str]) -> tuple[dict[str, str], list[str], list[str]]:
+        """Returns (role -> model id, fallback notes, compensation notes)."""
+        cfg = self.policy.cfg
+        resolved: dict[str, str] = {}
+        fallbacks = list(self.notes)
+        compensations: list[str] = []
+        comp_cfg = cfg.get("fallback_compensations", {})
+
+        for role in roles:
+            primary_key = self.binding.get(role)
+            primary_id = cfg["models"][primary_key]["id"] if primary_key else None
+            chosen_id = self.peek(role)
+            if chosen_id is None:
+                raise ValidationError(
+                    f"no usable model for role {role!r}: every candidate is unavailable, "
+                    f"already failed, or on the unreachable side of a downed bridge. "
+                    "This is an operational failure, not a route."
+                )
+            resolved[role] = chosen_id
+            if primary_id is not None and chosen_id != primary_id:
+                fallbacks.append(f"{role}: {primary_id} unavailable -> {chosen_id}")
+                compensations.extend(self._compensations(role, primary_id, chosen_id, comp_cfg))
+        return resolved, fallbacks, compensations
+
+    def _compensations(self, role, primary_id, chosen_id, comp_cfg) -> list[str]:
+        """Configured compensations for a downgrade. Declared and never applied,
+        these were policy that existed only as a comment."""
+        out = []
+        fam = self.policy.family_of
+        if role == "principal_architect" and (rule := comp_cfg.get("principal_architect_to_senior")):
+            out.append(rule)
+        if role == "reasoning_specialist" and fam[chosen_id] == fam.get(
+                self.peek("senior_engineer") or chosen_id):
+            if (rule := comp_cfg.get("reasoning_specialist_to_same_family")):
+                out.append(rule)
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -486,18 +626,26 @@ def families(resolved: dict[str, str], cfg: dict) -> dict[str, str]:
 # --------------------------------------------------------------------------
 
 def independence(review: dict, task: Task) -> str:
-    """Separate the policy requirement from what was actually enforced.
+    """Separate what the policy asks for from what was actually established.
 
-    `independent` is what the band asks for. `review_independence` is what the
-    runtime can prove it got. Reporting the first as if it were the second is
-    the single most damaging thing this router can do, because it converts a
-    safety control into a false assurance — so an unestablished isolation
-    capability reports `degraded`, never `enforced`.
+    Three states, not two. `unavailable` is positive evidence that isolation
+    cannot be achieved; `degraded` is the absence of evidence either way.
+    Collapsing them makes a confirmed gap indistinguishable from an unchecked
+    one, and the config's own ledger records a case of exactly that.
+
+    `enforced` requires post-dispatch proof — one distinct session per
+    reviewer. A caller's capability attestation alone yields `planned`, because
+    a route computed before any reviewer runs cannot know what happened.
     """
     if not review["independent"]:
         return "not_applicable"
-    if task.isolation_available is True:
+    if task.isolation_available is False:
+        return "unavailable"
+    distinct = len({e for e in task.isolation_evidence if e})
+    if distinct >= len(review["reviewers"]) and distinct >= 2:
         return "enforced"
+    if task.isolation_available is True:
+        return "planned"
     return "degraded"
 
 
@@ -505,13 +653,7 @@ def independence(review: dict, task: Task) -> str:
 # Confidence
 # --------------------------------------------------------------------------
 
-def routing_confidence(task: Task, band: str, fallbacks: list[str]) -> float:
-    """A deliberately conservative self-assessment.
-
-    Confidence drops where the inputs themselves are shaky — maximum
-    uncertainty, repeated prior failures, degraded bindings — because those are
-    the situations where a confidently wrong route costs the most.
-    """
+def routing_confidence(task: Task, fallbacks: list[str]) -> float:
     c = 0.95
     if task.uncertainty == 3:
         c -= 0.20
@@ -533,73 +675,84 @@ def routing_confidence(task: Task, band: str, fallbacks: list[str]) -> float:
 # --------------------------------------------------------------------------
 
 def route(task: Task, cfg: dict | None = None) -> dict:
-    cfg = cfg or _CFG
+    cfg = cfg if cfg is not None else default_config()
+    policy = Policy.of(cfg)
+    task.validate(policy)
+
+    resolver = Resolver(task, policy)
 
     risk_score = score(task, cfg)
-    band = band_from_score(risk_score, cfg)
-    band, overrides, route_path = apply_overrides(task, band, cfg)
+    band = band_from_score(risk_score, policy)
+    band, overrides, redundant_overrides, route_path = apply_overrides(task, band, policy)
 
-    worker, worker_notes = select_worker(task, band, cfg)
-    effort, effort_notes = select_effort(task, band, cfg)
-    review = select_review(band, worker, cfg)
-
+    worker, worker_notes, ceiling_exhausted = select_worker(task, band, policy, resolver.binding)
+    effort, effort_notes = select_effort(task, band, policy)
     disagreement = cfg["review"]["disagreement"]
 
-    def roles_for(rev: dict) -> list[str]:
+    def roles_for(rev):
         needed = [worker] + list(rev["reviewers"])
-        # The judge follows the REVIEW band, not the risk band. A review
-        # promoted to CRITICAL by low confidence needs adjudication just as
-        # much as one that scored there.
+        # The judge follows the REVIEW band, not the risk band — a review
+        # promoted by low confidence needs adjudication just as much.
         if rev["band"] == "CRITICAL" or route_path == "disagreement":
             needed.append(disagreement["default_judge"])
         return list(dict.fromkeys(needed))
 
-    # Resolution runs twice on purpose. The first pass exists only to learn
-    # which fallbacks apply, because routing confidence depends on them; the
-    # confidence may then raise the review band, which changes the reviewer
-    # set. Resolving once up front would emit reviewer roles that were never
-    # checked for availability.
-    _, probe_fallbacks, _ = resolve(roles_for(review), task, cfg)
+    # Bounded fixed point. Confidence depends on the fallbacks, the fallbacks
+    # depend on which roles are needed, and which roles are needed depends on
+    # the review band — which confidence can raise. Computing confidence once
+    # from a preliminary role set let a route whose *final* fallbacks pushed it
+    # below the escalation floor still emit as executable.
+    review_band = band
+    for _ in range(MAX_PROMOTION_PASSES):
+        review = select_review(review_band, worker, policy, resolver)
+        resolved, fallbacks, compensations = resolver.resolve(roles_for(review))
+        confidence = routing_confidence(task, fallbacks)
+        threshold = cfg["router"]["confidence"]["extra_review_below"]
+        if confidence < threshold and review_band != "CRITICAL":
+            promoted = policy.bands[policy.bands.index(review_band) + 1]
+            overrides.append(f"low_routing_confidence_raised_review_to_{promoted}")
+            review_band = promoted
+            continue
+        break
+    else:  # pragma: no cover - the band ladder is shorter than the pass budget
+        raise ConfigError("review band promotion failed to reach a fixed point")
 
-    confidence = routing_confidence(task, band, probe_fallbacks)
-    if confidence < cfg["router"]["confidence"]["extra_review_below"] and review["band"] != "CRITICAL":
-        promoted = BANDS[BANDS.index(review["band"]) + 1]
-        review = select_review(promoted, worker, cfg)
-        overrides.append(f"low_routing_confidence_raised_review_to_{promoted}")
+    for note in compensations:
+        if note == "raise_effort_one_level":
+            effort = policy.effort_up(effort)
+            effort_notes.append("compensation: fallback lost family diversity, effort +1")
+        elif note == "raise_effort_to_MAX_and_add_second_review":
+            effort = policy.efforts[-1]
+            effort_notes.append("compensation: architect downgraded, effort raised to MAX")
 
-    resolved, fallbacks, blocked = resolve(roles_for(review), task, cfg)
-    fams = families(resolved, cfg)
-
+    fams = {r: policy.family_of[m] for r, m in resolved.items()}
     reviewer_families = {fams[r] for r in review["reviewers"] if r in fams}
     cross_family = len(reviewer_families) > 1 or (
-        len(review["reviewers"]) == 1
-        and review["reviewers"][0] in fams
-        and worker in fams
+        len(review["reviewers"]) == 1 and review["reviewers"][0] in fams and worker in fams
         and fams[review["reviewers"][0]] != fams[worker]
     )
 
     review_independence = independence(review, task)
     judge = disagreement["default_judge"] if (
-        review["band"] == "CRITICAL" or route_path == "disagreement"
-    ) else None
+        review["band"] == "CRITICAL" or route_path == "disagreement") else None
 
-    # Terminal states. These are normal outcomes that need a human, not routes
-    # to execute — so no executable model is emitted for them.
     terminal = None
-    retry_cap = cfg["retry"]["max_total_implementation_attempts"]
-    if task.prior_failures >= retry_cap:
+    if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
+        terminal = "HUMAN_REQUIRED"
+    elif ceiling_exhausted:
         terminal = "HUMAN_REQUIRED"
     elif confidence < cfg["router"]["confidence"]["escalate_below"]:
         terminal = "ESCALATE_ROUTING"
 
     requires_human = bool(
         terminal
-        or (review["band"] == "CRITICAL" and review_independence == "degraded")
+        or (review["band"] == "CRITICAL" and review_independence != "enforced")
     )
 
-    effort_key = task.runtime
-    native_effort = cfg["effort_map"][effort_key][effort]
-
+    # A terminal route emits no execution bindings at all. Nulling only the
+    # worker left a consumer able to dispatch the reviewers from a route the
+    # rationale said must not be executed.
+    executable = terminal is None
     result = {
         "task_class": task.task_class,
         "complexity": task.complexity,
@@ -610,29 +763,31 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "risk_score": risk_score,
         "risk_band": band,
         "band_overrides_applied": overrides,
-        "critical_flags": task.critical_flags,
+        "band_overrides_redundant": redundant_overrides,
+        "critical_flags": task.critical_flags(policy),
         "route_path": route_path,
         "terminal": terminal,
-        "selected_role": None if terminal else worker,
-        "selected_model": None if terminal else resolved.get(worker),
-        "selected_effort": None if terminal else effort,
-        "selected_effort_native": None if terminal else native_effort,
+        "selected_role": worker if executable else None,
+        "selected_model": resolved.get(worker) if executable else None,
+        "selected_effort": effort if executable else None,
+        "selected_effort_native": cfg["effort_map"][task.runtime][effort] if executable else None,
         "review": {
             "band": review["band"],
             "reviewers": review["reviewers"],
-            "reviewer_models": [resolved.get(r) for r in review["reviewers"]],
-            "effort": review["effort"],
+            "reviewer_models": [resolved.get(r) for r in review["reviewers"]] if executable else [],
+            "effort": review["effort"] if executable else None,
             "independence_required": review["independent"],
             "review_independence": review_independence,
             "required_checks": review.get("required_checks", []),
             "judge": judge,
-            "judge_model": resolved.get(judge) if judge else None,
+            "judge_model": (resolved.get(judge) if judge else None) if executable else None,
         },
         "cross_family_review": cross_family,
         "fallbacks_applied": fallbacks,
-        "unavailable_models": blocked,
+        "fallback_compensations_applied": compensations,
+        "unavailable_models": sorted(resolver.blocked),
+        "excluded_prior_failures": sorted(resolver.failed),
         "escalation_count": task.prior_failures,
-        "retry_count": task.prior_failures,
         "routing_confidence": confidence,
         "requires_human_confirmation": requires_human,
         "notes": worker_notes + effort_notes,
@@ -642,30 +797,28 @@ def route(task: Task, cfg: dict | None = None) -> dict:
 
 
 def explain(task: Task, r: dict) -> str:
-    parts = [
-        f"{task.task_class} scored {r['risk_score']}/18 "
-        f"(c={task.complexity} u={task.uncertainty} b={task.blast_radius} r={task.reversibility}) "
-        f"-> band {r['risk_band']}."
-    ]
+    parts = [f"{task.task_class} scored {r['risk_score']}/18 "
+             f"(c={task.complexity} u={task.uncertainty} b={task.blast_radius} r={task.reversibility}) "
+             f"-> band {r['risk_band']}."]
     if r["band_overrides_applied"]:
         parts.append(f"Overrides applied: {', '.join(r['band_overrides_applied'])}.")
+    if r["band_overrides_redundant"]:
+        parts.append(f"Overrides that fired but were already satisfied: "
+                     f"{', '.join(r['band_overrides_redundant'])}.")
     if r["critical_flags"]:
         parts.append(f"Critical-domain flags: {', '.join(r['critical_flags'])}.")
     if r["terminal"]:
         parts.append(
-            f"TERMINAL: {r['terminal']} — no executable route emitted; "
-            f"routing confidence {r['routing_confidence']} after {task.prior_failures} prior failure(s). "
-            "Surface to a human with what was tried, what evidence accumulated, "
-            "and the blocking uncertainty."
+            f"TERMINAL: {r['terminal']} — no executable bindings emitted; routing confidence "
+            f"{r['routing_confidence']} after {task.prior_failures} prior failure(s). Surface to a "
+            "human with what was tried, what evidence accumulated, and the blocking uncertainty."
         )
     else:
         parts.append(f"Worker {r['selected_role']} at {r['selected_effort']} effort.")
     rv = r["review"]
-    parts.append(
-        f"Review band {rv['band']}: {', '.join(rv['reviewers'])} at {rv['effort']}, "
-        f"independence_required={rv['independence_required']}, "
-        f"review_independence={rv['review_independence']}."
-    )
+    parts.append(f"Review band {rv['band']}: {', '.join(rv['reviewers'])}, "
+                 f"independence_required={rv['independence_required']}, "
+                 f"review_independence={rv['review_independence']}.")
     if rv["judge"]:
         parts.append(f"Judge: {rv['judge']}.")
     if rv["required_checks"]:
@@ -674,6 +827,10 @@ def explain(task: Task, r: dict) -> str:
         parts.append(f"Fallbacks: {'; '.join(r['fallbacks_applied'])}.")
     else:
         parts.append("No fallbacks applied.")
+    if r["fallback_compensations_applied"]:
+        parts.append(f"Compensations: {', '.join(r['fallback_compensations_applied'])}.")
+    if r["excluded_prior_failures"]:
+        parts.append(f"Excluded as already-failed: {', '.join(r['excluded_prior_failures'])}.")
     if not r["cross_family_review"] and rv["independence_required"]:
         parts.append("cross_family_review=false — reviewers share a family; weigh the second verdict accordingly.")
     if r["requires_human_confirmation"]:
@@ -689,34 +846,44 @@ def _split(value: str) -> list[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+def build_parser(policy: Policy) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--json", help="full task as a JSON object; overrides the flags below")
-    p.add_argument("--class", dest="task_class", choices=TASK_CLASSES)
+    p.add_argument("--class", dest="task_class", choices=policy.task_classes)
     p.add_argument("--complexity", type=int)
     p.add_argument("--uncertainty", type=int)
     p.add_argument("--blast-radius", type=int)
     p.add_argument("--reversibility", type=int)
     p.add_argument("--reasoning-centric", action="store_true")
     p.add_argument("--flags", default="",
-                   help=f"comma-separated; known flags: {', '.join(sorted(KNOWN_FLAGS))}")
+                   help=f"comma-separated; known: {', '.join(sorted(policy.known_flags))}")
     p.add_argument("--prior-failures", type=int, default=0)
     p.add_argument("--prior-models", default="",
                    help="comma-separated role aliases or model ids that already failed")
-    p.add_argument("--runtime", default="claude_code", choices=sorted(RUNTIMES))
-    p.add_argument("--unavailable", default="", help="comma-separated roles to treat as unavailable")
-    p.add_argument("--unavailable-models", default="",
-                   help="comma-separated concrete model ids to treat as unavailable")
+    p.add_argument("--runtime", default="claude_code", choices=sorted(policy.runtimes))
+    p.add_argument("--unavailable", default="", help="comma-separated unavailable roles")
+    p.add_argument("--unavailable-models", default="", help="comma-separated unavailable model ids")
     p.add_argument("--isolation", choices=["available", "unavailable"],
-                   help="whether reviewer context isolation was confirmed this session")
+                   help="whether reviewer context isolation can be achieved this session")
+    p.add_argument("--isolation-evidence", default="",
+                   help="comma-separated distinct session ids, one per dispatched reviewer")
     p.add_argument("--format", default="text", choices=["text", "json"])
     return p
 
 
+REQUIRED_JSON_FIELDS = ("task_class", "complexity", "uncertainty", "blast_radius", "reversibility")
+PUBLIC_FIELDS = {f.name for f in fields(Task) if not f.name.startswith("_")}
+
+
 def main(argv: list[str] | None = None) -> int:
-    p = build_parser()
+    try:
+        policy = _default_policy()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    p = build_parser(policy)
     args = p.parse_args(argv)
 
     try:
@@ -727,45 +894,38 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValidationError(f"--json is not valid JSON: {exc}") from None
             if not isinstance(payload, dict):
                 raise ValidationError("--json must be a JSON object")
-            unknown = set(payload) - set(Task.__dataclass_fields__)
-            if unknown:
+            if (unknown := set(payload) - PUBLIC_FIELDS):
                 raise ValidationError(f"--json has unknown field(s): {', '.join(sorted(unknown))}")
+            if (missing := [f for f in REQUIRED_JSON_FIELDS if f not in payload]):
+                raise ValidationError(f"--json is missing required field(s): {', '.join(missing)}")
             task = Task(**payload)
         else:
-            missing = [n for n in ("task_class", "complexity", "uncertainty",
-                                   "blast_radius", "reversibility")
-                       if getattr(args, n) is None]
-            if missing:
+            if (missing := [n for n in REQUIRED_JSON_FIELDS if getattr(args, n) is None]):
                 p.error("missing required arguments: "
                         + ", ".join("--" + m.replace("_", "-") for m in missing))
-            isolation = None
-            if args.isolation is not None:
-                isolation = args.isolation == "available"
             task = Task(
-                task_class=args.task_class,
-                complexity=args.complexity,
-                uncertainty=args.uncertainty,
-                blast_radius=args.blast_radius,
-                reversibility=args.reversibility,
-                reasoning_centric=args.reasoning_centric,
-                flags=_split(args.flags),
-                prior_failures=args.prior_failures,
-                prior_models=_split(args.prior_models),
-                runtime=args.runtime,
+                task_class=args.task_class, complexity=args.complexity,
+                uncertainty=args.uncertainty, blast_radius=args.blast_radius,
+                reversibility=args.reversibility, reasoning_centric=args.reasoning_centric,
+                flags=_split(args.flags), prior_failures=args.prior_failures,
+                prior_models=_split(args.prior_models), runtime=args.runtime,
                 unavailable_roles=_split(args.unavailable),
                 unavailable_models=_split(args.unavailable_models),
-                isolation_available=isolation,
+                isolation_available=None if args.isolation is None else args.isolation == "available",
+                isolation_evidence=_split(args.isolation_evidence),
             )
         result = route(task)
     except ValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
 
     if args.format == "json":
-        print(json.dumps(result, indent=2, default=sorted))
+        print(json.dumps(result, indent=2))
     else:
         _print_text(result)
-
     return 1 if result["terminal"] else 0
 
 
@@ -773,25 +933,33 @@ def _print_text(r: dict) -> None:
     print(f"risk_score:  {r['risk_score']}")
     print(f"risk_band:   {r['risk_band']}")
     print(f"overrides:   {r['band_overrides_applied'] or '(none)'}")
+    if r["band_overrides_redundant"]:
+        print(f"  already satisfied by another rule: {r['band_overrides_redundant']}")
     if r["terminal"]:
-        print(f"TERMINAL:    {r['terminal']}  — no executable route emitted")
+        print(f"TERMINAL:    {r['terminal']}  — no executable bindings emitted")
     else:
         print(f"worker:      {r['selected_role']}  ->  {r['selected_model']}")
         print(f"effort:      {r['selected_effort']}  (native: {r['selected_effort_native']})")
     rv = r["review"]
-    print("review:")
+    label = "review (policy only — not dispatchable)" if r["terminal"] else "review"
+    print(f"{label}:")
     print(f"  band:            {rv['band']}")
     print(f"  reviewers:       {', '.join(rv['reviewers'])}")
-    print(f"  models:          {', '.join(m for m in rv['reviewer_models'] if m)}")
-    print(f"  effort:          {rv['effort']}")
+    if not r["terminal"]:
+        print(f"  models:          {', '.join(m for m in rv['reviewer_models'] if m)}")
+        print(f"  effort:          {rv['effort']}")
     print(f"  required:        independent={rv['independence_required']}")
     print(f"  actual:          {rv['review_independence']}")
     if rv["required_checks"]:
         print(f"  checks:          {', '.join(rv['required_checks'])}")
     if rv["judge"]:
-        print(f"  judge:           {rv['judge']} -> {rv['judge_model']}")
+        print(f"  judge:           {rv['judge']}" + (f" -> {rv['judge_model']}" if rv["judge_model"] else ""))
     print(f"cross_family_review: {r['cross_family_review']}")
     print(f"fallbacks:   {r['fallbacks_applied'] or '(none)'}")
+    if r["fallback_compensations_applied"]:
+        print(f"compensations: {r['fallback_compensations_applied']}")
+    if r["excluded_prior_failures"]:
+        print(f"excluded:    {r['excluded_prior_failures']} (already failed)")
     print(f"confidence:  {r['routing_confidence']}")
     if r["requires_human_confirmation"]:
         print("human:       CONFIRMATION REQUIRED")
