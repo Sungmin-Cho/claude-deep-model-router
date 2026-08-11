@@ -685,11 +685,24 @@ def test_d10_every_recorded_substitution_actually_changed_the_model():
     code: a recorded avoidance that avoided nothing."""
     seen = 0
     for out in _sweep():
-        for sub in (out["review"].get("self_review_avoided") or []):
+        rv = out["review"]
+        for sub in (rv.get("self_review_avoided") or []):
             seen += 1
             assert sub["replaced"] != sub["with"]
             assert sub["with"] in ROLES
             assert sub["reason"]
+            # Role labels are not models. Under a degraded binding several
+            # roles collapse onto one id, so a substitution between two
+            # aliases can rename the seat without changing who sits in it —
+            # which is the exact defect this file is named after. The seat the
+            # substitute now holds must differ from the implementer's.
+            substitute_model = _peek_model(out, sub["with"])
+            if substitute_model is not None and out["selected_model"] is not None:
+                assert substitute_model != out["selected_model"], (
+                    f"{out['task_class']}/{rv['band']}: substituted "
+                    f"{sub['replaced']} -> {sub['with']} but both resolve to "
+                    f"{substitute_model}"
+                )
     assert seen, "no substitution in the sweep — the assertion was vacuous"
 
 

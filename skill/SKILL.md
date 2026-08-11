@@ -155,6 +155,11 @@ normal outcomes that need a human, not routes to execute:
 | `ESCALATE_ROUTING` | routing confidence fell below 0.60 — re-classify at higher effort or ask a human |
 | `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and no assignment of distinct models could provide it |
 
+`judge_unavailable` is deliberately **not** a terminal state. Independence
+failing means the review itself cannot happen as specified, so there is nothing
+safe to dispatch. A missing adjudicator means the review can still run; what a
+human takes over is settling a disagreement, should one arise.
+
 If you cannot run the script, compute it by hand from the tables below — the
 script reads `config/model-routing.yaml`, and this file describes the same
 policy, so the two must agree.
