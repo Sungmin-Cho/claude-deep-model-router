@@ -504,6 +504,37 @@ def select_review(band: str, worker: str, policy: Policy, resolver: "Resolver") 
 
     spec.setdefault("required_checks", [])
     spec["band"] = band
+
+    # An implementer must never be one of its own independent reviewers. At
+    # HIGH and CRITICAL the reviewer pair is fixed, so any task whose worker is
+    # already `senior_engineer` or `reasoning_specialist` was being reviewed by
+    # itself — the exact arrangement dual review exists to prevent, in the most
+    # common high-risk routes. Substitute the colliding slot, preferring a
+    # replacement from a family the other reviewer does not already cover.
+    if spec["independent"] and worker in spec["reviewers"]:
+        others = [x for x in spec["reviewers"] if x != worker]
+        other_family = resolver.family_for_role(others[0]) if others else None
+        worker_tier = policy.roles.index(worker)
+        pool = [x for x in policy.roles
+                if x != worker and x not in spec["reviewers"] and resolver.peek(x)]
+
+        # Rank strength first, family second. A reviewer weaker than the
+        # implementer defeats the purpose more thoroughly than one that shares
+        # the other reviewer's family: the point of the slot is a check the
+        # implementer could not have performed on itself, and a lower tier
+        # cannot supply that. Losing family diversity is a real cost, but it is
+        # disclosed by cross_family_review; a too-weak reviewer is not.
+        def rank(role):
+            tier = policy.roles.index(role)
+            return (tier >= worker_tier,
+                    resolver.family_for_role(role) != other_family,
+                    tier)
+
+        replacement = max(pool, key=rank, default=None)
+        if replacement:
+            spec = dict(spec)
+            spec["reviewers"] = [replacement if x == worker else x for x in spec["reviewers"]]
+            spec["self_review_avoided"] = {"replaced": worker, "with": replacement}
     return spec
 
 
@@ -781,6 +812,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             "required_checks": review.get("required_checks", []),
             "judge": judge,
             "judge_model": (resolved.get(judge) if judge else None) if executable else None,
+            "self_review_avoided": review.get("self_review_avoided"),
         },
         "cross_family_review": cross_family,
         "fallbacks_applied": fallbacks,
@@ -819,6 +851,9 @@ def explain(task: Task, r: dict) -> str:
     parts.append(f"Review band {rv['band']}: {', '.join(rv['reviewers'])}, "
                  f"independence_required={rv['independence_required']}, "
                  f"review_independence={rv['review_independence']}.")
+    if (sub := rv.get("self_review_avoided")):
+        parts.append(f"Reviewer slot substituted: {sub['replaced']} -> {sub['with']}, because "
+                     "the worker would otherwise have reviewed its own output.")
     if rv["judge"]:
         parts.append(f"Judge: {rv['judge']}.")
     if rv["required_checks"]:

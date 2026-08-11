@@ -503,3 +503,69 @@ def test_d9_parity_holds_including_the_native_effort_spelling():
     codex_map = CFG["effort_map"]["codex"]
     assert a["selected_effort_native"] == claude_map[a["selected_effort"]]
     assert b["selected_effort_native"] == codex_map[b["selected_effort"]]
+
+
+# ---------------------------------------------------------------------------
+# D10 — an implementer must never review its own output
+# ---------------------------------------------------------------------------
+#
+# Found by self-audit after a reviewer flagged it as out-of-diff and it was
+# deferred. It should not have been: at HIGH and CRITICAL the reviewer pair is
+# fixed, so every task whose worker was already `senior_engineer` or
+# `reasoning_specialist` had that same model as one of its two "independent"
+# reviewers — 12 combinations, in the most common high-risk routes. It is the
+# arrangement the whole dual-review structure exists to prevent.
+
+DIMENSION_SWEEP = [(0, 0, 0, 0), (2, 2, 2, 0), (3, 2, 3, 1), (3, 3, 3, 3), (2, 2, 2, 2)]
+
+
+def _sweep():
+    for task_class in TASK_CLASSES:
+        for c, u, b, rev in DIMENSION_SWEEP:
+            for reasoning in (False, True):
+                yield r(task_class=task_class, complexity=c, uncertainty=u,
+                        blast_radius=b, reversibility=rev, reasoning_centric=reasoning)
+
+
+def test_d10_worker_is_never_its_own_independent_reviewer():
+    offenders = [
+        (out["task_class"], out["review"]["band"], out["selected_role"])
+        for out in _sweep()
+        if out["review"]["independence_required"] and out["selected_role"] in out["review"]["reviewers"]
+    ]
+    assert offenders == [], f"worker reviews its own output in: {sorted(set(offenders))}"
+
+
+def test_d10_substitution_never_picks_a_weaker_reviewer_than_the_implementer():
+    """A reviewer below the implementer's tier cannot supply the check the
+    implementer could not perform on itself. Losing family diversity is the
+    lesser cost, and it is disclosed; a too-weak reviewer is not."""
+    for out in _sweep():
+        rv = out["review"]
+        if not rv.get("self_review_avoided"):
+            continue
+        # Only the substituted slot is under this rule. The other reviewer is
+        # the band's fixed pair, which is allowed to sit below a top-tier
+        # implementer by design — the architect is reviewed by the frontier
+        # pair, not by something above it.
+        substitute = rv["self_review_avoided"]["with"]
+        assert ROLES.index(substitute) >= ROLES.index(out["selected_role"]), (
+            f"{out['task_class']}/{rv['band']}: substitute {substitute} is weaker "
+            f"than implementer {out['selected_role']}"
+        )
+
+
+def test_d10_substitution_is_disclosed_in_the_rationale():
+    for out in _sweep():
+        if out["review"].get("self_review_avoided"):
+            assert "reviewed its own output" in out["rationale"]
+            return
+    pytest.fail("no substitution occurred in the sweep — the assertion was vacuous")
+
+
+def test_d10_low_band_self_review_is_intentional_not_a_bug():
+    """LOW explicitly does not ask for independence, so worker_fast reviewing
+    worker_fast there is the documented design, not the defect above."""
+    out = r(task_class="MECHANICAL")
+    assert out["review"]["independence_required"] is False
+    assert out["selected_role"] in out["review"]["reviewers"]
