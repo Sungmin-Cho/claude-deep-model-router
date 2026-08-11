@@ -206,20 +206,23 @@ never fails it.
 
 When a bridge is down entirely, fall back to the single-provider binding:
 
+Registry keys, not model ids — resolve them through `config/model-routing.yaml`,
+which is the only place a concrete identifier appears:
+
 ```yaml
 claude_only:
-  worker_fast:          claude-haiku-4-5-20251001
-  worker_balanced:      claude-sonnet-5
-  senior_engineer:      claude-opus-5
-  reasoning_specialist: claude-opus-5      # at MAX effort
-  principal_architect:  claude-fable-5
+  worker_fast:          claude_worker_fast
+  worker_balanced:      claude_worker_balanced
+  senior_engineer:      claude_senior
+  reasoning_specialist: claude_senior          # at MAX effort
+  principal_architect:  claude_architect
 
 openai_only:
-  worker_fast:          gpt-5.6-luna
-  worker_balanced:      gpt-5.6-terra
-  senior_engineer:      gpt-5.6-sol
-  reasoning_specialist: gpt-5.6-sol
-  principal_architect:  gpt-5.6-sol        # at MAX effort + second review
+  worker_fast:          openai_worker_fast
+  worker_balanced:      openai_worker_balanced
+  senior_engineer:      openai_reasoning
+  reasoning_specialist: openai_reasoning
+  principal_architect:  openai_reasoning       # at MAX effort + second review
 ```
 
 Both degraded bindings collapse the two frontier roles onto one model. That

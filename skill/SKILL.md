@@ -64,14 +64,29 @@ decompose the work; they must not drive who does it.
 critical-domain (force overrides):
   security_sensitive  auth_sensitive  financial_sensitive  data_integrity_sensitive
 
-elevating:
+elevating (each one has an observable effect — see the table below):
   concurrency_sensitive  migration  public_api_change
   production_hotfix  unknown_root_cause  review_disagreement
 
 context (inform decomposition, never the band):
   unfamiliar_codebase  cross_service_change  long_horizon
   large_context  tool_heavy
+
+operational (state of the runtime, not of the task):
+  bridge_down
 ```
+
+What each elevating flag actually does — a flag with no consumer is a promise
+the system does not keep, so this table is enforced by test:
+
+| Flag | Effect |
+|---|---|
+| `production_hotfix` | band floor `HIGH` |
+| `concurrency_sensitive` | band floor `MEDIUM` |
+| `public_api_change` | band floor `MEDIUM` |
+| `migration` | with `data_integrity_sensitive` → band `CRITICAL` |
+| `unknown_root_cause` | effort `MAX`, worker promotion, confidence penalty |
+| `review_disagreement` | routes to the disagreement path and binds a judge |
 
 **`reasoning_centric`** — one boolean that decides between the two frontier
 roles:
@@ -96,12 +111,32 @@ python3 scripts/route_task.py --class DEBUGGING \
     --flags auth_sensitive,unknown_root_cause
 ```
 
-Add `--format json` for a machine-readable route, `--runtime codex` for the
-Codex effort spelling, `--prior-failures N --prior-models worker_fast` after a
-failed attempt, and `--unavailable <role>` when a bridge is down.
+Other inputs worth knowing:
+
+| Flag | Use |
+|---|---|
+| `--format json` | machine-readable route |
+| `--runtime codex` | the Codex effort spelling |
+| `--prior-failures N` | after a failed attempt; `--prior-models` accepts role aliases *or* model ids |
+| `--unavailable <role>` / `--unavailable-models <id>` | a specific role or model does not resolve |
+| `--flags bridge_down` | the whole cross-provider transport is unreachable — switches to the degraded single-provider binding |
+| `--isolation available\|unavailable` | whether you confirmed reviewer context isolation this session |
+
+**`--isolation` matters more than it looks.** Left unset, the router reports
+`review_independence: degraded` — it will not claim a safety property nobody
+established. Pass `available` only after confirming isolation actually holds.
+
+The script exits nonzero when the route reaches a terminal state. Those are
+normal outcomes that need a human, not routes to execute:
+
+| Terminal | Meaning |
+|---|---|
+| `HUMAN_REQUIRED` | the retry budget is spent; no executable route is emitted |
+| `ESCALATE_ROUTING` | routing confidence fell below 0.60 — re-classify at higher effort or ask a human |
 
 If you cannot run the script, compute it by hand from the tables below — the
-script and this file are generated from the same policy and must agree.
+script reads `config/model-routing.yaml`, and this file describes the same
+policy, so the two must agree.
 
 ### The pipeline
 
@@ -332,16 +367,33 @@ Every route reports:
 
 ```yaml
 task_class:  complexity:  uncertainty:  blast_radius:  reversibility:
+reasoning_centric:
 risk_score:  risk_band:   band_overrides_applied: []   critical_flags: []
-selected_role:  selected_model:  selected_effort:
-review_band:  reviewers: []
-review_independence: enforced | degraded | not_applicable
+route_path:                    # null, or "disagreement"
+terminal:                      # null, HUMAN_REQUIRED, or ESCALATE_ROUTING
+selected_role:  selected_model:  selected_effort:  selected_effort_native:
+review:
+  band:  reviewers: []  reviewer_models: []  effort:
+  independence_required:       # what the band asks for
+  review_independence:         # what the runtime actually got
+  required_checks: []
+  judge:  judge_model:
 cross_family_review: true | false
-fallbacks_applied: []
-escalation_count:  retry_count:  review_count:
+fallbacks_applied: []          # only recorded when the model actually changed
+unavailable_models: []
+escalation_count:  retry_count:
 routing_confidence:
+requires_human_confirmation:
 rationale:   # names the band, the triggering flags, and every fallback
 ```
+
+Two pairs in there are deliberately not collapsed:
+
+- **`independence_required` vs `review_independence`.** The first is policy; the
+  second is evidence. Reporting policy as if it were evidence is how a control
+  becomes a false assurance.
+- **`selected_model` vs `terminal`.** A terminal state emits no model. A route
+  you must not execute should not look executable.
 
 Optimize expected **total** task cost — correctness, engineering quality,
 latency, money, and human intervention together. Not the unit price of one

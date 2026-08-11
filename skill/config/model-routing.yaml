@@ -65,14 +65,17 @@ flags:
     - financial_sensitive
     - data_integrity_sensitive
 
-  # Raise the band or force a specific path.
+  # Raise the band or force a specific path. Every flag listed here MUST have
+  # an observable effect — a rule declared and consumed nowhere is a promise
+  # the system does not keep, and `test_d6_every_declared_flag_has_an_effect`
+  # fails if one goes inert.
   elevating:
-    - concurrency_sensitive
-    - migration
-    - public_api_change
-    - production_hotfix
-    - unknown_root_cause
-    - review_disagreement
+    - concurrency_sensitive   # band floor MEDIUM (see overrides)
+    - migration               # conditional: with data_integrity_sensitive -> CRITICAL
+    - public_api_change       # band floor MEDIUM
+    - production_hotfix       # band floor HIGH
+    - unknown_root_cause      # effort MAX, worker promotion, confidence penalty
+    - review_disagreement     # routes to the disagreement path
 
   # Inform decomposition and model choice, but never the band.
   context:
@@ -82,27 +85,70 @@ flags:
     - large_context
     - tool_heavy
 
+  # Operational state of the runtime, not a property of the task. `bridge_down`
+  # is the only supported way to select a degraded single-provider binding —
+  # it used to be an undocumented string recognised in one place in the code,
+  # which meant the documented route (`--unavailable <role>`) and the working
+  # route were different things.
+  operational:
+    - bridge_down             # the cross-provider transport is unreachable
+
+# Flags whose effect is real but only in combination with another flag. Listed
+# explicitly so the "no inert elevating flag" test can tell a deliberate
+# conditional from a rule nobody wired up.
+conditional_flags:
+  migration:
+    requires: [data_integrity_sensitive]
+    effect: band_exactly CRITICAL
+
 # Applied after the band is computed, unconditionally, for every task class.
 # Bands may only be raised by an override, never lowered.
+#
+# `when` is a small structured predicate so the code evaluates the config
+# rather than reimplementing it:
+#   {flag: NAME}                     the task carries NAME
+#   {any_flag_in: GROUP}             the task carries any flag from flags.GROUP
+#   {dimension_at_least: {DIM: N}}   that dimension scores N or higher
+#   {all: [ ... ]}                   every sub-predicate holds
 overrides:
   - name: critical_domain
-    when: any_critical_domain_flag
+    when: { any_flag_in: critical_domain }
     effect: { band_at_least: HIGH }
+
   - name: critical_irreversible
-    when: any_critical_domain_flag AND reversibility >= 2
+    when:
+      all:
+        - { any_flag_in: critical_domain }
+        - { dimension_at_least: { reversibility: 2 } }
     effect: { band_exactly: CRITICAL }
+
   - name: migration_data_integrity
-    when: migration AND data_integrity_sensitive
+    when:
+      all:
+        - { flag: migration }
+        - { flag: data_integrity_sensitive }
     effect: { band_exactly: CRITICAL }
+
   - name: production_hotfix
-    when: production_hotfix
+    when: { flag: production_hotfix }
     effect: { band_at_least: HIGH }
+
   - name: public_api_change
-    when: public_api_change
+    when: { flag: public_api_change }
     effect: { band_at_least: MEDIUM }
+
+  # Concurrency defects are subtle, poorly covered by ordinary tests, and their
+  # effects are hard to undo even when the diff is easy to revert. A MEDIUM
+  # floor buys one independent reviewer; it deliberately does not force HIGH,
+  # because merely touching concurrent code is not the same as changing its
+  # invariants — raise blast_radius for that.
+  - name: concurrency_sensitive
+    when: { flag: concurrency_sensitive }
+    effect: { band_at_least: MEDIUM }
+
   - name: review_disagreement
-    when: review_disagreement
-    effect: { route: disagreement_path }   # see review.disagreement
+    when: { flag: review_disagreement }
+    effect: { route: disagreement }        # see review.disagreement
 
 # ---------------------------------------------------------------------------
 # Worker selection — by task class and band
@@ -389,17 +435,35 @@ transports:
       isolation: separate_process
       verified: true
 
+# Ordered replacement candidates, consulted when a role's bound model is
+# unavailable. Entries are registry keys, tried in order; the resolver skips
+# any whose model is itself unavailable or identical to the one that failed,
+# and falls through to the role-tier ladder when the list is exhausted.
+#
+# These lists were previously prose sketches with no code consumer, which is
+# how five of ten (role x runtime) fallbacks became silent no-ops: the resolver
+# substituted the degraded binding for the SAME role, and for those five the
+# degraded binding names the same model as the default one.
 fallbacks:
   claude_code:
-    worker_fast_unavailable:          [claude_worker_fast, worker_balanced]
-    reasoning_specialist_unavailable: [senior_engineer_one_effort_higher]
-    principal_architect_unavailable:  [senior_engineer_at_MAX_plus_extra_review]
-    cross_family_reviewer_unavailable: [strongest_same_family, set_cross_family_review_false]
+    worker_fast:          [claude_worker_fast, claude_worker_balanced]
+    worker_balanced:      [openai_worker_balanced, claude_senior]
+    senior_engineer:      [openai_reasoning, claude_architect]
+    reasoning_specialist: [claude_senior, claude_architect]
+    principal_architect:  [claude_senior, openai_reasoning]
   codex:
-    worker_balanced_unavailable:      [openai_worker_balanced, reasoning_specialist_if_band_high]
-    senior_engineer_unavailable:      [reasoning_specialist]
-    principal_architect_unavailable:  [reasoning_specialist_at_MAX_plus_extra_review]
-    cross_family_reviewer_unavailable: [strongest_same_family, set_cross_family_review_false]
+    worker_fast:          [openai_worker_balanced, claude_worker_fast]
+    worker_balanced:      [openai_worker_balanced, openai_reasoning]
+    senior_engineer:      [openai_reasoning, claude_senior]
+    reasoning_specialist: [openai_reasoning, claude_senior]
+    principal_architect:  [openai_reasoning, claude_architect]
+
+# Compensations that apply when a fallback lands on a weaker or same-family
+# model. The resolver records these; it does not silently absorb them.
+fallback_compensations:
+  reasoning_specialist_to_same_family: raise_effort_one_level
+  principal_architect_to_senior:       raise_effort_to_MAX_and_add_second_review
+  cross_family_reviewer_lost:          set_cross_family_review_false
 
 # ---------------------------------------------------------------------------
 # Verification ledger

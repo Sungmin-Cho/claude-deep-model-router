@@ -99,37 +99,44 @@ best fits the job regardless of provider, because both cross-provider bridges
 are verified working. Provider choice is nearly free at delegation time — you
 have already paid for a fresh context window — so it should be made on merit.
 
+Registry keys, not model ids. Resolve them through
+`config/model-routing.yaml` — concrete identifiers appear there and nowhere
+else, so this table cannot drift out of date when the registry changes:
+
 ```
-worker_fast           gpt-5.6-luna       (openai)
-worker_balanced       claude-sonnet-5    (claude)
-worker_balanced_alt   gpt-5.6-terra      (openai)  — same-family fallback only
-senior_engineer       claude-opus-5      (claude)
-reasoning_specialist  gpt-5.6-sol        (openai)
-principal_architect   claude-fable-5     (claude)
+worker_fast           openai_worker_fast       (openai)
+worker_balanced       claude_worker_balanced   (claude)
+worker_balanced_alt   openai_worker_balanced   (openai)  — same-family fallback only
+senior_engineer       claude_senior            (claude)
+reasoning_specialist  openai_reasoning         (openai)
+principal_architect   claude_architect         (claude)
 ```
 
-The escalation ladder alternates families by construction:
-`luna → sonnet-5 → opus-5 → sol → fable-5`. The first escalation crossing a
-family boundary is deliberate — if the cheap worker's failure mode is
-family-specific, staying in the family reproduces it.
+The escalation ladder alternates families by construction — openai → claude →
+claude → openai → claude. The first escalation crossing a family boundary is
+deliberate: if the cheap worker's failure mode is family-specific, staying in
+the family reproduces it.
 
 **`worker_balanced_alt` exists for bridge failures, not to shorten the ladder.**
-Use `gpt-5.6-terra` for the first escalation only when `claude-sonnet-5` is
-unreachable. Reaching for it by default would put `worker_fast` and
-`worker_balanced` in the same family and throw away the diversity that makes
-the first escalation worth taking.
+Use the OpenAI middle tier for the first escalation only when the Claude
+balanced worker is unreachable. Reaching for it by default would put
+`worker_fast` and `worker_balanced` in the same family and throw away the
+diversity that makes the first escalation worth taking.
 
 Degraded bindings for when a bridge is down are in `adapters.md`.
 
-## Why `worker_fast` is bound to `gpt-5.6-luna`
+## Why `worker_fast` is bound to the OpenAI fast tier
 
 Worth recording, because it is the one binding decision that rests on
-measurement rather than structure.
+measurement rather than structure. Prices below are quoted as of the probe date
+in the config's verification ledger; the authoritative ids and rates live in
+the registry.
 
-**Price — verified.** `gpt-5.6-luna` is $0.20 / $1.20 per million input/output
-tokens against `claude-haiku-4-5`'s $1.00 / $5.00: five times cheaper on input,
-4.2× on output, and $0.02 vs $0.10 on cached input. For the role that carries
-the volume, that difference compounds across every routine task.
+**Price — verified.** The OpenAI fast tier is $0.20 / $1.20 per million
+input/output tokens against the Claude fast tier's $1.00 / $5.00: five times
+cheaper on input, 4.2× on output, and $0.02 vs $0.10 on cached input. For the
+role that carries the volume, that difference compounds across every routine
+task.
 
 **Quality — not established.** A five-task Tier 0/1 head-to-head (spec
 implementation with edge cases, a scoped bug fix, a multi-file API migration,
@@ -143,5 +150,5 @@ quality advantage — which is exactly what the "cheapest capable model carries
 the volume" principle asks for. If a harder eval later separates them, change
 one line in the registry; the policy does not move.
 
-`claude-haiku-4-5` remains bound as the `claude_only` fallback, so a dead
-bridge costs latency and money, not capability.
+The Claude fast tier (`claude_worker_fast`) remains bound as the `claude_only`
+fallback, so a dead bridge costs latency and money, not capability.

@@ -48,9 +48,19 @@ effort: HIGH
 independent: true
 ```
 
-Exactly one independent reviewer, stronger than the implementer, from a
-different family where available. Pick the first candidate that is both
-available and a different family from the implementer:
+Exactly one independent reviewer, from a different family where available, and
+at least as strong as the implementer.
+
+"At least as strong", not "stronger": the two frontier roles are peers, so once
+the implementer is already at the top of the ladder the reviewer can only be a
+sibling. `reasoning_specialist` reviewing `senior_engineer` work — and the
+reverse — is the intended pairing, and it is the *family* difference doing the
+work there, not a tier difference. The same applies when a `MEDIUM`-band task
+gets promoted to `principal_architect` by the architecture rule: its reviewer
+is a peer, not a superior.
+
+Pick the first candidate that is both available and a different family from the
+implementer:
 
 | Implementer | Preferred reviewer |
 |---|---|

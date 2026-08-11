@@ -64,7 +64,7 @@ def test_s1_mechanical_rename_stays_cheap():
     assert out["selected_role"] == "worker_fast"
     assert out["selected_effort"] == "LOW"
     assert out["review"]["band"] == "LOW"
-    assert out["review"]["independent"] is False
+    assert out["review"]["independence_required"] is False
 
 
 def test_s2_ordinary_feature_with_clear_spec():
@@ -146,7 +146,7 @@ def test_s7_regression_auth_change_forces_dual_independent_review():
     assert at_least(out["selected_role"], "worker_balanced")
     assert band_at_least(out["review"]["band"], "HIGH")
     assert len(out["review"]["reviewers"]) == 2
-    assert out["review"]["independent"] is True
+    assert out["review"]["independence_required"] is True
 
 
 def test_s8_regression_auth_bug_unknown_root_cause():
@@ -159,7 +159,7 @@ def test_s8_regression_auth_bug_unknown_root_cause():
     assert at_least(out["selected_role"], "worker_balanced")
     assert band_at_least(out["review"]["band"], "HIGH")
     assert len(out["review"]["reviewers"]) == 2
-    assert out["review"]["independent"] is True
+    assert out["review"]["independence_required"] is True
     assert "critical_domain" in out["band_overrides_applied"]
 
 
@@ -186,7 +186,7 @@ def test_s15_regression_payments_architecture():
     assert out["selected_role"] == "principal_architect"
     assert out["review"]["band"] == "CRITICAL"
     assert len(out["review"]["reviewers"]) == 2
-    assert out["review"]["independent"] is True
+    assert out["review"]["independence_required"] is True
     assert set(out["review"]["required_checks"]) == {
         "security", "edge_cases", "rollback", "test_adequacy", "specification_compliance",
     }
@@ -235,7 +235,7 @@ def test_s16_isolation_unavailable_is_a_disclosed_degradation():
     assert CFG["human_in_the_loop"]["on_degraded_critical_pass"] == "require_human_confirmation"
     out = r(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
             blast_radius=3, reversibility=2, flags=["security_sensitive"])
-    assert out["review"]["independent"] is True  # what the policy asks for
+    assert out["review"]["independence_required"] is True  # what the policy asks for
     # ...and the runtime must downgrade the *claim*, not the requirement.
 
 
@@ -259,8 +259,8 @@ def test_s18_both_runtimes_agree_on_role_effort_and_review_band():
     assert a["review"]["band"] == b["review"]["band"]
     assert a["review"]["reviewers"] == b["review"]["reviewers"]
     assert a["risk_band"] == b["risk_band"]
-    # Only the native effort spelling is allowed to differ.
-    assert a["selected_effort_native"] == b["selected_effort_native"] or True
+    # The native effort spelling is the one thing allowed to differ; it is
+    # asserted concretely in test_defects.py::test_d9_parity_holds_...
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +292,7 @@ def test_i2_critical_flag_implies_review_band_at_least_high(flag):
         assert band_at_least(out["review"]["band"], "HIGH"), (
             f"{task_class} with {flag} produced review band {out['review']['band']}"
         )
-        assert out["review"]["independent"] is True
+        assert out["review"]["independence_required"] is True
 
 
 @pytest.mark.parametrize("flag", [
