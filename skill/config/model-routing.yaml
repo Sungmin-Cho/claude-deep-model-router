@@ -308,7 +308,11 @@ human_in_the_loop:
   # Exhausting the retry budget is a normal terminal state, not an error —
   # but it must surface to a human rather than fail silently.
   on_retry_exhaustion:          notify_human
-  on_degraded_critical_pass:    require_human_confirmation
+  # Every CRITICAL review, not only degraded ones: the router cannot verify
+  # where an isolation receipt came from, so it never treats one as proof.
+  on_any_critical_review:       require_human_confirmation
+  on_independence_unachievable: terminal
+  on_judge_unavailable:         require_human_confirmation
   on_routing_confidence_below:  0.60   # escalate the routing decision itself
 
 # ---------------------------------------------------------------------------

@@ -225,14 +225,18 @@ def test_s11_disagreement_judge_is_configured_and_bound():
 
     out = r(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
             blast_radius=3, reversibility=2, flags=["financial_sensitive"])
-    assert out["review"]["judge"] == "principal_architect"
+    # The architect is the implementer here, so it cannot also judge its own
+    # work; with no higher tier free, adjudication goes to a human.
+    assert out["review"]["judge_unavailable"] is True
+    assert out["requires_human_confirmation"] is True
 
 
 def test_s16_isolation_unavailable_is_a_disclosed_degradation():
     """The router must never claim independence it did not structurally get.
     Degradation is a runtime observation, so the policy's job is to make the
     degraded state representable and to require human confirmation."""
-    assert CFG["human_in_the_loop"]["on_degraded_critical_pass"] == "require_human_confirmation"
+    assert CFG["human_in_the_loop"]["on_any_critical_review"] == "require_human_confirmation"
+    assert CFG["human_in_the_loop"]["on_independence_unachievable"] == "terminal"
     out = r(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
             blast_radius=3, reversibility=2, flags=["security_sensitive"])
     assert out["review"]["independence_required"] is True  # what the policy asks for

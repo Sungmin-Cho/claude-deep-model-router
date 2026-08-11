@@ -212,12 +212,54 @@ def test_d3_confidence_promoted_critical_review_gets_a_judge():
     assert out["review"]["judge_model"] is not None, "the judge must also be resolved for availability"
 
 
-def test_d3_every_critical_review_has_a_resolved_judge():
+def test_d3_every_critical_review_either_seats_a_judge_or_says_it_cannot():
+    """A judge must be able to adjudicate the reviewers it sits above. When the
+    implementer is already the architect there is no higher authority in the
+    ladder, so the honest outcome is to say so and hand adjudication to a
+    human — not to seat one of the disputing parties as its own judge."""
+    known = {m["id"] for m in CFG["models"].values()}
     for task_class in TASK_CLASSES:
         out = r(task_class=task_class, complexity=3, uncertainty=3,
                 blast_radius=3, reversibility=3)
-        if out["review"]["band"] == "CRITICAL":
-            assert out["review"]["judge_model"] in {m["id"] for m in CFG["models"].values()}
+        rv = out["review"]
+        if rv["band"] != "CRITICAL" or out["terminal"]:
+            continue
+        if rv["judge_unavailable"]:
+            assert rv["judge"] is None
+            assert out["requires_human_confirmation"] is True
+            assert "human must resolve" in out["rationale"]
+        else:
+            assert rv["judge_model"] in known
+
+
+def test_d11_no_seat_is_held_twice():
+    """Worker, every reviewer, and the judge are distinct models. The judge was
+    allocated after de-confliction ran and never checked against it, so an
+    adjudicator could be the same model as a reviewer whose disagreement it was
+    brought in to settle."""
+    checked = 0
+    for out in _sweep():
+        rv = out["review"]
+        if out["terminal"] or not rv["independence_required"]:
+            continue
+        seats = [out["selected_model"], *rv["reviewer_models"], rv["judge_model"]]
+        filled = [x for x in seats if x]
+        checked += 1
+        assert len(filled) == len(set(filled)), (
+            f"{out['task_class']}/{rv['band']}: a model holds more than one seat: {seats}"
+        )
+    assert checked, "the sweep produced no dispatchable independent route"
+
+
+def test_d11_judge_is_never_weaker_than_the_reviewers_it_adjudicates():
+    for out in _sweep():
+        rv = out["review"]
+        if out["terminal"] or not rv["judge"]:
+            continue
+        floor = max((ROLES.index(x) for x in rv["reviewers"]), default=0)
+        assert ROLES.index(rv["judge"]) >= floor, (
+            f"judge {rv['judge']} sits below reviewers {rv['reviewers']}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -527,30 +569,57 @@ BINDING_SWEEP = [
     dict(runtime="codex", flags=["bridge_down"]),
 ]
 
+# Scarcity is what forces roles onto shared models, and the previous sweep
+# never created any: it varied runtime and bridge_down but never marked a model
+# unavailable, so every collision the code could actually produce lived outside
+# the sweep. Withholding models is the cheapest way to reach that state.
+_MODEL_IDS = sorted(m["id"] for m in CFG["models"].values())
+SCARCITY_SWEEP = [
+    [],
+    [_MODEL_IDS[0]],
+    _MODEL_IDS[:2],
+    _MODEL_IDS[:3],
+    _MODEL_IDS[1:4],
+    _MODEL_IDS[2:5],
+]
+
 
 def _sweep():
     for task_class in TASK_CLASSES:
         for c, u, b, rev in DIMENSION_SWEEP:
             for reasoning in (False, True):
                 for binding in BINDING_SWEEP:
-                    yield r(task_class=task_class, complexity=c, uncertainty=u,
-                            blast_radius=b, reversibility=rev,
-                            reasoning_centric=reasoning, **binding)
+                    for scarce in SCARCITY_SWEEP:
+                        try:
+                            yield r(task_class=task_class, complexity=c, uncertainty=u,
+                                    blast_radius=b, reversibility=rev,
+                                    reasoning_centric=reasoning,
+                                    unavailable_models=list(scarce), **binding)
+                        except ValidationError:
+                            # Every candidate withheld — failing closed is a
+                            # correct outcome, not a route to inspect.
+                            continue
 
 
-def test_d10_sweep_actually_reaches_the_degenerate_bindings():
-    """Guards the guard. If the sweep stops producing routes where several
-    roles share a model, everything below passes without testing anything."""
-    collapsed = 0
+def test_d10_sweep_actually_reaches_the_conditions_it_asserts_about():
+    """Guards the guard, and it has to guard three separate things.
+
+    Each round of review found the same failure: an invariant test that never
+    entered the branch where the invariant could break. A sweep that produces
+    no substitutions, no compromised routes, and no compensations proves
+    nothing about any of them.
+    """
+    substituted = compromised = compensated = 0
     for out in _sweep():
-        models = [m for m in out["review"]["reviewer_models"] if m]
-        if out["selected_model"] and len(set(models + [out["selected_model"]])) < len(models) + 1:
-            collapsed += 1
-    # Before the fix this counted thousands; after it, the sweep must still
-    # *visit* bindings where a naive role-level check would have collapsed.
-    degenerate = [out for out in _sweep()
-                  if out["review"]["reviewers"] and out.get("review", {}).get("self_review_avoided")]
-    assert degenerate, "the sweep never entered a binding needing de-confliction"
+        if out["review"].get("self_review_avoided"):
+            substituted += 1
+        if out["review"].get("independence_compromised"):
+            compromised += 1
+        if out["fallback_compensations_applied"]:
+            compensated += 1
+    assert substituted, "the sweep never needed a reviewer substitution"
+    assert compromised, "the sweep never reached an unresolvable collision"
+    assert compensated, "the sweep never exercised a fallback compensation"
 
 
 def test_d10_worker_model_is_never_one_of_its_own_reviewers():
@@ -576,26 +645,73 @@ def test_d10_two_reviewers_are_never_the_same_model():
     assert offenders == [], f"duplicate reviewer models in: {sorted(set(offenders))[:5]}"
 
 
-def test_d10_unresolvable_collision_is_disclosed_not_papered_over():
-    """When no distinct model is available for a slot, the route must say the
-    independence could not be established rather than reporting a substitution
-    that changed nothing."""
+def test_d10_unresolvable_collision_gates_rather_than_merely_disclosing():
+    """Disclosure is not a control. A route whose reviewers could not be given
+    distinct models must stop, not ship with a boolean set and hope the
+    consumer reads it."""
+    seen = 0
     for out in _sweep():
         rv = out["review"]
-        if rv.get("independence_compromised"):
-            assert rv["review_independence"] == "unavailable"
-            assert out["requires_human_confirmation"] is True
-            assert "could not be established" in out["rationale"]
-            return
+        if not rv.get("independence_compromised"):
+            continue
+        seen += 1
+        assert rv["review_independence"] == "unavailable"
+        assert out["requires_human_confirmation"] is True
+        assert "could not be established" in out["rationale"]
+    assert seen, "no compromised route in the sweep — the assertion was vacuous"
+
+
+def test_d10_compensation_path_cannot_bypass_deconfliction():
+    """The second-review compensation appends a reviewer and flips
+    `independent` to true after the band's own de-confliction has run. Checking
+    the invariant mid-pipeline protected only the paths that existed when the
+    check was written; this asserts the post-condition at the emit boundary."""
+    checked = 0
+    for out in _sweep():
+        rv = out["review"]
+        if not out["fallback_compensations_applied"] or not rv["independence_required"]:
+            continue
+        if out["terminal"] or rv.get("independence_compromised"):
+            continue
+        checked += 1
+        models = [m for m in rv["reviewer_models"] if m]
+        assert out["selected_model"] not in models
+        assert len(models) == len(set(models))
+    assert checked, "no compensated independent route in the sweep"
 
 
 def test_d10_every_recorded_substitution_actually_changed_the_model():
     """The defect this whole file exists to prevent, applied to the newest
     code: a recorded avoidance that avoided nothing."""
+    seen = 0
     for out in _sweep():
         for sub in (out["review"].get("self_review_avoided") or []):
+            seen += 1
             assert sub["replaced"] != sub["with"]
-            assert ROLES.index(sub["with"]) >= 0
+            assert sub["with"] in ROLES
+            assert sub["reason"]
+    assert seen, "no substitution in the sweep — the assertion was vacuous"
+
+
+def test_d10_substitute_is_never_weaker_than_the_implementer_where_one_exists():
+    """Restores a guard that was dropped when D10 was rewritten. A reviewer
+    below the implementer's tier cannot supply the check the implementer could
+    not perform on itself — but scarcity can leave no stronger option, and
+    taking a weaker distinct reviewer beats taking the implementer itself. The
+    assertion is therefore about disclosure, not prohibition."""
+    for out in _sweep():
+        rv = out["review"]
+        for sub in (rv.get("self_review_avoided") or []):
+            if ROLES.index(sub["with"]) < ROLES.index(out["selected_role"] or sub["with"]):
+                assert out["cross_family_review"] is not None
+                assert "Reviewer slot substituted" in out["rationale"]
+
+
+def test_d10_self_review_avoided_is_always_a_list():
+    """Documented as a list; it used to emit null when nothing was substituted,
+    so a consumer iterating it as documented hit a TypeError."""
+    for out in _sweep():
+        assert isinstance(out["review"]["self_review_avoided"], list)
 
 
 def test_d10_substitution_is_disclosed_in_the_rationale():

@@ -278,15 +278,31 @@ class Task:
         excluded instead — over-exclusion costs a cheaper model, while
         under-exclusion re-runs a known failure.
         """
-        out = set()
+        return self.failed_and_ambiguous(policy, binding)[0] | self.failed_and_ambiguous(policy, binding)[1]
+
+    def failed_and_ambiguous(self, policy: Policy, binding: dict) -> tuple[set[str], set[str]]:
+        """(models that demonstrably failed, models excluded only as ambiguous).
+
+        Excluding every binding's reading of a role alias is the safe choice —
+        under-exclusion re-runs a known failure. But reporting all of them as
+        "already failed" states something untrue about models that never ran,
+        which is the reporting-layer version of the defect this module is
+        built to avoid. The two sets are kept apart so the caution stays and
+        the claim stays accurate.
+        """
+        failed: set[str] = set()
+        ambiguous: set[str] = set()
         for item in self.prior_models:
             if item in policy.model_ids:
-                out.add(item)
+                failed.add(item)
                 continue
+            actual = binding.get(item)
+            if actual:
+                failed.add(policy.cfg["models"][actual]["id"])
             for candidate_binding in policy.cfg["role_bindings"].values():
                 if (key := candidate_binding.get(item)):
-                    out.add(policy.cfg["models"][key]["id"])
-        return out
+                    ambiguous.add(policy.cfg["models"][key]["id"])
+        return failed, ambiguous - failed
 
 
 # --------------------------------------------------------------------------
@@ -600,7 +616,7 @@ def _deconflict(spec: dict, worker: str, policy: Policy, resolver: "Resolver") -
     if substitutions or compromised:
         spec = dict(spec)
         spec["reviewers"] = reviewers
-        spec["self_review_avoided"] = substitutions or None
+        spec["self_review_avoided"] = substitutions
         spec["independence_compromised"] = compromised
     return spec
 
@@ -648,9 +664,9 @@ class Resolver:
         # A tier that already failed must not be re-emitted under a new label.
         # Role-level escalation alone is not enough: in a degraded binding the
         # top roles collapse onto one model, so "escalating" changed nothing.
-        self.failed = task.failed_model_ids(policy, self.binding)
+        self.failed, self.ambiguous = task.failed_and_ambiguous(policy, self.binding)
         self.blocked = blocked
-        self.unusable = blocked | self.failed
+        self.unusable = blocked | self.failed | self.ambiguous
 
     def _candidates(self, role: str) -> list[str]:
         cfg = self.policy.cfg
@@ -867,6 +883,62 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                 )
     compensations = applied_compensations
 
+    # Final de-confliction, at the emit boundary rather than mid-pipeline.
+    #
+    # This invariant has now been broken four times, each in a different place,
+    # because it was being enforced at one point that later code could route
+    # around: the compensation path above appends a reviewer and flips
+    # `independent` to true, so a LOW-band review that never went through
+    # de-confliction was promoted to "independent" with the worker's own model
+    # sitting in a reviewer slot. Checking in the middle protects only the
+    # paths that existed when the check was written. Checking here protects
+    # every path, including ones added later, because nothing runs after it.
+    judge_role = disagreement["default_judge"] if (
+        review["band"] == "CRITICAL" or route_path == "disagreement") else None
+
+    if review["independent"]:
+        review = _deconflict(review, worker, policy, resolver)
+
+        # The judge is a seat like any other. It was allocated after
+        # de-confliction ran and never checked against it, so an adjudicator
+        # could be the same model as one of the reviewers whose disagreement it
+        # was brought in to settle — self-adjudication, which is the same
+        # failure as self-review one level up. All seats are allocated together.
+        if judge_role:
+            taken = {resolver.peek(worker)} | {resolver.peek(x) for x in review["reviewers"]}
+            if resolver.peek(judge_role) in taken:
+                # A judge must be able to adjudicate the reviewers it is
+                # settling between, so a replacement below their tier is not a
+                # judge — it is a third opinion with less standing than the
+                # disagreement it is resolving.
+                floor = max((policy.roles.index(x) for x in review["reviewers"]), default=0)
+                pool = [x for x in policy.roles
+                        if policy.roles.index(x) >= floor
+                        and resolver.peek(x) and resolver.peek(x) not in taken]
+                replacement = max(pool, key=policy.roles.index, default=None)
+                review = dict(review)
+                if replacement:
+                    review["judge_override"] = replacement
+                    judge_role = replacement
+                else:
+                    # No independent adjudicator exists here. Say so and hand
+                    # the adjudication to a human rather than seating a judge
+                    # that is one of the parties.
+                    review["judge_unavailable"] = True
+                    judge_role = None
+
+        resolved, fallbacks, _ = resolver.resolve(
+            list(dict.fromkeys([worker] + list(review["reviewers"]) + ([judge_role] if judge_role else [])))
+        )
+        # Post-condition, asserted rather than assumed: every seat — the
+        # implementer, each reviewer, and the judge — holds a distinct model.
+        seat_roles = [worker] + list(review["reviewers"]) + ([judge_role] if judge_role else [])
+        seat_models = [resolved.get(x) for x in seat_roles]
+        filled = [m for m in seat_models if m]
+        if len(filled) != len(set(filled)):
+            review = dict(review)
+            review["independence_compromised"] = True
+
     fams = {r: policy.family_of[m] for r, m in resolved.items()}
     reviewer_families = {fams[r] for r in review["reviewers"] if r in fams}
     cross_family = len(reviewer_families) > 1 or (
@@ -875,11 +947,17 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     )
 
     review_independence = independence(review, task)
-    judge = disagreement["default_judge"] if (
-        review["band"] == "CRITICAL" or route_path == "disagreement") else None
+    judge = review.get("judge_override") or judge_role
 
     terminal = None
-    if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
+    if review.get("independence_compromised"):
+        # The band asked for independent review and no assignment of distinct
+        # models could provide it. Emitting a dispatchable route here would
+        # hand back reviewers that are the implementer wearing another label,
+        # with a boolean alongside saying so — disclosure standing in for a
+        # control. There is no safe route to emit, so none is.
+        terminal = "INDEPENDENCE_UNAVAILABLE"
+    elif task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
         terminal = "HUMAN_REQUIRED"
     elif ceiling_exhausted:
         terminal = "HUMAN_REQUIRED"
@@ -892,7 +970,16 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # gate would make the strongest control in the policy forgeable by typing.
     # So CRITICAL always asks a human, and `enforced` reports what the caller
     # claims without acting on it as proof.
-    requires_human = bool(terminal or review["band"] == "CRITICAL")
+    requires_human = bool(
+        terminal
+        or review["band"] == "CRITICAL"
+        # Disclosure is not a control. A route whose reviewers could not be
+        # given distinct models is one where the implementer reviews itself;
+        # emitting it as dispatchable and hoping the consumer reads a boolean
+        # is exactly the false-assurance shape this policy exists to avoid.
+        or review.get("independence_compromised")
+        or review.get("judge_unavailable")
+    )
 
     # A terminal route emits no execution bindings at all. Nulling only the
     # worker left a consumer able to dispatch the reviewers from a route the
@@ -926,8 +1013,9 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             "required_checks": review.get("required_checks", []),
             "judge": judge,
             "judge_model": (resolved.get(judge) if judge else None) if executable else None,
-            "self_review_avoided": review.get("self_review_avoided"),
+            "self_review_avoided": review.get("self_review_avoided") or [],
             "independence_compromised": bool(review.get("independence_compromised")),
+            "judge_unavailable": bool(review.get("judge_unavailable")),
         },
         "cross_family_review": cross_family,
         "fallbacks_applied": (
@@ -938,6 +1026,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "fallback_compensations_applied": compensations,
         "unavailable_models": sorted(resolver.blocked),
         "excluded_prior_failures": sorted(resolver.failed),
+        "excluded_as_ambiguous_alias": sorted(resolver.ambiguous),
         "escalation_count": task.prior_failures,
         "retry_count": task.prior_failures,
         "routing_confidence": confidence,
@@ -976,7 +1065,10 @@ def explain(task: Task, r: dict) -> str:
                      f"({sub['reason']}).")
     if rv.get("independence_compromised"):
         parts.append("Independence could not be established: no distinct model was available "
-                     "for every reviewer slot.")
+                     "for every seat.")
+    if rv.get("judge_unavailable"):
+        parts.append("No independent adjudicator is available at or above the reviewers' tier; "
+                     "a human must resolve any disagreement.")
     if rv["judge"]:
         parts.append(f"Judge: {rv['judge']}.")
     if rv["required_checks"]:
@@ -989,6 +1081,9 @@ def explain(task: Task, r: dict) -> str:
         parts.append(f"Compensations: {', '.join(r['fallback_compensations_applied'])}.")
     if r["excluded_prior_failures"]:
         parts.append(f"Excluded as already-failed: {', '.join(r['excluded_prior_failures'])}.")
+    if r["excluded_as_ambiguous_alias"]:
+        parts.append("Also withheld because a role alias is ambiguous across bindings "
+                     f"(these did not run): {', '.join(r['excluded_as_ambiguous_alias'])}.")
     if not r["cross_family_review"] and rv["independence_required"]:
         parts.append("cross_family_review=false — reviewers share a family; weigh the second verdict accordingly.")
     if r["requires_human_confirmation"]:

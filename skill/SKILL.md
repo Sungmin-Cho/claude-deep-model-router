@@ -153,6 +153,7 @@ normal outcomes that need a human, not routes to execute:
 |---|---|
 | `HUMAN_REQUIRED` | the retry budget is spent; no executable route is emitted |
 | `ESCALATE_ROUTING` | routing confidence fell below 0.60 — re-classify at higher effort or ask a human |
+| `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and no assignment of distinct models could provide it |
 
 If you cannot run the script, compute it by hand from the tables below — the
 script reads `config/model-routing.yaml`, and this file describes the same
@@ -397,15 +398,17 @@ review:
   band:  reviewers: []  reviewer_models: []  effort:
   independence_required:       # what the band asks for
   review_independence:         # what was actually established
-  independence_compromised:    # no distinct model was available for a slot
+  independence_compromised:    # no distinct model was available for a seat
+  judge_unavailable:           # no adjudicator at or above the reviewers' tier
   self_review_avoided: []      # [{replaced, with, reason}], only real changes
   required_checks: []
-  judge:  judge_model:
+  judge:  judge_model:         # null when judge_unavailable — a human adjudicates
 cross_family_review: true | false
 fallbacks_applied: []          # only recorded when the model actually changed
 fallback_compensations_applied: []
 unavailable_models: []
 excluded_prior_failures: []    # models withheld because they already failed
+excluded_as_ambiguous_alias: []# withheld because a role alias spans bindings; these did not run
 escalation_count:  retry_count:
 routing_confidence:
 requires_human_confirmation:

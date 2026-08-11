@@ -96,7 +96,8 @@ Three situations page a human rather than proceeding:
 | Situation | Why |
 |---|---|
 | Retry budget exhausted | Four attempts without success means the task is not what the classification said it was |
-| `CRITICAL` review whose independence is anything but `enforced` | The safety control was requested but not demonstrated; a human decides whether to accept it |
+| Any `CRITICAL` review | The router cannot verify an isolation receipt's provenance, so it never treats one as proof; a human confirms |
+| Independence or an adjudicator could not be seated | Disclosure is not a control — the route stops instead of shipping with a boolean set |
 | Routing confidence below 0.60 | The router does not trust its own classification, and classification errors propagate everywhere downstream |
 
 ## Observability
@@ -120,6 +121,8 @@ routing_metrics:
   review_band:
   reviewers: []
   review_independence: enforced | planned | degraded | unavailable | not_applicable
+  independence_compromised: true | false
+  judge_unavailable: true | false
   cross_family_review: true | false
   fallbacks_applied: []
   escalation_count:
