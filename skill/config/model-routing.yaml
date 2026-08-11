@@ -1,0 +1,465 @@
+# Model routing policy — the deployment artifact.
+#
+# This file is the single source of truth for every deterministic part of the
+# router: band boundaries, overrides, worker selection, effort floors, and
+# review policy. It intentionally contains NO classification logic — deciding a
+# task's class, its four dimension scores, and its flags is a judgment call that
+# belongs to the model, not to a config file.
+#
+# Concrete model identifiers live here and nowhere else. Routing logic addresses
+# models by role alias only, so a model rename is a one-line change in this file.
+#
+# Verification status of every identifier is recorded in `verification_ledger`
+# at the bottom. Keep it honest: "assumed" and "verified" must not blur.
+
+version: 2
+
+# ---------------------------------------------------------------------------
+# Router defaults
+# ---------------------------------------------------------------------------
+
+router:
+  default_worker: worker_fast
+  default_orchestrator: worker_fast
+  default_orchestrator_effort: HIGH
+
+  # Bands are non-overlapping and exhaustive over 0..18. All downstream policy
+  # is expressed in bands, never in raw scores — a raw-score comparison
+  # anywhere else in the system is a bug.
+  bands:
+    LOW:      { min: 0,  max: 3,  ordinal: 0 }
+    MEDIUM:   { min: 4,  max: 7,  ordinal: 1 }
+    HIGH:     { min: 8,  max: 10, ordinal: 2 }
+    CRITICAL: { min: 11, max: 18, ordinal: 3 }
+
+  # risk_score = complexity + 2*uncertainty + 2*blast_radius + reversibility
+  #
+  # Uncertainty and blast radius are double-weighted because complexity and
+  # reversibility describe what the change *is*, while uncertainty and blast
+  # radius together approximate risk-adjusted expected loss — what the change
+  # might *cost*.
+  score_weights:
+    complexity:    1
+    uncertainty:   2
+    blast_radius:  2
+    reversibility: 1
+
+  confidence:
+    escalate_below:     0.60   # re-classify at higher effort, or ask a human
+    extra_review_below: 0.80   # execute, but raise the review band one level
+
+  floors:
+    critical_domain_worker:     worker_balanced
+    critical_domain_review_band: HIGH
+    critical_domain_effort:     HIGH
+
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
+
+flags:
+  # Force band overrides. Any one of these makes the task at least HIGH.
+  critical_domain:
+    - security_sensitive
+    - auth_sensitive
+    - financial_sensitive
+    - data_integrity_sensitive
+
+  # Raise the band or force a specific path.
+  elevating:
+    - concurrency_sensitive
+    - migration
+    - public_api_change
+    - production_hotfix
+    - unknown_root_cause
+    - review_disagreement
+
+  # Inform decomposition and model choice, but never the band.
+  context:
+    - unfamiliar_codebase
+    - cross_service_change
+    - long_horizon
+    - large_context
+    - tool_heavy
+
+# Applied after the band is computed, unconditionally, for every task class.
+# Bands may only be raised by an override, never lowered.
+overrides:
+  - name: critical_domain
+    when: any_critical_domain_flag
+    effect: { band_at_least: HIGH }
+  - name: critical_irreversible
+    when: any_critical_domain_flag AND reversibility >= 2
+    effect: { band_exactly: CRITICAL }
+  - name: migration_data_integrity
+    when: migration AND data_integrity_sensitive
+    effect: { band_exactly: CRITICAL }
+  - name: production_hotfix
+    when: production_hotfix
+    effect: { band_at_least: HIGH }
+  - name: public_api_change
+    when: public_api_change
+    effect: { band_at_least: MEDIUM }
+  - name: review_disagreement
+    when: review_disagreement
+    effect: { route: disagreement_path }   # see review.disagreement
+
+# ---------------------------------------------------------------------------
+# Worker selection — by task class and band
+# ---------------------------------------------------------------------------
+#
+# `reasoning_centric` picks between the two frontier roles wherever a cell
+# reads `by_reasoning_centric`: true selects reasoning_specialist (the
+# bottleneck is deciding WHAT is correct), false selects senior_engineer (the
+# bottleneck is producing correct CODE). Default false when genuinely
+# ambiguous — code-centric routing is cheaper and recovers more gracefully.
+
+worker_selection:
+  MECHANICAL:    { LOW: worker_fast,     MEDIUM: worker_fast,     HIGH: worker_balanced,       CRITICAL: senior_engineer }
+  DOCUMENTATION: { LOW: worker_fast,     MEDIUM: worker_fast,     HIGH: worker_balanced,       CRITICAL: worker_balanced }
+  TESTING:       { LOW: worker_fast,     MEDIUM: worker_fast,     HIGH: worker_balanced,       CRITICAL: senior_engineer }
+  IMPLEMENTATION: { LOW: worker_fast,    MEDIUM: worker_fast,     HIGH: worker_balanced,       CRITICAL: by_reasoning_centric }
+  REFACTORING:   { LOW: worker_fast,     MEDIUM: worker_balanced, HIGH: worker_balanced,       CRITICAL: by_reasoning_centric }
+  DEBUGGING:     { LOW: worker_fast,     MEDIUM: worker_fast,     HIGH: worker_balanced,       CRITICAL: by_reasoning_centric }
+  INVESTIGATION: { LOW: worker_fast,     MEDIUM: worker_balanced, HIGH: reasoning_specialist,  CRITICAL: reasoning_specialist }
+  MIGRATION:     { LOW: worker_balanced, MEDIUM: worker_balanced, HIGH: senior_engineer,       CRITICAL: principal_architect }
+  ARCHITECTURE:  { LOW: worker_balanced, MEDIUM: worker_balanced, HIGH: senior_engineer,       CRITICAL: principal_architect }
+  REVIEW:        { LOW: worker_fast,     MEDIUM: worker_balanced, HIGH: senior_engineer,       CRITICAL: senior_engineer }
+  OPERATIONS:    { LOW: worker_fast,     MEDIUM: worker_balanced, HIGH: senior_engineer,       CRITICAL: senior_engineer }
+
+# Applied after the table, before effort selection.
+worker_promotions:
+  - class: ARCHITECTURE
+    when: uncertainty == 3 OR long_horizon
+    to: principal_architect
+  - class: DEBUGGING
+    when: unknown_root_cause AND prior_failures >= 2
+    to_at_least: by_reasoning_centric
+  - class: INVESTIGATION
+    when: unknown_root_cause
+    to_at_least: worker_balanced
+  - class: MIGRATION
+    when: band == CRITICAL
+    note: >
+      principal_architect applies to the architecture phase only; the
+      implementation phase runs at worker_balanced / senior_engineer.
+  - class: "*"
+    when: prior_failures >= 1
+    to_at_least: one_tier_above_failed_model
+
+# Role ordering, used by every `max(worker, X)` and `one tier above` rule.
+role_tiers:
+  - worker_fast
+  - worker_balanced
+  - senior_engineer
+  - reasoning_specialist
+  - principal_architect
+
+# ---------------------------------------------------------------------------
+# Effort
+# ---------------------------------------------------------------------------
+
+effort_levels: [MINIMAL, LOW, MEDIUM, HIGH, VERY_HIGH, MAX]
+
+effort_by_work:
+  formatting_rename:        LOW
+  boilerplate:              LOW
+  straightforward_impl:     MEDIUM
+  normal_feature:           MEDIUM
+  multi_file_feature:       HIGH
+  debugging:                HIGH
+  difficult_debugging:      VERY_HIGH
+  refactoring:              HIGH
+  multi_system_refactoring: VERY_HIGH
+  architecture:             HIGH
+  complex_architecture:     MAX
+  unknown_root_cause:       MAX
+  standard_review:          HIGH
+  adversarial_review:       MAX
+  orchestration:            HIGH
+
+# Floors override the table above — never the other way round.
+effort_floors:
+  band_HIGH:            HIGH
+  band_CRITICAL:        VERY_HIGH
+  any_critical_domain:  HIGH
+
+# ---------------------------------------------------------------------------
+# Review policy — a function of BAND ONLY
+# ---------------------------------------------------------------------------
+#
+# Review depth does not depend on which worker was selected. That independence
+# is what makes the "every task reaches review selection" invariant checkable:
+# no worker-selection branch can weaken the review.
+
+review:
+  LOW:
+    reviewers: [worker_fast]
+    effort: MEDIUM
+    independent: false
+
+  MEDIUM:
+    reviewer_count: 1
+    candidates: [worker_balanced, senior_engineer, reasoning_specialist]
+    prefer_cross_family: true
+    effort: HIGH
+    independent: true
+    # First candidate that is both available and a different family from the
+    # implementer wins.
+    preferred_by_implementer:
+      worker_fast:             worker_balanced
+      worker_balanced:         reasoning_specialist
+      worker_balanced_alt:     senior_engineer
+      senior_engineer:         reasoning_specialist
+      reasoning_specialist:    senior_engineer
+      principal_architect:     reasoning_specialist
+
+  HIGH:
+    reviewers: [senior_engineer, reasoning_specialist]
+    effort: HIGH
+    independent: true
+
+  CRITICAL:
+    reviewers: [senior_engineer, reasoning_specialist]
+    effort: MAX
+    independent: true
+    required_checks:
+      - security
+      - edge_cases
+      - rollback
+      - test_adequacy
+      - specification_compliance
+
+  disagreement:
+    default_judge: principal_architect
+    code_local_dispute_judge: senior_engineer
+    formal_reasoning_dispute_judge: reasoning_specialist
+    formal_reasoning_dispute_effort: MAX
+    resolution:
+      # R1 / R2 -> action
+      PASS+PASS:                             accept_unless_unresolved_finding
+      PASS+PASS_WITH_CHANGES:                apply_then_light_rereview
+      PASS_WITH_CHANGES+PASS_WITH_CHANGES:   apply_union_then_light_rereview
+      PASS+FAIL:                             judge
+      FAIL+PASS:                             judge
+      PASS_WITH_CHANGES+FAIL:                judge_if_high_or_critical_else_reimplement
+      FAIL+FAIL:                             reimplement
+
+# ---------------------------------------------------------------------------
+# Control loop
+# ---------------------------------------------------------------------------
+
+retry:
+  same_model_same_effort:            1
+  same_model_higher_effort:          1
+  stronger_model:                    2
+  max_total_implementation_attempts: 4
+  max_review_rounds:                 3
+  max_judge_invocations:             1
+  require_new_evidence_on_same_tier: true
+
+human_in_the_loop:
+  # Exhausting the retry budget is a normal terminal state, not an error —
+  # but it must surface to a human rather than fail silently.
+  on_retry_exhaustion:          notify_human
+  on_degraded_critical_pass:    require_human_confirmation
+  on_routing_confidence_below:  0.60   # escalate the routing decision itself
+
+# ---------------------------------------------------------------------------
+# Model registry
+# ---------------------------------------------------------------------------
+#
+# Every id below was probed in this environment. See verification_ledger.
+
+models:
+  claude_worker_fast:
+    id: claude-haiku-4-5-20251001
+    family: claude
+    verified: true
+    price_per_mtok: { input: 1.00, output: 5.00, cached_input: 0.10 }
+
+  claude_worker_balanced:
+    id: claude-sonnet-5
+    family: claude
+    verified: true
+    price_per_mtok: { input: 3.00, output: 15.00 }
+
+  claude_senior:
+    id: claude-opus-5
+    family: claude
+    verified: true
+    price_per_mtok: { input: 5.00, output: 25.00 }
+
+  claude_architect:
+    id: claude-fable-5
+    family: claude
+    verified: true
+    price_per_mtok: { input: 10.00, output: 50.00 }
+
+  openai_worker_fast:
+    id: gpt-5.6-luna
+    family: openai
+    verified: true
+    price_per_mtok: { input: 0.20, output: 1.20, cached_input: 0.02 }
+
+  openai_worker_balanced:
+    id: gpt-5.6-terra
+    family: openai
+    verified: true
+    price_per_mtok: { input: 2.00, output: 12.00 }
+
+  openai_reasoning:
+    id: gpt-5.6-sol
+    family: openai
+    verified: true
+    price_per_mtok: { input: 5.00, output: 30.00 }
+
+# ---------------------------------------------------------------------------
+# Role bindings
+# ---------------------------------------------------------------------------
+#
+# One binding, not one per runtime. Roles are filled by whichever model is best
+# for the job regardless of provider, because both cross-provider bridges are
+# verified working. The per-provider bindings below are degraded fallbacks for
+# when a bridge is down — not alternate defaults.
+
+role_bindings:
+  default:
+    worker_fast:          openai_worker_fast       # cheapest capable volume worker
+    worker_balanced:      claude_worker_balanced   # first escalation, crosses family
+    worker_balanced_alt:  openai_worker_balanced   # same-family fallback only
+    senior_engineer:      claude_senior
+    reasoning_specialist: openai_reasoning
+    principal_architect:  claude_architect
+
+  # Degraded: the codex bridge is unreachable from Claude Code.
+  claude_only:
+    worker_fast:          claude_worker_fast
+    worker_balanced:      claude_worker_balanced
+    senior_engineer:      claude_senior
+    reasoning_specialist: claude_senior            # opus at MAX effort
+    principal_architect:  claude_architect
+
+  # Degraded: the claude bridge is unreachable from Codex.
+  openai_only:
+    worker_fast:          openai_worker_fast
+    worker_balanced:      openai_worker_balanced
+    senior_engineer:      openai_reasoning
+    reasoning_specialist: openai_reasoning
+    principal_architect:  openai_reasoning         # MAX effort + second review
+
+# The alt tier exists to keep an escalation path open when the bridge dies,
+# not to shorten the ladder. Crossing families on the first escalation is the
+# point of the first escalation.
+worker_balanced_selection:
+  prefer: worker_balanced
+  use_alt_when: worker_balanced_unavailable
+
+# ---------------------------------------------------------------------------
+# Runtime adapters
+# ---------------------------------------------------------------------------
+
+effort_map:
+  claude_code:
+    MINIMAL:   low        # no distinct minimal tier exists; collapses to low
+    LOW:       low
+    MEDIUM:    medium
+    HIGH:      high
+    VERY_HIGH: xhigh
+    MAX:       max
+  codex:
+    MINIMAL:   none       # verified: `minimal` is rejected, `none` is accepted
+    LOW:       low
+    MEDIUM:    medium
+    HIGH:      high
+    VERY_HIGH: xhigh
+    MAX:       max
+
+transports:
+  claude_code:
+    native: { mechanism: agent_tool_subagent, isolation: context_isolation }
+    to_openai:
+      mechanism: "codex exec -m <id> -c model_reasoning_effort=<effort> -s <sandbox>"
+      isolation: separate_process
+      verified: true
+  codex:
+    native: { mechanism: multi_agent_subagent, isolation: unverified }
+    to_claude:
+      mechanism: "claude -p --model <id>"
+      isolation: separate_process
+      verified: true
+
+fallbacks:
+  claude_code:
+    worker_fast_unavailable:          [claude_worker_fast, worker_balanced]
+    reasoning_specialist_unavailable: [senior_engineer_one_effort_higher]
+    principal_architect_unavailable:  [senior_engineer_at_MAX_plus_extra_review]
+    cross_family_reviewer_unavailable: [strongest_same_family, set_cross_family_review_false]
+  codex:
+    worker_balanced_unavailable:      [openai_worker_balanced, reasoning_specialist_if_band_high]
+    senior_engineer_unavailable:      [reasoning_specialist]
+    principal_architect_unavailable:  [reasoning_specialist_at_MAX_plus_extra_review]
+    cross_family_reviewer_unavailable: [strongest_same_family, set_cross_family_review_false]
+
+# ---------------------------------------------------------------------------
+# Verification ledger
+# ---------------------------------------------------------------------------
+#
+# Distinguishing "verified" from "assumed" is what stops the next session from
+# building on sand. Do not promote a row without running the probe.
+
+verification_ledger:
+  probed_on: 2026-08-11
+  entries:
+    - item: "Claude model ids (haiku-4-5-20251001, sonnet-5, opus-5, fable-5)"
+      status: verified
+      evidence: "claude -p --model <id> round-trip returned OK for all four"
+
+    - item: "OpenAI model ids (gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol)"
+      status: verified
+      evidence: "codex exec -m <id> round-trip returned OK for all three"
+
+    - item: "Codex reasoning-effort values"
+      status: verified
+      evidence: >
+        none/low/medium/high/xhigh/max accepted; `minimal` rejected with an
+        API error. Probed via codex exec -c model_reasoning_effort=<v>.
+
+    - item: "Claude Code effort values"
+      status: verified
+      evidence: "low/medium/high/xhigh/max accepted by the subagent interface"
+
+    - item: "Claude Code -> OpenAI transport (codex exec)"
+      status: verified
+      evidence: "trivial round-trip succeeded; runs as a separate process"
+
+    - item: "Codex -> Claude transport (claude -p)"
+      status: verified
+      evidence: "trivial round-trip succeeded; runs as a separate process"
+
+    - item: "Codex native subagent isolation"
+      status: flag_verified_semantics_unverified
+      evidence: >
+        `codex features list` reports multi_agent as stable/true. Whether its
+        context isolation matches the Claude Agent tool's has NOT been tested.
+        Until it is, treat the first dual review on Codex as degraded unless
+        both reviewers run as separate processes.
+
+    - item: "Claude Code subagent context isolation"
+      status: assumed
+      evidence: >
+        Documented behaviour of the Agent tool; not empirically probed here.
+        Confirm before claiming independent review.
+
+    - item: "worker_fast binding: gpt-5.6-luna over claude-haiku-4-5"
+      status: price_verified_quality_unverified
+      evidence: >
+        PRICE: verified from published rates — luna $0.20/$1.20 per MTok vs
+        haiku $1.00/$5.00, i.e. 5x cheaper input and 4.2x cheaper output.
+        Cached input $0.02 vs $0.10.
+        QUALITY: NOT established. A 5-task Tier 0/1 head-to-head (47 hidden
+        pytest assertions + 5 mutants, graded only on test results) scored
+        100% for both models and 308s vs 304s wall time — the task set did
+        not discriminate. No primary source puts both models on the same
+        benchmark. The binding rests on the verified price advantage, not on
+        a demonstrated quality advantage.
