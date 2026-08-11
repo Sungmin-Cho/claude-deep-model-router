@@ -136,10 +136,15 @@ isolation happened:
 | `enforced` | one distinct session id per reviewer was supplied afterwards |
 
 `unavailable` and `degraded` are deliberately distinct: a confirmed gap and an
-unchecked one call for different responses. And a `CRITICAL` review that is not
-`enforced` requires human confirmation — the capability attestation alone must
-never clear that gate, because it is a statement about what the runtime *can*
-do, not about what it did.
+unchecked one call for different responses.
+
+**`enforced` does not unlock anything.** The router has no way to verify where
+an isolation receipt came from — it is a string the caller passed in, and
+nothing binds it to a real dispatch, to this route, or to a particular
+reviewer. So a `CRITICAL` review always asks a human, and `enforced` reports
+what the caller claims without treating it as proof. Making the strongest
+control in the policy openable by typing would be the exact failure this skill
+is about.
 
 The script exits nonzero when the route reaches a terminal state. Those are
 normal outcomes that need a human, not routes to execute:
@@ -391,7 +396,9 @@ selected_role:  selected_model:  selected_effort:  selected_effort_native:
 review:
   band:  reviewers: []  reviewer_models: []  effort:
   independence_required:       # what the band asks for
-  review_independence:         # what the runtime actually got
+  review_independence:         # what was actually established
+  independence_compromised:    # no distinct model was available for a slot
+  self_review_avoided: []      # [{replaced, with, reason}], only real changes
   required_checks: []
   judge:  judge_model:
 cross_family_review: true | false

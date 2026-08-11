@@ -198,8 +198,17 @@ class Task:
             self._require_choice("implementation_role", self.implementation_role, policy.roles)
         if self.isolation_available is not None:
             self._require_bool("isolation_available", self.isolation_available)
+        # This field is the only input that can reach `enforced`, so it gets
+        # the same strictness as everything else. It previously skipped the
+        # shared validator, and a list of integers was enough to report an
+        # independence the router had no basis for.
         if isinstance(self.isolation_evidence, str) or not isinstance(self.isolation_evidence, (list, tuple)):
             raise ValidationError("isolation_evidence: expected a list of session identifiers")
+        for item in self.isolation_evidence:
+            if not isinstance(item, str) or not item.strip():
+                raise ValidationError(
+                    f"isolation_evidence: expected non-empty strings, got {item!r}"
+                )
         self._policy = policy
 
     # -- validators ------------------------------------------------------
@@ -259,13 +268,24 @@ class Task:
         return out
 
     def failed_model_ids(self, policy: Policy, binding: dict) -> set[str]:
-        """Concrete models that already failed, whether named as a role or an id."""
+        """Concrete models that already failed, whether named as a role or an id.
+
+        A role alias is ambiguous across bindings: `senior_engineer` under a
+        degraded binding is a different model from `senior_engineer` under the
+        default one, so resolving it through only the *current* binding let a
+        model that had just failed come back under a different label after the
+        bridge recovered. Every binding that could have produced the alias is
+        excluded instead — over-exclusion costs a cheaper model, while
+        under-exclusion re-runs a known failure.
+        """
         out = set()
         for item in self.prior_models:
             if item in policy.model_ids:
                 out.add(item)
-            elif item in binding:
-                out.add(policy.cfg["models"][binding[item]]["id"])
+                continue
+            for candidate_binding in policy.cfg["role_bindings"].values():
+                if (key := candidate_binding.get(item)):
+                    out.add(policy.cfg["models"][key]["id"])
         return out
 
 
@@ -511,31 +531,86 @@ def select_review(band: str, worker: str, policy: Policy, resolver: "Resolver") 
     # itself — the exact arrangement dual review exists to prevent, in the most
     # common high-risk routes. Substitute the colliding slot, preferring a
     # replacement from a family the other reviewer does not already cover.
-    if spec["independent"] and worker in spec["reviewers"]:
-        others = [x for x in spec["reviewers"] if x != worker]
-        other_family = resolver.family_for_role(others[0]) if others else None
-        worker_tier = policy.roles.index(worker)
-        pool = [x for x in policy.roles
-                if x != worker and x not in spec["reviewers"] and resolver.peek(x)]
-
-        # Rank strength first, family second. A reviewer weaker than the
-        # implementer defeats the purpose more thoroughly than one that shares
-        # the other reviewer's family: the point of the slot is a check the
-        # implementer could not have performed on itself, and a lower tier
-        # cannot supply that. Losing family diversity is a real cost, but it is
-        # disclosed by cross_family_review; a too-weak reviewer is not.
-        def rank(role):
-            tier = policy.roles.index(role)
-            return (tier >= worker_tier,
-                    resolver.family_for_role(role) != other_family,
-                    tier)
-
-        replacement = max(pool, key=rank, default=None)
-        if replacement:
-            spec = dict(spec)
-            spec["reviewers"] = [replacement if x == worker else x for x in spec["reviewers"]]
-            spec["self_review_avoided"] = {"replaced": worker, "with": replacement}
+    if spec["independent"]:
+        spec = _deconflict(spec, worker, policy, resolver)
     return spec
+
+
+def _deconflict(spec: dict, worker: str, policy: Policy, resolver: "Resolver") -> dict:
+    """Ensure no reviewer resolves to the implementer's model, or to another
+    reviewer's.
+
+    The collision test is on the **resolved model**, not the role label. Roles
+    are not distinct models: a degraded single-provider binding maps several
+    roles onto one id, so a role-level check reported a substitution while the
+    same model kept every seat — implementer, both "independent" reviewers, and
+    the judge. Recording an avoidance that avoided nothing is the same defect
+    this module removed from the fallback and escalation paths, and it is worse
+    here because it clears a safety gate.
+
+    When no substitution can break the collision, the caller is told
+    (`independence_compromised`) rather than being handed a route that looks
+    independent.
+    """
+    worker_model = resolver.peek(worker)
+    worker_tier = policy.roles.index(worker)
+    reviewers = list(spec["reviewers"])
+    substitutions: list[dict] = []
+    taken = {worker_model} if worker_model else set()
+    compromised = False
+
+    for index, role in enumerate(reviewers):
+        model = resolver.peek(role)
+        if model is not None and model not in taken:
+            taken.add(model)
+            continue
+
+        other_models = {resolver.peek(x) for i, x in enumerate(reviewers) if i != index}
+        pool = []
+        for candidate in policy.roles:
+            if candidate in reviewers:
+                continue
+            candidate_model = resolver.peek(candidate)
+            if candidate_model is None or candidate_model in taken:
+                continue
+            pool.append((candidate, candidate_model))
+
+        # Strength first, then a family the other reviewer does not cover. A
+        # reviewer below the implementer's tier cannot supply the check the
+        # implementer could not perform on itself; a lost family difference is
+        # a real but lesser cost, and cross_family_review discloses it.
+        other_family = next((policy.family_of[m] for m in other_models if m), None)
+        pick = max(
+            pool,
+            key=lambda pair: (policy.roles.index(pair[0]) >= worker_tier,
+                              policy.family_of[pair[1]] != other_family,
+                              policy.roles.index(pair[0])),
+            default=None,
+        )
+        if pick is None:
+            compromised = True
+            continue
+        substitutions.append({"replaced": role, "with": pick[0],
+                              "reason": "would have shared a model with the implementer"
+                                        if model == worker_model else
+                                        "would have duplicated another reviewer"})
+        reviewers[index] = pick[0]
+        taken.add(pick[1])
+
+    if substitutions or compromised:
+        spec = dict(spec)
+        spec["reviewers"] = reviewers
+        spec["self_review_avoided"] = substitutions or None
+        spec["independence_compromised"] = compromised
+    return spec
+
+
+def _extra_reviewer(review: dict, worker: str, policy: "Policy", resolver: "Resolver") -> str | None:
+    """A reviewer whose model is not already in use by the worker or a peer."""
+    taken = {resolver.peek(worker)} | {resolver.peek(x) for x in review["reviewers"]}
+    pool = [x for x in policy.roles
+            if x not in review["reviewers"] and x != worker and resolver.peek(x) not in taken]
+    return max(pool, key=policy.roles.index, default=None)
 
 
 # --------------------------------------------------------------------------
@@ -670,10 +745,18 @@ def independence(review: dict, task: Task) -> str:
     """
     if not review["independent"]:
         return "not_applicable"
+    # A reviewer set the router could not de-conflict is not independent, no
+    # matter what the caller attests.
+    if review.get("independence_compromised"):
+        return "unavailable"
     if task.isolation_available is False:
         return "unavailable"
-    distinct = len({e for e in task.isolation_evidence if e})
-    if distinct >= len(review["reviewers"]) and distinct >= 2:
+    distinct = len({e.strip() for e in task.isolation_evidence if e.strip()})
+    # One identifier per reviewer — no more, and no hidden extra minimum. The
+    # old `and distinct >= 2` made a single-reviewer MEDIUM band unable to
+    # reach `enforced` even when the caller did exactly what both documents
+    # instruct, with no note explaining the refusal.
+    if review["reviewers"] and distinct >= len(review["reviewers"]):
         return "enforced"
     if task.isolation_available is True:
         return "planned"
@@ -734,27 +817,55 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # from a preliminary role set let a route whose *final* fallbacks pushed it
     # below the escalation floor still emit as executable.
     review_band = band
+    promoted_once = False
     for _ in range(MAX_PROMOTION_PASSES):
         review = select_review(review_band, worker, policy, resolver)
         resolved, fallbacks, compensations = resolver.resolve(roles_for(review))
         confidence = routing_confidence(task, fallbacks)
         threshold = cfg["router"]["confidence"]["extra_review_below"]
-        if confidence < threshold and review_band != "CRITICAL":
+        # The policy is "raise the review band ONE level" — the loop exists so
+        # the terminal decision sees the final confidence, not to change how
+        # far the promotion goes. Confidence is very nearly invariant in the
+        # review band, so a loop that re-promotes on every pass walks to
+        # CRITICAL every time; that regression put a CRITICAL human gate on
+        # routine documentation work, and a gate that fires on everything
+        # trains people to wave it through.
+        if confidence < threshold and review_band != "CRITICAL" and not promoted_once:
             promoted = policy.bands[policy.bands.index(review_band) + 1]
             overrides.append(f"low_routing_confidence_raised_review_to_{promoted}")
             review_band = promoted
+            promoted_once = True
             continue
         break
     else:  # pragma: no cover - the band ladder is shorter than the pass budget
         raise ConfigError("review band promotion failed to reach a fixed point")
 
+    applied_compensations: list[str] = []
     for note in compensations:
         if note == "raise_effort_one_level":
             effort = policy.effort_up(effort)
             effort_notes.append("compensation: fallback lost family diversity, effort +1")
+            applied_compensations.append(note)
         elif note == "raise_effort_to_MAX_and_add_second_review":
             effort = policy.efforts[-1]
             effort_notes.append("compensation: architect downgraded, effort raised to MAX")
+            # The name promises two things. Recording it while doing one is the
+            # same false report this module exists to avoid, so the extra
+            # reviewer is actually added — and if none can be resolved, the
+            # compensation is not claimed.
+            extra = _extra_reviewer(review, worker, policy, resolver)
+            if extra:
+                review = dict(review)
+                review["reviewers"] = list(review["reviewers"]) + [extra]
+                review["independent"] = True
+                resolved, fallbacks, _ = resolver.resolve(roles_for(review))
+                applied_compensations.append(note)
+                effort_notes.append(f"compensation: added a second independent review ({extra})")
+            else:
+                effort_notes.append(
+                    "compensation NOT fully applied: no additional reviewer could be resolved"
+                )
+    compensations = applied_compensations
 
     fams = {r: policy.family_of[m] for r, m in resolved.items()}
     reviewer_families = {fams[r] for r in review["reviewers"] if r in fams}
@@ -775,10 +886,13 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     elif confidence < cfg["router"]["confidence"]["escalate_below"]:
         terminal = "ESCALATE_ROUTING"
 
-    requires_human = bool(
-        terminal
-        or (review["band"] == "CRITICAL" and review_independence != "enforced")
-    )
+    # The router cannot verify where an isolation receipt came from. It is a
+    # caller-supplied string; nothing here binds it to an actual dispatch, to
+    # this route, or to a particular reviewer. Letting it clear the CRITICAL
+    # gate would make the strongest control in the policy forgeable by typing.
+    # So CRITICAL always asks a human, and `enforced` reports what the caller
+    # claims without acting on it as proof.
+    requires_human = bool(terminal or review["band"] == "CRITICAL")
 
     # A terminal route emits no execution bindings at all. Nulling only the
     # worker left a consumer able to dispatch the reviewers from a route the
@@ -813,13 +927,19 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             "judge": judge,
             "judge_model": (resolved.get(judge) if judge else None) if executable else None,
             "self_review_avoided": review.get("self_review_avoided"),
+            "independence_compromised": bool(review.get("independence_compromised")),
         },
         "cross_family_review": cross_family,
-        "fallbacks_applied": fallbacks,
+        "fallbacks_applied": (
+            fallbacks if executable
+            else [f.split(":")[0] + ": binding withheld (terminal route)"
+                  if ":" in f and "->" in f else f for f in fallbacks]
+        ),
         "fallback_compensations_applied": compensations,
         "unavailable_models": sorted(resolver.blocked),
         "excluded_prior_failures": sorted(resolver.failed),
         "escalation_count": task.prior_failures,
+        "retry_count": task.prior_failures,
         "routing_confidence": confidence,
         "requires_human_confirmation": requires_human,
         "notes": worker_notes + effort_notes,
@@ -851,9 +971,12 @@ def explain(task: Task, r: dict) -> str:
     parts.append(f"Review band {rv['band']}: {', '.join(rv['reviewers'])}, "
                  f"independence_required={rv['independence_required']}, "
                  f"review_independence={rv['review_independence']}.")
-    if (sub := rv.get("self_review_avoided")):
-        parts.append(f"Reviewer slot substituted: {sub['replaced']} -> {sub['with']}, because "
-                     "the worker would otherwise have reviewed its own output.")
+    for sub in (rv.get("self_review_avoided") or []):
+        parts.append(f"Reviewer slot substituted: {sub['replaced']} -> {sub['with']} "
+                     f"({sub['reason']}).")
+    if rv.get("independence_compromised"):
+        parts.append("Independence could not be established: no distinct model was available "
+                     "for every reviewer slot.")
     if rv["judge"]:
         parts.append(f"Judge: {rv['judge']}.")
     if rv["required_checks"]:
@@ -933,7 +1056,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValidationError(f"--json has unknown field(s): {', '.join(sorted(unknown))}")
             if (missing := [f for f in REQUIRED_JSON_FIELDS if f not in payload]):
                 raise ValidationError(f"--json is missing required field(s): {', '.join(missing)}")
-            task = Task(**payload)
+            try:
+                task = Task(**payload)
+            except TypeError as exc:
+                raise ValidationError(f"--json field types are invalid: {exc}") from None
         else:
             if (missing := [n for n in REQUIRED_JSON_FIELDS if getattr(args, n) is None]):
                 p.error("missing required arguments: "

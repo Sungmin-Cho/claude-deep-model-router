@@ -506,59 +506,102 @@ def test_d9_parity_holds_including_the_native_effort_spelling():
 
 
 # ---------------------------------------------------------------------------
-# D10 — an implementer must never review its own output
+# D10 — an implementer must never review its own MODEL
 # ---------------------------------------------------------------------------
 #
-# Found by self-audit after a reviewer flagged it as out-of-diff and it was
-# deferred. It should not have been: at HIGH and CRITICAL the reviewer pair is
-# fixed, so every task whose worker was already `senior_engineer` or
-# `reasoning_specialist` had that same model as one of its two "independent"
-# reviewers — 12 combinations, in the most common high-risk routes. It is the
-# arrangement the whole dual-review structure exists to prevent.
+# The first version of this check compared role labels, and the sweep never set
+# runtime or flags — so it only ever ran the default binding, where the role
+# check already held. Under a degraded single-provider binding several roles
+# resolve to one model, and there the worker, both "independent" reviewers and
+# the judge were all the same model while the route reported a substitution and
+# cleared the human gate.
+#
+# Roles are labels. Models are what actually runs. The invariant is about
+# models, so the test is too — and it sweeps the bindings where roles collapse.
 
 DIMENSION_SWEEP = [(0, 0, 0, 0), (2, 2, 2, 0), (3, 2, 3, 1), (3, 3, 3, 3), (2, 2, 2, 2)]
+BINDING_SWEEP = [
+    dict(runtime="claude_code", flags=[]),
+    dict(runtime="claude_code", flags=["bridge_down"]),
+    dict(runtime="codex", flags=[]),
+    dict(runtime="codex", flags=["bridge_down"]),
+]
 
 
 def _sweep():
     for task_class in TASK_CLASSES:
         for c, u, b, rev in DIMENSION_SWEEP:
             for reasoning in (False, True):
-                yield r(task_class=task_class, complexity=c, uncertainty=u,
-                        blast_radius=b, reversibility=rev, reasoning_centric=reasoning)
+                for binding in BINDING_SWEEP:
+                    yield r(task_class=task_class, complexity=c, uncertainty=u,
+                            blast_radius=b, reversibility=rev,
+                            reasoning_centric=reasoning, **binding)
 
 
-def test_d10_worker_is_never_its_own_independent_reviewer():
-    offenders = [
-        (out["task_class"], out["review"]["band"], out["selected_role"])
-        for out in _sweep()
-        if out["review"]["independence_required"] and out["selected_role"] in out["review"]["reviewers"]
-    ]
-    assert offenders == [], f"worker reviews its own output in: {sorted(set(offenders))}"
+def test_d10_sweep_actually_reaches_the_degenerate_bindings():
+    """Guards the guard. If the sweep stops producing routes where several
+    roles share a model, everything below passes without testing anything."""
+    collapsed = 0
+    for out in _sweep():
+        models = [m for m in out["review"]["reviewer_models"] if m]
+        if out["selected_model"] and len(set(models + [out["selected_model"]])) < len(models) + 1:
+            collapsed += 1
+    # Before the fix this counted thousands; after it, the sweep must still
+    # *visit* bindings where a naive role-level check would have collapsed.
+    degenerate = [out for out in _sweep()
+                  if out["review"]["reviewers"] and out.get("review", {}).get("self_review_avoided")]
+    assert degenerate, "the sweep never entered a binding needing de-confliction"
 
 
-def test_d10_substitution_never_picks_a_weaker_reviewer_than_the_implementer():
-    """A reviewer below the implementer's tier cannot supply the check the
-    implementer could not perform on itself. Losing family diversity is the
-    lesser cost, and it is disclosed; a too-weak reviewer is not."""
+def test_d10_worker_model_is_never_one_of_its_own_reviewers():
+    offenders = []
     for out in _sweep():
         rv = out["review"]
-        if not rv.get("self_review_avoided"):
+        if not rv["independence_required"] or out["terminal"]:
             continue
-        # Only the substituted slot is under this rule. The other reviewer is
-        # the band's fixed pair, which is allowed to sit below a top-tier
-        # implementer by design — the architect is reviewed by the frontier
-        # pair, not by something above it.
-        substitute = rv["self_review_avoided"]["with"]
-        assert ROLES.index(substitute) >= ROLES.index(out["selected_role"]), (
-            f"{out['task_class']}/{rv['band']}: substitute {substitute} is weaker "
-            f"than implementer {out['selected_role']}"
-        )
+        if out["selected_model"] and out["selected_model"] in rv["reviewer_models"]:
+            offenders.append((out["task_class"], rv["band"], out["selected_model"]))
+    assert offenders == [], f"worker model also reviews its own output in: {sorted(set(offenders))[:5]}"
+
+
+def test_d10_two_reviewers_are_never_the_same_model():
+    offenders = []
+    for out in _sweep():
+        rv = out["review"]
+        if not rv["independence_required"] or out["terminal"]:
+            continue
+        models = [m for m in rv["reviewer_models"] if m]
+        if len(models) != len(set(models)):
+            offenders.append((out["task_class"], rv["band"], tuple(models)))
+    assert offenders == [], f"duplicate reviewer models in: {sorted(set(offenders))[:5]}"
+
+
+def test_d10_unresolvable_collision_is_disclosed_not_papered_over():
+    """When no distinct model is available for a slot, the route must say the
+    independence could not be established rather than reporting a substitution
+    that changed nothing."""
+    for out in _sweep():
+        rv = out["review"]
+        if rv.get("independence_compromised"):
+            assert rv["review_independence"] == "unavailable"
+            assert out["requires_human_confirmation"] is True
+            assert "could not be established" in out["rationale"]
+            return
+
+
+def test_d10_every_recorded_substitution_actually_changed_the_model():
+    """The defect this whole file exists to prevent, applied to the newest
+    code: a recorded avoidance that avoided nothing."""
+    for out in _sweep():
+        for sub in (out["review"].get("self_review_avoided") or []):
+            assert sub["replaced"] != sub["with"]
+            assert ROLES.index(sub["with"]) >= 0
 
 
 def test_d10_substitution_is_disclosed_in_the_rationale():
     for out in _sweep():
         if out["review"].get("self_review_avoided"):
-            assert "reviewed its own output" in out["rationale"]
+            assert "Reviewer slot substituted" in out["rationale"]
             return
     pytest.fail("no substitution occurred in the sweep — the assertion was vacuous")
 

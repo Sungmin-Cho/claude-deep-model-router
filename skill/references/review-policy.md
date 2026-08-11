@@ -181,9 +181,22 @@ being folded into "unknown".
 
 **`planned` is not `enforced`.** A route is computed before any reviewer runs,
 so nothing available at routing time can prove isolation happened. A caller's
-attestation that isolation is *achievable* is a capability claim; only distinct
-per-reviewer session identifiers, supplied afterwards, are evidence. Anything
-short of `enforced` at band `CRITICAL` requires human confirmation.
+attestation that isolation is *achievable* is a capability claim; distinct
+per-reviewer session identifiers, supplied afterwards, are the closest thing to
+evidence the interface has.
+
+**But `enforced` is still only a report.** The router cannot verify a receipt's
+provenance — it is a caller-supplied string, unbound to any actual dispatch. A
+`CRITICAL` review therefore always requires human confirmation regardless of
+what independence reports. Anything else would let the policy's strongest
+control be opened by typing two words, which is precisely the false assurance
+this section exists to prevent.
+
+**Independence is also a property of the resolved models, not the roles.** Two
+reviewer roles that resolve to the same model are one reviewer with two labels.
+Under a degraded single-provider binding this is the normal case, so the router
+substitutes on resolved-model collisions and reports
+`independence_compromised` when no distinct model is available for a slot.
 
 When real isolation cannot be achieved, run the reviewers sequentially with the
 second explicitly instructed to form its verdict *before* being shown anything
