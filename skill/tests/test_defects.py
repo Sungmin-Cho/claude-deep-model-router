@@ -693,38 +693,132 @@ def test_d10_every_recorded_substitution_actually_changed_the_model():
     assert seen, "no substitution in the sweep — the assertion was vacuous"
 
 
-def test_d10_substitute_is_never_weaker_than_the_implementer_where_one_exists():
-    """Restores a guard that was dropped when D10 was rewritten. A reviewer
-    below the implementer's tier cannot supply the check the implementer could
-    not perform on itself — but scarcity can leave no stronger option, and
-    taking a weaker distinct reviewer beats taking the implementer itself. The
-    assertion is therefore about disclosure, not prohibition."""
+def test_d10_a_below_tier_substitute_is_only_taken_when_nothing_better_is_free():
+    """Scarcity can leave no reviewer at or above the implementer's tier, and a
+    weaker distinct reviewer still beats the implementer reviewing itself. What
+    must not happen is taking a weaker one while a stronger one sits unused.
+
+    The previous version of this test asserted `cross_family_review is not
+    None` (always true, it is a bool) and that the rationale contains a string
+    `explain()` emits unconditionally on that branch — the same shape as the
+    `or True` tautology `test_d9` forbids, so the invariant in its own name was
+    never checked."""
+    checked = 0
     for out in _sweep():
         rv = out["review"]
-        for sub in (rv.get("self_review_avoided") or []):
-            if ROLES.index(sub["with"]) < ROLES.index(out["selected_role"] or sub["with"]):
-                assert out["cross_family_review"] is not None
-                assert "Reviewer slot substituted" in out["rationale"]
+        if out["terminal"] or not out["selected_role"]:
+            continue
+        worker_tier = ROLES.index(out["selected_role"])
+        weak = [x for x in rv["reviewers"] if ROLES.index(x) < worker_tier]
+        if not weak:
+            continue
+        checked += 1
+        used = {out["selected_model"], *(m for m in rv["reviewer_models"] if m)}
+        stronger_free = [
+            role for role in ROLES
+            if ROLES.index(role) >= worker_tier and role not in rv["reviewers"]
+        ]
+        # A stronger role only counts as "free" if it would resolve to a model
+        # nobody holds; otherwise picking it would have created a collision.
+        assert all(
+            m in used
+            for role in stronger_free
+            for m in [_peek_model(out, role)]
+            if m is not None
+        ), f"{out['task_class']}/{rv['band']}: took {weak} while a stronger model was unused"
+    assert checked, "no below-tier substitution in the sweep — the assertion was vacuous"
 
 
-def test_d10_self_review_avoided_is_always_a_list():
-    """Documented as a list; it used to emit null when nothing was substituted,
-    so a consumer iterating it as documented hit a TypeError."""
-    for out in _sweep():
-        assert isinstance(out["review"]["self_review_avoided"], list)
+def _peek_model(out, role):
+    """The model a role resolved to in this route, if it appears in it."""
+    if role == out["selected_role"]:
+        return out["selected_model"]
+    rv = out["review"]
+    for name, model in zip(rv["reviewers"], rv["reviewer_models"]):
+        if name == role:
+            return model
+    if rv["judge"] == role:
+        return rv["judge_model"]
+    return None
 
 
-def test_d10_substitution_is_disclosed_in_the_rationale():
-    for out in _sweep():
-        if out["review"].get("self_review_avoided"):
-            assert "Reviewer slot substituted" in out["rationale"]
-            return
-    pytest.fail("no substitution occurred in the sweep — the assertion was vacuous")
+# ---------------------------------------------------------------------------
+# D12 — the disagreement path is a seat allocator too
+# ---------------------------------------------------------------------------
+#
+# `route_path == "disagreement"` binds a judge at ANY band, but seat allocation
+# used to sit behind `if review["independent"]`, and LOW declares
+# `independent: false`. The code's blind spot and the test suite's blind spot
+# were the same one: the sweep never set `review_disagreement` either.
+
+DISAGREEMENT_SWEEP = [
+    ["review_disagreement"],
+    ["review_disagreement", "bridge_down"],
+    ["review_disagreement", "long_horizon"],
+    ["review_disagreement", "auth_sensitive"],
+]
 
 
-def test_d10_low_band_self_review_is_intentional_not_a_bug():
-    """LOW explicitly does not ask for independence, so worker_fast reviewing
-    worker_fast there is the documented design, not the defect above."""
-    out = r(task_class="MECHANICAL")
-    assert out["review"]["independence_required"] is False
-    assert out["selected_role"] in out["review"]["reviewers"]
+def _disagreement_sweep():
+    for task_class in TASK_CLASSES:
+        for c, u, b, rev in DIMENSION_SWEEP:
+            for flags in DISAGREEMENT_SWEEP:
+                for runtime in ("claude_code", "codex"):
+                    for scarce in SCARCITY_SWEEP:
+                        try:
+                            yield r(task_class=task_class, complexity=c, uncertainty=u,
+                                    blast_radius=b, reversibility=rev, flags=list(flags),
+                                    runtime=runtime, unavailable_models=list(scarce))
+                        except ValidationError:
+                            continue
+
+
+def test_d12_sweep_reaches_low_band_disagreement_routes():
+    low = [o for o in _disagreement_sweep()
+           if not o["terminal"] and o["review"]["band"] == "LOW" and o["review"]["judge"]]
+    assert low, "the sweep never produced a LOW-band route with a judge"
+
+
+def test_d12_the_judge_is_never_a_party_at_any_band():
+    """An adjudicator brought in to settle a dispute must not be one of the
+    parties. LOW's worker-reviews-itself is documented design; the judge seat
+    is not covered by that exemption."""
+    checked = 0
+    for out in _disagreement_sweep():
+        rv = out["review"]
+        if out["terminal"] or not rv["judge_model"]:
+            continue
+        checked += 1
+        parties = {out["selected_model"], *(m for m in rv["reviewer_models"] if m)}
+        assert rv["judge_model"] not in parties, (
+            f"{out['task_class']}/{rv['band']}: judge {rv['judge_model']} is also a party"
+        )
+    assert checked, "no seated judge in the disagreement sweep"
+
+
+def test_d12_judge_unavailable_gates_and_explains():
+    seen = 0
+    for out in _disagreement_sweep():
+        rv = out["review"]
+        if out["terminal"] or not rv["judge_unavailable"]:
+            continue
+        seen += 1
+        assert rv["judge"] is None and rv["judge_model"] is None
+        assert out["requires_human_confirmation"] is True
+        assert "human must resolve" in out["rationale"]
+    assert seen, "no judge_unavailable route in the sweep — the assertion was vacuous"
+
+
+def test_d12_judge_reclaims_a_tier_a_reviewer_did_not_need():
+    """Allocation is greedy — worker, then reviewers, then judge — and the
+    reviewer step maximises tier, so the judge could be told nothing adequate
+    was free while a model sat unused behind a reviewer that did not need it.
+    This is the exact route that exhibited it; a stop nobody can act on is as
+    unhelpful as a missing one."""
+    out = r(task_class="MECHANICAL", flags=["review_disagreement"],
+            unavailable_models=["claude-fable-5"])
+    rv = out["review"]
+    assert rv["judge_unavailable"] is False
+    assert rv["judge_model"] is not None
+    parties = {out["selected_model"], *(m for m in rv["reviewer_models"] if m)}
+    assert rv["judge_model"] not in parties

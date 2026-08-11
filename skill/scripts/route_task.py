@@ -267,19 +267,6 @@ class Task:
                 out.extend(r for r, k in binding.items() if k == key and r in policy.roles)
         return out
 
-    def failed_model_ids(self, policy: Policy, binding: dict) -> set[str]:
-        """Concrete models that already failed, whether named as a role or an id.
-
-        A role alias is ambiguous across bindings: `senior_engineer` under a
-        degraded binding is a different model from `senior_engineer` under the
-        default one, so resolving it through only the *current* binding let a
-        model that had just failed come back under a different label after the
-        bridge recovered. Every binding that could have produced the alias is
-        excluded instead — over-exclusion costs a cheaper model, while
-        under-exclusion re-runs a known failure.
-        """
-        return self.failed_and_ambiguous(policy, binding)[0] | self.failed_and_ambiguous(policy, binding)[1]
-
     def failed_and_ambiguous(self, policy: Policy, binding: dict) -> tuple[set[str], set[str]]:
         """(models that demonstrably failed, models excluded only as ambiguous).
 
@@ -621,6 +608,61 @@ def _deconflict(spec: dict, worker: str, policy: Policy, resolver: "Resolver") -
     return spec
 
 
+def _seat_judge(review: dict, worker: str, judge_role: str, policy: "Policy",
+                resolver: "Resolver") -> tuple[dict, str | None]:
+    """Give the judge a model no other seat holds, at or above the reviewers'
+    tier.
+
+    Allocation is greedy — worker, then reviewers, then judge — and the
+    reviewer step maximises tier, so the judge could be told no adequate model
+    was free while one sat unused behind a reviewer that did not need it. When
+    that happens, one reviewer is re-seated lower (never below the implementer)
+    to release the top tier, and the judge is tried again. Reporting
+    `judge_unavailable` while a valid full assignment exists is a false stop,
+    and a stop nobody can act on is as unhelpful as a missing one.
+    """
+    def taken(reviewers):
+        return {resolver.peek(worker)} | {resolver.peek(x) for x in reviewers}
+
+    def pick(reviewers):
+        floor = max((policy.roles.index(x) for x in reviewers), default=0)
+        used = taken(reviewers)
+        pool = [x for x in policy.roles
+                if policy.roles.index(x) >= floor and resolver.peek(x)
+                and resolver.peek(x) not in used]
+        return max(pool, key=policy.roles.index, default=None)
+
+    reviewers = list(review["reviewers"])
+    if resolver.peek(judge_role) not in taken(reviewers):
+        return review, judge_role
+
+    if (found := pick(reviewers)):
+        review = dict(review)
+        return review, found
+
+    # Retry once, freeing the highest reviewer seat if a distinct lower one
+    # (still at or above the implementer) can take its place.
+    worker_tier = policy.roles.index(worker)
+    highest = max(range(len(reviewers)), key=lambda i: policy.roles.index(reviewers[i]), default=None)
+    if highest is not None:
+        used = taken([x for i, x in enumerate(reviewers) if i != highest])
+        alternatives = [x for x in policy.roles
+                        if x not in reviewers and policy.roles.index(x) >= worker_tier
+                        and resolver.peek(x) and resolver.peek(x) not in used]
+        for alt in sorted(alternatives, key=policy.roles.index):
+            trial = list(reviewers)
+            trial[highest] = alt
+            if (found := pick(trial)) and resolver.peek(found) not in taken(trial):
+                review = dict(review)
+                review["reviewers"] = trial
+                review.setdefault("self_review_avoided", [])
+                return review, found
+
+    review = dict(review)
+    review["judge_unavailable"] = True
+    return review, None
+
+
 def _extra_reviewer(review: dict, worker: str, policy: "Policy", resolver: "Resolver") -> str | None:
     """A reviewer whose model is not already in use by the worker or a peer."""
     taken = {resolver.peek(worker)} | {resolver.peek(x) for x in review["reviewers"]}
@@ -896,48 +938,48 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     judge_role = disagreement["default_judge"] if (
         review["band"] == "CRITICAL" or route_path == "disagreement") else None
 
+    # Seat allocation. This block is unconditional on purpose.
+    #
+    # The previous version wrapped it in `if review["independent"]:`, which is
+    # how the same defect survived a fifth round: a check moved to the boundary
+    # but placed behind a condition is not a boundary, it is a mid-pipeline
+    # check in a new location. The disagreement path sets a judge at ANY band,
+    # and LOW declares `independent: false`, so LOW + disagreement skipped seat
+    # allocation entirely and the implementer adjudicated its own work.
+    #
+    # Reviewer de-confliction is still gated on `independent` — LOW's
+    # worker-reviews-itself is documented design. The judge is not covered by
+    # that exemption: an adjudicator brought in to settle a dispute must not be
+    # one of the parties, whatever the band.
     if review["independent"]:
         review = _deconflict(review, worker, policy, resolver)
 
-        # The judge is a seat like any other. It was allocated after
-        # de-confliction ran and never checked against it, so an adjudicator
-        # could be the same model as one of the reviewers whose disagreement it
-        # was brought in to settle — self-adjudication, which is the same
-        # failure as self-review one level up. All seats are allocated together.
-        if judge_role:
-            taken = {resolver.peek(worker)} | {resolver.peek(x) for x in review["reviewers"]}
-            if resolver.peek(judge_role) in taken:
-                # A judge must be able to adjudicate the reviewers it is
-                # settling between, so a replacement below their tier is not a
-                # judge — it is a third opinion with less standing than the
-                # disagreement it is resolving.
-                floor = max((policy.roles.index(x) for x in review["reviewers"]), default=0)
-                pool = [x for x in policy.roles
-                        if policy.roles.index(x) >= floor
-                        and resolver.peek(x) and resolver.peek(x) not in taken]
-                replacement = max(pool, key=policy.roles.index, default=None)
-                review = dict(review)
-                if replacement:
-                    review["judge_override"] = replacement
-                    judge_role = replacement
-                else:
-                    # No independent adjudicator exists here. Say so and hand
-                    # the adjudication to a human rather than seating a judge
-                    # that is one of the parties.
-                    review["judge_unavailable"] = True
-                    judge_role = None
+    if judge_role:
+        review, judge_role = _seat_judge(review, worker, judge_role, policy, resolver)
 
-        resolved, fallbacks, _ = resolver.resolve(
-            list(dict.fromkeys([worker] + list(review["reviewers"]) + ([judge_role] if judge_role else [])))
-        )
-        # Post-condition, asserted rather than assumed: every seat — the
-        # implementer, each reviewer, and the judge — holds a distinct model.
-        seat_roles = [worker] + list(review["reviewers"]) + ([judge_role] if judge_role else [])
-        seat_models = [resolved.get(x) for x in seat_roles]
-        filled = [m for m in seat_models if m]
+    resolved, fallbacks, _ = resolver.resolve(
+        list(dict.fromkeys([worker] + list(review["reviewers"])
+                           + ([judge_role] if judge_role else [])))
+    )
+
+    # Post-condition, asserted rather than assumed. Reviewer duplication is
+    # only a defect where independence was requested; a judge sharing any seat
+    # is a defect always.
+    seat_models = {
+        "worker": resolved.get(worker),
+        **{f"reviewer_{i}": resolved.get(x) for i, x in enumerate(review["reviewers"])},
+    }
+    if review["independent"]:
+        filled = [m for m in seat_models.values() if m]
         if len(filled) != len(set(filled)):
             review = dict(review)
             review["independence_compromised"] = True
+    if judge_role:
+        judge_model = resolved.get(judge_role)
+        if judge_model and judge_model in [m for m in seat_models.values() if m]:
+            review = dict(review)
+            review["judge_unavailable"] = True
+            judge_role = None
 
     fams = {r: policy.family_of[m] for r, m in resolved.items()}
     reviewer_families = {fams[r] for r in review["reviewers"] if r in fams}
@@ -947,7 +989,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     )
 
     review_independence = independence(review, task)
-    judge = review.get("judge_override") or judge_role
+    judge = judge_role
 
     terminal = None
     if review.get("independence_compromised"):

@@ -91,13 +91,14 @@ wrong route costs the most.
 
 ## Human-in-the-loop
 
-Three situations page a human rather than proceeding:
+These situations stop or gate rather than proceeding:
 
 | Situation | Why |
 |---|---|
 | Retry budget exhausted | Four attempts without success means the task is not what the classification said it was |
 | Any `CRITICAL` review | The router cannot verify an isolation receipt's provenance, so it never treats one as proof; a human confirms |
-| Independence or an adjudicator could not be seated | Disclosure is not a control — the route stops instead of shipping with a boolean set |
+| Independence could not be established | **Terminal.** Disclosure is not a control — a route whose reviewers cannot hold distinct models is one where the implementer reviews itself |
+| No adjudicator could be seated | **Human confirmation.** The route is still dispatchable; what a human takes over is adjudicating a disagreement, should one arise |
 | Routing confidence below 0.60 | The router does not trust its own classification, and classification errors propagate everywhere downstream |
 
 ## Observability
