@@ -328,7 +328,10 @@ human_in_the_loop:
   # it cannot see. Terminal states stay 1; invalid input stays 2.
   on_review_depth_reduced:      require_human_confirmation
   human_gate_exit_status:       3
-  on_routing_confidence_below:  0.60   # escalate the routing decision itself
+  # `on_routing_confidence_below` used to sit here holding 0.60 — the same
+  # number as `router.confidence.escalate_below`, which is the one the router
+  # reads. Two places holding one number is the drift this file's header
+  # forbids, and round 10's instrumented test proved this copy was never read.
 
 # ---------------------------------------------------------------------------
 # Model registry

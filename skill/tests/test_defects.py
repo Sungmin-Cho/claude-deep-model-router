@@ -16,6 +16,7 @@ import itertools
 import json
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -914,18 +915,113 @@ DOCUMENTED_BUT_UNREAD = {
                              "worker_selection is what executes",
     "router.default_orchestrator": "guidance for the calling agent, not the router",
     "router.default_orchestrator_effort": "guidance for the calling agent",
+    # Round 10, from the instrumented reader below. Each of these is read by
+    # nobody across 34,848 routes; the reason is what separates "documented on
+    # purpose" from "forgotten".
+    "retry.same_model_same_effort": "budget for the CALLING agent's loop; one "
+                                    "route() call cannot count attempts",
+    "retry.same_model_higher_effort": "same",
+    "retry.stronger_model": "same",
+    "retry.max_review_rounds": "the caller runs the review loop, not the router",
+    "retry.max_judge_invocations": "same",
+    "retry.require_new_evidence_on_same_tier": "states the rule the router "
+                                               "enforces by refusing same-tier retries",
+    "review.disagreement.resolution": "verdict-combination table the caller "
+                                      "applies after reviews return",
+    "review.disagreement.code_local_dispute_judge": "REAL GAP, recorded not "
+        "excused: the router always seats `default_judge` and never inspects "
+        "the dispute's kind, so these two never bind. Wiring them needs a "
+        "dispute-kind input the schema does not have yet.",
+    "review.disagreement.formal_reasoning_dispute_judge": "see above",
+    "review.disagreement.formal_reasoning_dispute_effort": "see above",
+    "review.MEDIUM.preferred_by_implementer.reasoning_specialist": "read for "
+        "the implementers that reach MEDIUM; these two do not in any probe",
+    "review.MEDIUM.preferred_by_implementer.worker_balanced_alt": "see above",
+    "effort_by_work": "per-work-kind guidance for the caller; the router's own "
+                      "effort comes from effort_by_work entries that map to a band",
+    "effort_map.claude_code.MINIMAL": "vocabulary completeness — no band or "
+                                      "floor selects MINIMAL",
+    "effort_map.codex.MINIMAL": "same",
+    "models": "ids/families/tiers are read; price_per_mtok and verified are "
+              "cost and provenance documentation for people",
+    "transports": "how the CALLER invokes each model; the router names models, "
+                  "it does not dispatch them",
 }
+
+
+class _Recording(Mapping):
+    """A config that remembers which paths were actually read.
+
+    A string scan of the source cannot answer this question: `cfg["effort_map"]
+    [task.runtime][effort]` reads a leaf whose name appears nowhere, and
+    `cfg["flags"].values()` reads every child of a key without naming one. Round
+    10 tried the scan both ways — any-segment matching excused whole subtrees,
+    leaf matching invented orphans — so the reads are instrumented instead.
+
+    A `Mapping` rather than a `dict` subclass on purpose: `dict(spec)` copies a
+    dict subclass's storage directly without going through `__getitem__`, so the
+    router's ordinary `spec = dict(spec)` would have slipped every key in that
+    subtree past the recorder.
+    """
+
+    def __init__(self, data, path=(), seen=None):
+        self._data, self._path = data, path
+        self._seen = seen if seen is not None else set()
+
+    def __getitem__(self, key):
+        value = self._data[key]
+        self._seen.add(self._path + (str(key),))
+        if isinstance(value, dict):
+            return _Recording(value, self._path + (str(key),), self._seen)
+        return value
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def get(self, key, default=None):
+        if key in self._data:
+            return self[key]
+        self._seen.add(self._path + (str(key),))
+        return default
 
 
 def test_d14_every_config_rule_has_a_consumer_or_a_recorded_reason():
     """The config's own rule: "a rule declared and consumed nowhere is a promise
-    the system does not keep." Round 9 found eight keys breaking it, including
-    `critical_domain_review_band` and `critical_domain_effort` — second copies
-    of numbers the router reads elsewhere, which is exactly how two sources of
-    truth drift apart. Those are gone; the rest are declared documentation here
-    so the distinction between "documented on purpose" and "forgotten" is
-    written down rather than inferred."""
-    src = (SKILL / "scripts" / "route_task.py").read_text()
+    the system does not keep." Round 9 found eight keys breaking it. Round 10
+    found the test that was supposed to hold the line matching ANY segment of a
+    path, so `"router"` appearing once in the source excused every key beneath
+    it — including the two removed in round 9, which could be re-added with the
+    test still green. It now runs the router over a spread of inputs and asserts
+    on what was actually read."""
+    seen: set = set()
+    cfg = _Recording(load_config(), (), seen)
+    # Every task class and every band, because a key read only on
+    # `MIGRATION/CRITICAL` is not inert — it is uncovered, and conflating the
+    # two would turn this test into a coverage complaint. The retry budget is
+    # exercised past its own ceiling for the same reason.
+    probes = [
+        dict(task_class=c, complexity=x, uncertainty=u, blast_radius=b, reversibility=r,
+             flags=list(f), runtime=rt, prior_failures=pf,
+             prior_models=list(pm), unavailable_models=list(um), isolation_available=iso)
+        for c in TASK_CLASSES
+        for x, u, b, r in ((0, 0, 0, 0), (1, 1, 1, 1), (2, 2, 2, 0), (3, 3, 3, 3))
+        for f in ([], ["auth_sensitive"], ["review_disagreement"], ["bridge_down"],
+                  ["long_horizon"], ["migration", "data_integrity_sensitive"],
+                  ["unknown_root_cause"], ["production_hotfix"], ["public_api_change"],
+                  ["concurrency_sensitive"], ["auth_sensitive", "review_disagreement"])
+        for rt in ("claude_code", "codex")
+        for pf, pm in ((0, []), (1, ["senior_engineer"]), (2, []), (5, []))
+        for um in ([], ["claude-fable-5"], ["claude-opus-5", "gpt-5.6-sol"])
+        for iso in (None, True, False)
+    ]
+    for kw in probes:
+        try:
+            route(Task(**kw), cfg)
+        except (ValidationError, Exception):
+            continue
 
     def paths(node, prefix=()):
         if isinstance(node, dict):
@@ -938,14 +1034,29 @@ def test_d14_every_config_rule_has_a_consumer_or_a_recorded_reason():
         return any(".".join(path[:n]) in DOCUMENTED_BUT_UNREAD
                    for n in range(1, len(path) + 1))
 
-    orphans = sorted({
-        ".".join(path) for path in paths(CFG)
-        if not excused(path)
-        and not any(f'"{seg}"' in src or f"'{seg}'" in src for seg in path)
-    })
+    def unread(snapshot):
+        """Leaves the router never read. One predicate, used by the assertion
+        and by the canary below, so weakening it fails the canary."""
+        return {".".join(path) for path in paths(snapshot)
+                if not excused(path) and path not in seen}
+
+    orphans = sorted(unread(load_config()))
     assert not orphans, (
-        f"config declares {orphans} and no code reads any segment of them; "
-        f"either wire them up or add them to DOCUMENTED_BUT_UNREAD with a reason")
+        f"the router never read {orphans} across {len(probes)} routes; either wire "
+        f"them up or add them to DOCUMENTED_BUT_UNREAD with a reason")
+
+    # A canary, because the guard could not otherwise detect its own weakening:
+    # with the allowlist complete the orphan set is empty under a correct rule
+    # AND under the any-segment rule this replaced, so nothing distinguished
+    # them. An unread key planted under an ancestor that IS read must surface —
+    # that ancestor is precisely what the old spelling used as an excuse.
+    planted = dict(load_config())
+    planted["router"] = {**planted["router"],
+                         "floors": {**planted["router"]["floors"], "__canary__": "unread"}}
+    canary = unread(planted)
+    assert canary == {"router.floors.__canary__"}, (
+        f"the guard did not surface a planted unread key under a read ancestor; "
+        f"it reported {sorted(canary)}")
 
 
 def test_d14_every_declared_compensation_can_actually_be_emitted():
@@ -959,6 +1070,22 @@ def test_d14_every_declared_compensation_can_actually_be_emitted():
     assert declared == emittable, (
         f"declared but unreachable compensations: {sorted(declared - emittable)}")
 
+    # Round 10: the check above reads the KEYS, and the router dispatches on the
+    # VALUES. Renaming an effect left `_compensations()` emitting it, `route()`
+    # matching no branch, the compensation reported as applied, and 130 tests
+    # green — an inert compensation reading as active, which is the exact defect
+    # the config comment above this block claims the test prevents.
+    from route_task import UnknownCompensationError
+    effects = set(CFG["fallback_compensations"].values())
+    unimplemented = {e for e in effects if f'"{e}"' not in src}
+    assert not unimplemented, f"declared effects nothing implements: {sorted(unimplemented)}"
+
+    altered = {**CFG, "fallback_compensations": {
+        **CFG["fallback_compensations"], "principal_architect_to_senior": "typo_effect"}}
+    with pytest.raises(UnknownCompensationError):
+        route(_task(task_class="ARCHITECTURE", complexity=3, uncertainty=3, blast_radius=3,
+                    reversibility=2, unavailable_roles=["principal_architect"]), altered)
+
 
 def test_d14_consecutive_retries_climb_until_they_genuinely_run_out():
     """Round 9. Every earlier retry test asserted ONE route, and the defect
@@ -969,26 +1096,53 @@ def test_d14_consecutive_retries_climb_until_they_genuinely_run_out():
     that. This one chains the attempts, which is the only shape that can."""
     tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
     ids = sorted(tier)
+    # Round 10: `MECHANICAL` and `IMPLEMENTATION` at these scores route
+    # identically, so the class loop was one iteration wearing two names. The
+    # class that matters is one whose BASE route depends on `prior_failures` —
+    # DEBUGGING promotes at pf>=2 — because that is where the reconstruction
+    # counted the same promotion twice and declared exhaustion at a tier it had
+    # invented, with two untried models free.
     for scarce in ([], ["claude-fable-5"], ["gpt-5.6-luna", "claude-haiku-4-5-20251001"],
                    ["claude-fable-5", "gpt-5.6-sol"]):
-        for task_class in ("MECHANICAL", "IMPLEMENTATION"):
+        for task_class, extra in (("MECHANICAL", {}), ("IMPLEMENTATION", {}),
+                                  ("DEBUGGING", {"flags": ["unknown_root_cause"]}),
+                                  ("INVESTIGATION", {"flags": ["unknown_root_cause"]})):
             seen, last = [], None
             for pf in range(0, 5):
                 out = r(task_class=task_class, complexity=1, uncertainty=1, blast_radius=1,
-                        prior_failures=pf, unavailable_models=list(scarce))
+                        prior_failures=pf, unavailable_models=list(scarce), **extra)
                 if out["terminal"]:
-                    # Exhaustion is only honest when nothing stronger is free.
-                    assert not [m for m in ids if m not in scarce and tier[m] > last], (
+                    # Exhaustion is only honest when nothing stronger is free
+                    # AND unused: a model this chain has already burned is not
+                    # a model the next attempt could have used.
+                    left = [m for m in ids
+                            if m not in scarce and m not in seen and tier[m] > (last or -1)]
+                    assert not left, (
                         f"{task_class}/{scarce}/pf={pf}: terminal at tier {last} while "
-                        f"stronger models were reachable")
+                        f"{left} were reachable and untried — {out['notes']}")
                     break
                 now = tier[out["selected_model"]]
+                # The contract, in the order it binds: never re-run a model;
+                # climb while there is somewhere to climb to; and once the
+                # ladder is spent, hold at the strongest thing reachable and
+                # ask a human rather than silently repeating or regressing.
+                assert out["selected_model"] not in seen, (
+                    f"{task_class}/{scarce}: re-ran {out['selected_model']} — "
+                    f"{out['notes']}")
                 assert last is None or now > last, (
                     f"{task_class}/{scarce}: attempt {pf + 1} runs "
                     f"{out['selected_model']} (tier {now}) after tier {last} — "
                     f"{out['notes']}")
-                assert out["selected_model"] not in seen, (
-                    f"{task_class}/{scarce}: re-ran {out['selected_model']}")
+                # From the first retry on, the floor came from a reconstruction
+                # rather than a model id the caller observed run, so the route
+                # is disclosed and gated.
+                if pf >= 1:
+                    assert out["retry_history_inferred"], "inference not disclosed"
+                    assert out["requires_human_confirmation"], (
+                        f"{task_class}/{scarce}: an inferred retry was emitted as "
+                        f"dispatchable")
+                else:
+                    assert not out["retry_history_inferred"]
                 seen.append(out["selected_model"])
                 last = now
 
@@ -1008,6 +1162,41 @@ def test_d14_a_role_alias_that_ran_a_fallback_is_not_read_as_its_nominal_model()
     assert second["selected_model"] != first["selected_model"], (
         f"re-ran {first['selected_model']} after it failed: {second['notes']}")
     assert tier[second["selected_model"]] > tier[first["selected_model"]]
+
+
+def test_d14_an_alias_is_resolved_through_both_withholding_channels():
+    """Round 10. The caller can withhold by model id OR by role, and
+    `_failed_tier` read only the first — so behind `--unavailable <role>`, which
+    the config header calls the documented route, the alias resolved to a model
+    that had been withheld and never ran. The floor came out at that model's
+    tier and the retry escalated straight back onto the model that had actually
+    failed, while `excluded_prior_failures` named one that never ran.
+
+    The round-9 test used the model channel only, which is exactly the input the
+    round-9 implementation handled, so it could not see this."""
+    first = r(task_class="REFACTORING", complexity=2,
+              unavailable_roles=["senior_engineer", "reasoning_specialist"])
+    held = first["selected_model"]
+    nominal = CFG["models"][CFG["role_bindings"]["default"]["senior_engineer"]]["id"]
+
+    retry = r(task_class="REFACTORING", complexity=2,
+              unavailable_roles=["senior_engineer", "reasoning_specialist"],
+              prior_failures=1, prior_models=["senior_engineer"])
+    # What `senior_engineer` HELD, not what the binding nominally names.
+    ladder = Resolver(_task(task_class="REFACTORING", complexity=2,
+                            unavailable_roles=["senior_engineer", "reasoning_specialist"]),
+                      Policy.of(CFG))
+    actually_ran = ladder.held_by("senior_engineer")
+    assert actually_ran != nominal, "probe drifted: the alias no longer falls back"
+
+    assert actually_ran in retry["excluded_prior_failures"], (
+        f"the model the alias held ({actually_ran}) was not excluded; "
+        f"excluded={retry['excluded_prior_failures']}")
+    assert nominal not in retry["excluded_prior_failures"], (
+        f"{nominal} was withheld and never ran, yet is reported as already-failed")
+    assert actually_ran not in emitted_models(retry), (
+        f"re-emitted {actually_ran} after it failed: {retry['notes']}")
+    del first, held
 
 
 def test_d14_a_bonus_review_that_cannot_be_isolated_does_not_kill_the_task():

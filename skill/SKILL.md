@@ -144,9 +144,9 @@ openable by typing would be the exact failure this skill is about.
 Exit status is the part of this contract a shell can act on, so every outcome
 needing a person is nonzero: **0** dispatchable, **1** terminal, **2** invalid
 input, and `human_in_the_loop.human_gate_exit_status` (**3** by default) for a
-route executable only after a human confirms. `requires_human_confirmation` is
-a boolean inside a JSON blob, and a caller reading "the router succeeded" as
-"I may dispatch" walks straight through it.
+route executable only after a human confirms — `requires_human_confirmation` is
+a boolean in a JSON blob, and a caller reading success as authorisation walks
+straight through it.
 
 The terminal states are normal outcomes that need a human, not routes to
 execute:
@@ -174,9 +174,10 @@ weaker than the band asks. The route stays executable and asks a human: the
 router cannot restore the depth, and whether a thinner review is acceptable is a
 judgement about the change. Review depth is never spent to buy a judge seat —
 neither by demoting a reviewer below the band nor by re-seating one onto the
-implementer's own model at any band; the adjudicator is reported unavailable
-instead. `band_floor_unsatisfiable` marks a shortage that will *not* clear by
-retrying. `references/review-policy.md` has the seating rules.
+implementer's own model; the adjudicator is reported unavailable instead.
+`band_floor_unsatisfiable` marks a shortage that will *not* clear by retrying,
+and a compensation's bonus seat never upgrades the band's own independence
+requirement. `references/review-policy.md` has the seating rules.
 
 If you cannot run the script, compute it by hand from the tables below — the
 script reads `config/model-routing.yaml`, and this file describes the same
@@ -201,12 +202,12 @@ fix was to stop fusing "who does it" and "how it's reviewed" into one decision.
 8 EMIT       → route + rationale + confidence + metrics
 ```
 
-Before you act on a route, check these five. They are also asserted by the
-test suite, so if one looks false, something is genuinely broken:
+Before acting on a route, check these five — the suite asserts them too, so if
+one looks false something is genuinely broken:
 
 - [ ] **I1** Every task reached review selection — no branch skipped it.
 - [ ] **I2** A critical-domain flag put the review band at `HIGH` or above, for *every* task class.
-- [ ] **I3** A critical-domain flag put the worker at `worker_balanced` or above.
+- [ ] **I3** A critical-domain flag put the worker at `worker_balanced`'s capability tier or above.
 - [ ] **I4** The route names only models confirmed available.
 - [ ] **I5** The rationale names the band, the triggering flags, and any fallbacks.
 
@@ -216,9 +217,8 @@ test suite, so if one looks false, something is genuinely broken:
 risk_score = complexity + 2×uncertainty + 2×blast_radius + reversibility     (0–18)
 ```
 
-Uncertainty and blast radius carry double weight because complexity and
-reversibility describe what the change *is*, while uncertainty and blast radius
-together approximate what it might *cost*.
+Uncertainty and blast radius carry double weight: complexity and reversibility
+describe what the change *is*, the other two approximate what it might *cost*.
 
 | Band | Score |
 |---|---|
@@ -377,13 +377,14 @@ an unstable plan, a reviewer finding. Not on a hunch, and not merely because a
 stronger model exists.
 
 A retry must reach a **strictly higher `capability_tier` than the model that
-ran**, or report exhaustion. Pass `--prior-models` with a **concrete model id**
-whenever you can: it is the only spelling needing no inference about which model
-a role held at the time — `references/control-loop.md` covers that inference and
-where it has gone wrong. The same-tier budgets below are real, but the router
-will not route one; it reports exhaustion and asks a human, who may authorise
-another attempt carrying new evidence (a log, a repro, a bisect, a failing
-assertion) or a different hypothesis.
+ran**, or report exhaustion. Pass `--prior-models` with a **concrete model id**:
+`route()` is stateless while this rule is historical, so every other spelling
+makes the router *infer* what ran, and an inferred retry is disclosed as
+`retry_history_inferred` and gated on human confirmation — availability can have
+changed since. A concrete id needs no inference and is not gated.
+`references/control-loop.md` covers the inference and where it has gone wrong.
+The same-tier budgets below are real, but the router will not route one; it
+reports exhaustion and asks a human.
 
 ```
 same_model_same_effort:            1
@@ -426,6 +427,7 @@ review:
   judge_unavailable:           # no adjudicator at or above every party's tier
   review_depth_reduced: []     # [{reviewer, model, capability_tier, band_requires}]
   band_floor_unsatisfiable:    # the binding itself cannot supply that tier
+  compensating_reviewers:      # extra seats added by a compensation
   self_review_avoided: []      # [{replaced, with, reason}]; `with` is always a
                                # role in `reviewers` above
   required_checks: []
@@ -436,17 +438,17 @@ fallback_compensations_applied: []
 unavailable_models: []
 excluded_prior_failures: []    # models withheld because they already failed
 excluded_as_ambiguous_alias: []# withheld because a role alias spans bindings; these did not run
+retry_history_inferred:        # the retry floor came from an inference, not
+                               # from a model id the caller observed run
 escalation_count:  retry_count:
 routing_confidence:
 requires_human_confirmation:
 rationale:   # names the band, the triggering flags, and every fallback
 ```
 
-Two pairs in there are deliberately not collapsed:
-
-- **`independence_required` vs `review_independence`.** The first is policy; the
-  second is evidence. Reporting policy as if it were evidence is how a control
-  becomes a false assurance.
+Two pairs are deliberately not collapsed. **`independence_required` vs
+`review_independence`:** the first is policy, the second is evidence, and
+reporting policy as evidence is how a control becomes a false assurance.
 - **`selected_model` vs `terminal`.** A terminal state names *no* concrete model
   anywhere except where the caller put one — not the worker, not the reviewers,
   not the judge, not inside `review_depth_reduced`. Enumerating the fields to
@@ -479,20 +481,18 @@ A model that does not resolve is unavailable — fall back per
 
 Read these when the situation calls for them; not needed for a routine route.
 
-- **`references/routing-policy.md`** — dimensions, bands, overrides, worker and
-  effort selection in full, with the reasoning behind each weight.
-- **`references/model-profiles.md`** — the five roles, what each is for, what
-  each must not be the sole authority on, and the current bindings.
-- **`references/review-policy.md`** — review by band, independence mechanics per
-  runtime, who may hold the judge seat, the reviewer output contract, and
-  disagreement resolution.
-- **`references/control-loop.md`** — escalation triggers, retry limits, routing
-  confidence, and the full observability schema.
-- **`references/adapters.md`** — runtime differences, effort mapping, transports,
-  and the complete fallback matrices. Read when a model is unavailable or you
-  are working across the provider bridge.
-- **`references/examples.md`** — worked routing decisions, including the four
-  cases an earlier version of this policy got wrong.
+- **`routing-policy.md`** — dimensions, bands, overrides, worker and effort
+  selection in full, with the reasoning behind each weight.
+- **`model-profiles.md`** — the five roles, what each is for, what each must not
+  be the sole authority on, and the current bindings.
+- **`review-policy.md`** — review by band, independence mechanics per runtime,
+  who may hold the judge seat, the reviewer output contract, disagreements.
+- **`control-loop.md`** — escalation triggers, retry limits, which model "ran"
+  and how that inference has gone wrong, routing confidence, observability.
+- **`adapters.md`** — runtime differences, effort mapping, transports, and the
+  fallback matrices. Read when a model is unavailable or you cross the bridge.
+- **`examples.md`** — worked routing decisions, including the four cases an
+  earlier version of this policy got wrong.
 
 Configuration lives in `config/model-routing.yaml`. Model identifiers appear
 there and nowhere else — when models or prices change, update the registry and

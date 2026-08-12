@@ -62,9 +62,24 @@ Three spellings have been tried and only the third is right:
 
 A concrete model id in `--prior-models` skips all of it, which is why callers
 that can supply one should. With no prior model named at all, the router walks
-its own ladder back `prior_failures - 1` steps: it produced those attempts, so
-it can reconstruct them — and it must, because `route()` is stateless and
-`prior_failures` is the only record of the history that exists.
+its own ladder back `prior_failures - 1` steps from the **`prior_failures`-independent**
+base: it produced those attempts, so it can reconstruct them — and it must,
+because `route()` is stateless and `prior_failures` is the only record of the
+history that exists. Reconstructing from today's base instead double-counts any
+promotion that is itself keyed on `prior_failures` (DEBUGGING with
+`unknown_root_cause` promotes at 2+), which produced a false "nothing is
+stronger" at a tier the reconstruction had invented.
+
+### What an inference costs
+
+Anything other than a concrete model id makes the route's floor an inference,
+and the route says so: `retry_history_inferred: true`, and human confirmation is
+required. Two things the router cannot see justify that gate — the role may have
+held a fallback rather than its nominal binding, and **availability can have
+changed between attempts**, so a model the reconstruction places at tier 1 may
+in fact have been tier 2. Neither is recoverable statelessly. The gate is the
+honest response: the route is still emitted, and a person decides whether the
+reconstruction is good enough for this change.
 ```
 
 **A second attempt at the same tier must carry a changed hypothesis or new

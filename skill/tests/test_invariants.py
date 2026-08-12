@@ -544,7 +544,15 @@ def test_a_compensation_is_recorded_only_when_it_was_applied():
         if out["terminal"]:
             continue
         assert out["selected_effort"] == CFG["effort_levels"][-1]
-        assert out["review"]["independence_required"] is True
+        # The name promises a second review, so a second reviewer must be
+        # seated. Round 10 changed WHICH field records that: the compensation
+        # used to flip `independence_required`, which let a bonus seat upgrade
+        # the band's own requirement — and then a LOW route whose compensating
+        # review could not be isolated terminated the entire task. The seat is
+        # what the name promises; the band's requirement was never part of it.
+        assert out["review"]["compensating_reviewers"] >= 1, (
+            "compensation recorded without the second reviewer it names")
+        assert len(out["review"]["reviewers"]) >= 2
 
 
 def test_independence_is_never_reported_as_enforced_without_evidence():

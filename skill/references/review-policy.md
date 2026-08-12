@@ -293,3 +293,9 @@ zero. So the implementer's model is barred from a *replacement* reviewer at
 every band. With two models and three seats you cannot have both an independent
 reviewer and an independent adjudicator; saying `judge_unavailable` is the
 honest answer, not a false stop.
+
+A fallback compensation may add a **bonus** reviewer (`compensating_reviewers`).
+That seat never upgrades the band's own independence requirement: it is checked
+for model collisions like any other, but a band that did not ask for
+independence does not start requiring it because a compensation fired, and a
+bonus reviewer that cannot be isolated must not terminate the task.
