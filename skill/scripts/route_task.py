@@ -88,7 +88,11 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
 class Policy:
     """Everything derivable from a config, computed once per config."""
 
-    _cache: dict[int, "Policy"] = {}
+    # Keyed on id(cfg) and holding the cfg alongside the Policy. Without the
+    # strong reference a freed config's id can be recycled by CPython and this
+    # cache would serve a Policy built from a *different* config — silently
+    # routing against a policy nobody selected.
+    _cache: dict[int, tuple[dict, "Policy"]] = {}
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -119,6 +123,19 @@ class Policy:
             role: self.tier_of[cfg["models"][key]["id"]]
             for role, key in cfg["role_bindings"]["default"].items()
         }
+        gate = cfg["human_in_the_loop"]["human_gate_exit_status"]
+        # Process exit status is truncated to eight bits, so 256 is 0 — a
+        # human-gated route reporting success, which is the single hazard this
+        # value exists to remove. Validated here rather than at the point of
+        # use: `main()` reads it after the route has already been printed, so a
+        # raise there escapes the handler and lands on exit 1 ("terminal") for
+        # a route it just emitted as executable.
+        if isinstance(gate, bool) or not isinstance(gate, int) or not 3 <= gate <= 255:
+            raise ConfigError(
+                f"human_gate_exit_status must be an integer in 3..255 "
+                f"(0/1/2 are taken, and >255 truncates to a success code); got {gate!r}")
+        self.human_gate_exit_status: int = gate
+
         self.band_reviewer_floor: dict[str, int] = {}
         for band in self.bands:
             spec = cfg["review"][band]
@@ -142,9 +159,12 @@ class Policy:
     @classmethod
     def of(cls, cfg: dict) -> "Policy":
         key = id(cfg)
-        if key not in cls._cache:
-            cls._cache[key] = cls(cfg)
-        return cls._cache[key]
+        hit = cls._cache.get(key)
+        if hit is not None and hit[0] is cfg:
+            return hit[1]
+        policy = cls(cfg)
+        cls._cache[key] = (cfg, policy)
+        return policy
 
     # ordered-enum helpers, bound to this policy's vocabulary
     def band_max(self, a, b): return self.bands[max(self.bands.index(a), self.bands.index(b))]
@@ -430,26 +450,40 @@ def apply_overrides(task: Task, band: str, policy: Policy) -> tuple[str, list[st
 # Stage 4 — worker
 # --------------------------------------------------------------------------
 
-def _failed_tier(task: Task, policy: Policy, binding: dict) -> int | None:
+def _failed_tier(task: Task, policy: Policy, resolver: "Resolver") -> int | None:
     """The capability tier of the strongest model that ALREADY FAILED.
 
-    Measured on what ran, which is not what the role resolves to now: the
-    failed model is in `Resolver.unusable`, so `peek` returns its replacement.
-    Round 8 found all three consequences of confusing the two — a floor
-    inflated to the replacement's tier declaring false exhaustion on the
-    simplest documented retry, an escalation that skipped a tier, and (through
-    `failed_roles`, which drops any binding entry outside `role_tiers`) a
-    `gpt-5.6-terra` failure that was not seen at all.
+    Three spellings of "what ran" have now been tried, and only the third is
+    right, so the reasoning is worth keeping:
 
-    Concrete ids are read directly. A role alias is read through the binding in
-    force — the model that role HELD when it ran.
+    * `resolver.peek(role)` is the REPLACEMENT — the failure is already in
+      `unusable` by the time this is asked. Using it inflated the floor and
+      declared exhaustion on the simplest documented retry (round 8).
+    * the binding's nominal model is what the role would hold if nothing were
+      scarce. But if that model was already in the caller's `unavailable_models`
+      on the previous attempt, the role fell back and ran something else —
+      typically STRONGER — so the floor came out too low and the retry
+      re-emitted the exact model that had just failed (round 9).
+    * the candidate ladder, filtered by what the caller withheld and nothing
+      else, is what that role actually held when it ran. That is this.
+
+    A concrete model id needs none of it and is read directly; callers that can
+    supply one should, because it is the only spelling that carries no
+    inference at all.
     """
     tiers = []
     for item in task.prior_models:
         if item in policy.model_ids:
             tiers.append(policy.tier_of[item])
-        elif item in binding:
-            tiers.append(policy.tier_of[policy.cfg["models"][binding[item]]["id"]])
+            continue
+        if item not in resolver.binding:
+            continue
+        withheld = set(task.unavailable_models)
+        for key in resolver._candidates(item):
+            model_id = policy.cfg["models"][key]["id"]
+            if model_id not in withheld:
+                tiers.append(policy.tier_of[model_id])
+                break
     return max(tiers) if tiers else None
 
 
@@ -507,7 +541,13 @@ def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -
         current = resolver.peek(worker)
         if current is None or policy.tier_of[current] < floor_tier:
             promoted = _promote_above(floor_tier - 1, policy, resolver)
-            # Recorded only when the MODEL moves. Measured over 570,240 paired
+            # Recorded only when a promotion was found. The tier precondition
+            # on the branch above is what suppresses the spurious notes — an
+            # earlier comment here credited a `peek(promoted) != current` test
+            # that could never be false, since `promoted` is drawn from a
+            # strictly higher tier than `current` by construction.
+            #
+            # Measured over 570,240 paired
             # critical-domain routes this floor never changes the dispatched
             # model or the terminal state — `worker_selection` already places
             # every class at `worker_balanced` or above once a critical-domain
@@ -515,10 +555,16 @@ def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -
             # anyway, which is this module's own forbidden shape: a recorded
             # change that changed nothing. It stays as a guard against a future
             # edit to that table; it does not get to claim credit meanwhile.
-            if promoted is not None and resolver.peek(promoted) != current:
+            if promoted is not None:
                 notes.append(f"critical-domain floor raised worker to {promoted} "
                              f"(capability tier {floor_tier} or better)")
                 worker = promoted
+            # `None` means no reachable model meets the floor at all. The worker
+            # stays below it and nothing is recorded here — a latent fail-open,
+            # unreachable today because every binding holds a tier-1 model. The
+            # thing that would notice is
+            # `test_a_critical_domain_flag_always_reaches_high_review_and_worker`,
+            # which asserts the dispatched tier rather than this note.
 
     ceiling_exhausted = False
     if task.prior_failures >= 1:
@@ -529,13 +575,24 @@ def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -
         # ladder blindly and, under scarcity, landed a tier BELOW where it
         # started while recording an escalation.
         current = policy.tier_of[resolver.peek(worker)] if resolver.peek(worker) else -1
-        floor = _failed_tier(task, policy, binding)
+        floor = _failed_tier(task, policy, resolver)
         named = floor is not None
         if floor is None:
-            # Nothing was named, so the previous attempt ran wherever this task
-            # routes to — which is exactly where it routes to now, since
-            # nothing has been excluded.
+            # Nothing was named. The previous attempt ran wherever this task
+            # routes to — and, since this function produced that route too, the
+            # attempt before it ran one promotion lower, and so on. Round 9
+            # found the earlier version flat in `prior_failures`: it recomputed
+            # the BASE tier every call, so attempts 3, 4 and 5 all re-dispatched
+            # the model attempt 2 had just run while the note claimed an
+            # escalation and the route stayed dispatchable at exit 0. The
+            # magnitude has to be walked back, because `route()` is stateless
+            # and `prior_failures` is the only record of it that exists.
             floor = current
+            for _ in range(task.prior_failures - 1):
+                step = _promote_above(floor, policy, resolver)
+                if step is None:
+                    break                # genuinely exhausted; the branch below says so
+                floor = policy.tier_of[resolver.peek(step)]
 
         if current > floor:
             # Excluding the failed model has already moved the worker above it.
@@ -1235,9 +1292,15 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     judge = judge_role
 
     terminal = None
-    if review["independent"] and review_independence == "unavailable":
+    band_requires_independence = bool(
+        cfg["review"][review["band"]].get("independent", False))
+    if band_requires_independence and review_independence == "unavailable":
         # The caller stated positively that isolation cannot be achieved here,
-        # and the band requires it. That is `on_independence_unachievable`,
+        # and THE BAND requires it. The band's own spec, not `review`'s flag:
+        # the architect-downgrade compensation sets that flag at any band, so
+        # keying off it terminated LOW routes because a *bonus* second review
+        # could not be isolated — a compensation punishing the caller for its
+        # own best effort. That is `on_independence_unachievable`,
         # which the policy calls terminal — the review cannot be run as
         # specified, so there is nothing safe to dispatch. It was previously
         # emitted as an ordinary route at exit 0, which made the exhaustiveness
@@ -1507,11 +1570,7 @@ def main(argv: list[str] | None = None) -> int:
     # 3 is executable-after-approval, distinct so a caller can tell them apart.
     if result["terminal"]:
         return 1
-    gate = policy.cfg["human_in_the_loop"]["human_gate_exit_status"]
-    if not isinstance(gate, int) or gate in (0, 1, 2):
-        raise ConfigError(
-            f"human_gate_exit_status must be an integer distinct from 0/1/2, got {gate!r}")
-    return gate if result["requires_human_confirmation"] else 0
+    return policy.human_gate_exit_status if result["requires_human_confirmation"] else 0
 
 
 def _print_text(r: dict) -> None:

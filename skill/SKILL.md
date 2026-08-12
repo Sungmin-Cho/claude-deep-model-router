@@ -143,10 +143,10 @@ openable by typing would be the exact failure this skill is about.
 
 Exit status is the part of this contract a shell can act on, so every outcome
 needing a person is nonzero: **0** dispatchable, **1** terminal, **2** invalid
-input, **3** executable only after a human confirms. `3` exists because
-`requires_human_confirmation` is a boolean inside a JSON blob — a caller that
-reads "the router succeeded" as "I may dispatch" walks straight through it, and
-a gate you cannot act on from a shell is disclosure, not a control.
+input, and `human_in_the_loop.human_gate_exit_status` (**3** by default) for a
+route executable only after a human confirms. `requires_human_confirmation` is
+a boolean inside a JSON blob, and a caller reading "the router succeeded" as
+"I may dispatch" walks straight through it.
 
 The terminal states are normal outcomes that need a human, not routes to
 execute:
@@ -155,7 +155,7 @@ execute:
 |---|---|
 | `HUMAN_REQUIRED` | the retry budget is spent; no executable route is emitted |
 | `ESCALATE_ROUTING` | routing confidence fell below 0.60 — re-classify at higher effort or ask a human |
-| `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and it cannot be had: no assignment of distinct models exists, or the caller reported isolation unavailable |
+| `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and it cannot be had — no distinct-model assignment exists, or the caller reported isolation unavailable |
 
 `judge_unavailable` is deliberately **not** terminal: independence failing means
 the review cannot happen as specified, so nothing is safe to dispatch, whereas a
@@ -171,13 +171,12 @@ ranks the assignment backwards exactly when scarcity makes it matter.
 
 `review_depth_reduced` is non-empty when the seats that could be filled are
 weaker than the band asks. The route stays executable and asks a human: the
-router cannot restore the depth, and whether a thinner review is acceptable is
-a judgement about the change. Review depth is never spent to buy a judge seat —
+router cannot restore the depth, and whether a thinner review is acceptable is a
+judgement about the change. Review depth is never spent to buy a judge seat —
 neither by demoting a reviewer below the band nor by re-seating one onto the
 implementer's own model at any band; the adjudicator is reported unavailable
 instead. `band_floor_unsatisfiable` marks a shortage that will *not* clear by
-retrying, so a gate that can only ever be waved through is not presented as one
-that could be fixed. See `references/review-policy.md` for the seating rules.
+retrying. `references/review-policy.md` has the seating rules.
 
 If you cannot run the script, compute it by hand from the tables below — the
 script reads `config/model-routing.yaml`, and this file describes the same
@@ -378,12 +377,13 @@ an unstable plan, a reviewer finding. Not on a hunch, and not merely because a
 stronger model exists.
 
 A retry must reach a **strictly higher `capability_tier` than the model that
-ran**, or say it cannot. That tier is read from what the model held when it ran,
-never from what its role resolves to afterwards — the failure is excluded by
-then, so that reads the replacement. A retry at the same tier must carry new
-evidence (a log, a repro, a bisect, a failing assertion) or a materially
-different hypothesis; asking the same model to retry equivalent approaches is
-the dominant cost-overrun mode in agent systems.
+ran**, or report exhaustion. Pass `--prior-models` with a **concrete model id**
+whenever you can: it is the only spelling needing no inference about which model
+a role held at the time — `references/control-loop.md` covers that inference and
+where it has gone wrong. The same-tier budgets below are real, but the router
+will not route one; it reports exhaustion and asks a human, who may authorise
+another attempt carrying new evidence (a log, a repro, a bisect, a failing
+assertion) or a different hypothesis.
 
 ```
 same_model_same_effort:            1

@@ -897,6 +897,154 @@ def test_d13_a_retry_escalates_to_a_stronger_model_not_merely_a_higher_role():
                 f"and recorded {second['notes']}")
 
 
+# Config entries the code deliberately does not read, each with the reason.
+# Anything NOT listed here must have a consumer: round 9 found eight keys that
+# had none, two of which were a second copy of a number the router reads from
+# somewhere else — the drift the config header forbids.
+DOCUMENTED_BUT_UNREAD = {
+    "version": "schema marker for humans and diffs",
+    "conditional_flags": "documents which flag pairs are deliberate, for the "
+                         "inert-flag test; the effect itself lives in `overrides`",
+    "worker_promotions": "prose description of promotions implemented in "
+                         "select_worker; kept as the human-readable statement",
+    "worker_balanced_selection": "documents that worker_balanced_alt is a "
+                                 "same-family fallback, which `fallbacks` implements",
+    "verification_ledger": "provenance of the identifiers, read by people",
+    "router.default_worker": "states the policy's starting point; the table in "
+                             "worker_selection is what executes",
+    "router.default_orchestrator": "guidance for the calling agent, not the router",
+    "router.default_orchestrator_effort": "guidance for the calling agent",
+}
+
+
+def test_d14_every_config_rule_has_a_consumer_or_a_recorded_reason():
+    """The config's own rule: "a rule declared and consumed nowhere is a promise
+    the system does not keep." Round 9 found eight keys breaking it, including
+    `critical_domain_review_band` and `critical_domain_effort` — second copies
+    of numbers the router reads elsewhere, which is exactly how two sources of
+    truth drift apart. Those are gone; the rest are declared documentation here
+    so the distinction between "documented on purpose" and "forgotten" is
+    written down rather than inferred."""
+    src = (SKILL / "scripts" / "route_task.py").read_text()
+
+    def paths(node, prefix=()):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                yield from paths(v, prefix + (str(k),))
+        else:
+            yield prefix
+
+    def excused(path):
+        return any(".".join(path[:n]) in DOCUMENTED_BUT_UNREAD
+                   for n in range(1, len(path) + 1))
+
+    orphans = sorted({
+        ".".join(path) for path in paths(CFG)
+        if not excused(path)
+        and not any(f'"{seg}"' in src or f"'{seg}'" in src for seg in path)
+    })
+    assert not orphans, (
+        f"config declares {orphans} and no code reads any segment of them; "
+        f"either wire them up or add them to DOCUMENTED_BUT_UNREAD with a reason")
+
+
+def test_d14_every_declared_compensation_can_actually_be_emitted():
+    """Round 9. `fallback_compensations.cross_family_reviewer_lost` was declared
+    and `_compensations()` had no branch that could emit it, so a compensation
+    name that is misspelled — or added to the config and never wired — goes
+    inert in silence while reading as active policy."""
+    src = (SKILL / "scripts" / "route_task.py").read_text()
+    declared = set(CFG["fallback_compensations"])
+    emittable = {name for name in declared if f'"{name}"' in src or f"'{name}'" in src}
+    assert declared == emittable, (
+        f"declared but unreachable compensations: {sorted(declared - emittable)}")
+
+
+def test_d14_consecutive_retries_climb_until_they_genuinely_run_out():
+    """Round 9. Every earlier retry test asserted ONE route, and the defect
+    lived between routes: with nothing named, the floor was recomputed from the
+    base route every call, so `prior_failures` 2, 3 and 4 all re-dispatched the
+    model attempt 2 had just run while the note claimed an escalation and the
+    route stayed dispatchable at exit 0. A single-route assertion cannot see
+    that. This one chains the attempts, which is the only shape that can."""
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    ids = sorted(tier)
+    for scarce in ([], ["claude-fable-5"], ["gpt-5.6-luna", "claude-haiku-4-5-20251001"],
+                   ["claude-fable-5", "gpt-5.6-sol"]):
+        for task_class in ("MECHANICAL", "IMPLEMENTATION"):
+            seen, last = [], None
+            for pf in range(0, 5):
+                out = r(task_class=task_class, complexity=1, uncertainty=1, blast_radius=1,
+                        prior_failures=pf, unavailable_models=list(scarce))
+                if out["terminal"]:
+                    # Exhaustion is only honest when nothing stronger is free.
+                    assert not [m for m in ids if m not in scarce and tier[m] > last], (
+                        f"{task_class}/{scarce}/pf={pf}: terminal at tier {last} while "
+                        f"stronger models were reachable")
+                    break
+                now = tier[out["selected_model"]]
+                assert last is None or now > last, (
+                    f"{task_class}/{scarce}: attempt {pf + 1} runs "
+                    f"{out['selected_model']} (tier {now}) after tier {last} — "
+                    f"{out['notes']}")
+                assert out["selected_model"] not in seen, (
+                    f"{task_class}/{scarce}: re-ran {out['selected_model']}")
+                seen.append(out["selected_model"])
+                last = now
+
+
+def test_d14_a_role_alias_that_ran_a_fallback_is_not_read_as_its_nominal_model():
+    """Round 9. `_failed_tier` read the alias through the binding, but if the
+    binding's model was already withheld the role fell back and ran something
+    else — usually stronger. The floor came out too low and the retry re-emitted
+    the exact model that had just failed, recorded as an escalation."""
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    scarce = ["gpt-5.6-luna", "claude-haiku-4-5-20251001"]
+    first = r(task_class="MECHANICAL", unavailable_models=list(scarce))
+    assert first["selected_role"] == "worker_fast"
+    assert first["selected_model"] == "claude-sonnet-5", "probe drifted"
+    second = r(task_class="MECHANICAL", unavailable_models=list(scarce),
+               prior_failures=1, prior_models=["worker_fast"])
+    assert second["selected_model"] != first["selected_model"], (
+        f"re-ran {first['selected_model']} after it failed: {second['notes']}")
+    assert tier[second["selected_model"]] > tier[first["selected_model"]]
+
+
+def test_d14_a_bonus_review_that_cannot_be_isolated_does_not_kill_the_task():
+    """Round 9. The isolation terminal keyed off `review["independent"]`, which
+    the architect-downgrade compensation sets at ANY band. A LOW route whose
+    *bonus* second review could not be isolated emitted nothing at all — a
+    compensation punishing the caller for its own best effort. The terminal
+    belongs to the band's own requirement."""
+    out = r(task_class="ARCHITECTURE", flags=["long_horizon"],
+            unavailable_models=["claude-fable-5"], isolation_available=False)
+    assert out["review"]["band"] == "LOW", "probe drifted"
+    assert not CFG["review"]["LOW"].get("independent"), "LOW now asks for independence"
+    assert out["fallback_compensations_applied"], "probe no longer reaches the compensation"
+    assert out["terminal"] is None, (
+        "a bonus review's isolation gap terminated a band that never asked for it")
+    assert out["selected_model"]
+
+
+def test_d14_the_human_gate_exit_status_must_survive_posix_truncation():
+    """Round 9. The guard rejected 0/1/2 and nothing else, so 256 passed it and
+    exited 0 — a human-gated route reporting success, the single hazard the
+    value exists to remove. It also raised after the route had been printed,
+    outside main()'s handler, landing on exit 1 for a route it had just emitted
+    as executable."""
+    from route_task import Policy, ConfigError
+    cfg = load_config()
+    for bad in (256, 512, -256, 0, 1, 2, True, "3", 3.0):
+        altered = {**cfg, "human_in_the_loop": {**cfg["human_in_the_loop"],
+                                                "human_gate_exit_status": bad}}
+        with pytest.raises(ConfigError):
+            Policy(altered)
+    for good in (3, 7, 255):
+        altered = {**cfg, "human_in_the_loop": {**cfg["human_in_the_loop"],
+                                                "human_gate_exit_status": good}}
+        assert Policy(altered).human_gate_exit_status == good
+
+
 def test_d13_a_confirmed_isolation_gap_is_terminal_where_the_band_requires_it():
     """Round 8. The policy declares `on_independence_unachievable: terminal`,
     and the five-state contract goes to the trouble of separating `unavailable`

@@ -44,9 +44,27 @@ max_total_implementation_attempts: 4
 max_review_rounds:                 3
 max_judge_invocations:             1
 require_new_evidence_on_same_tier: true    # "tier" = capability_tier of the
-                                          # model that RAN, not the role label
-                                          # and not what the role resolves to
-                                          # once the failure is excluded
+                                          # model that RAN
+
+### Which model "ran"
+
+Three spellings have been tried and only the third is right:
+
+* **what the role resolves to now** — wrong. The failure is already excluded by
+  then, so this reads its *replacement*; used as the floor it inflated the
+  requirement and declared exhaustion while an untried stronger model was free.
+* **the role's nominal binding** — wrong. If that model was already withheld on
+  the previous attempt, the role fell back and ran something else, usually
+  stronger; the floor came out too low and the retry re-emitted the exact model
+  that had just failed, recorded as an escalation.
+* **the role's candidate ladder filtered by what the caller withheld, and
+  nothing else** — right. That is what the role held when it ran.
+
+A concrete model id in `--prior-models` skips all of it, which is why callers
+that can supply one should. With no prior model named at all, the router walks
+its own ladder back `prior_failures - 1` steps: it produced those attempts, so
+it can reconstruct them — and it must, because `route()` is stateless and
+`prior_failures` is the only record of the history that exists.
 ```
 
 **A second attempt at the same tier must carry a changed hypothesis or new

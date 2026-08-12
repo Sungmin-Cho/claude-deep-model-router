@@ -49,9 +49,14 @@ router:
     extra_review_below: 0.80   # execute, but raise the review band one level
 
   floors:
+    # Round 9. `critical_domain_review_band: HIGH` and `critical_domain_effort:
+    # HIGH` used to sit here and were read by nothing — the band floor is the
+    # `critical_domain` override below, and the effort floor is
+    # `effort_floors.any_critical_domain`. Two places holding one number is the
+    # drift this file's header forbids, and a floor nobody reads is a promise
+    # nobody keeps. Only the worker floor remains, and it IS read (as a
+    # capability tier); see the note on its redundancy in route_task.py.
     critical_domain_worker:     worker_balanced
-    critical_domain_review_band: HIGH
-    critical_domain_effort:     HIGH
 
 # ---------------------------------------------------------------------------
 # Flags
@@ -493,10 +498,20 @@ fallbacks:
 
 # Compensations that apply when a fallback lands on a weaker or same-family
 # model. The resolver records these; it does not silently absorb them.
+# Every name here must be one `_compensations()` can actually emit — a
+# compensation the config declares and no branch produces is inert policy that
+# reads as active, and `test_d14_every_declared_compensation_can_actually_be_emitted`
+# fails if one appears.
+#
+# Round 9 removed `cross_family_reviewer_lost: set_cross_family_review_false`.
+# It had no branch and never needed one: `cross_family_review` is computed from
+# the families of the models that were actually resolved, so losing a
+# cross-family reviewer already turns it false without anyone setting it. A
+# compensation for something that happens by itself is a record of a decision
+# that was never made.
 fallback_compensations:
   reasoning_specialist_to_same_family: raise_effort_one_level
   principal_architect_to_senior:       raise_effort_to_MAX_and_add_second_review
-  cross_family_reviewer_lost:          set_cross_family_review_false
 
 # ---------------------------------------------------------------------------
 # Verification ledger

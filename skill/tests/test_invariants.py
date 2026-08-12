@@ -457,6 +457,22 @@ def test_an_unsatisfiable_band_floor_means_no_amount_of_availability_would_help(
         "openai_only holds one tier-2 model against two reviewer seats and "
         "nothing is withheld — no retry can clear this")
 
+    # Round 9: the two probes above both survive DELETING the implementer from
+    # the seat count, so they pinned only one direction. This one needs it: a
+    # tier-2 implementer under `claude_only` occupies one of the two tier-2+
+    # models, leaving one for two reviewer seats.
+    implementer_consumes_a_seat = route(Task(
+        task_class="ARCHITECTURE", complexity=2, uncertainty=2, blast_radius=2,
+        reversibility=0, flags=["bridge_down"], runtime="claude_code"), CFG)
+    rv = implementer_consumes_a_seat["review"]
+    assert rv["review_depth_reduced"], "probe drifted"
+    assert TIER_OF[implementer_consumes_a_seat["selected_model"]] >= BAND_FLOOR[rv["band"]], (
+        "probe needs an implementer at or above the floor to exercise the term")
+    assert rv["band_floor_unsatisfiable"], (
+        "claude_only has two tier-2+ models; a tier-2 implementer plus two "
+        "reviewer seats needs three, so this cannot be staffed at any "
+        "availability — dropping the implementer term inverts it")
+
 
 def test_the_shortfall_record_carries_the_band_the_gate_actually_used():
     """Round 7. The record's payload was asserted nowhere, so mutating
