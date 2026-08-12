@@ -608,6 +608,44 @@ def test_every_recorded_substitution_changed_who_sits_in_the_seat():
                 f"{out['selected_model']}")
 
 
+def test_a_promoted_review_band_still_passes_every_emit_boundary_check():
+    """Round 18, found independently by all three reviewers.
+
+    The confidence-driven promotion was re-run AFTER the emit-boundary
+    post-conditions had already passed, so a route promoted at the last moment
+    shipped without the depth check, the family check, de-confliction or its
+    disclosure. It is the mirror of the defect this file was built around — not
+    a check placed where later code routes around it, but a CHANGE placed where
+    the checks cannot see it. The plan and the promotion now live in the same
+    iteration of the fixed point; this asserts the consequence.
+    """
+    promoted = [o for o in routes()
+                if any("low_routing_confidence" in x for x in o["band_overrides_applied"])]
+    assert len(promoted) > 100, f"only {len(promoted)} promoted routes in the sweep"
+    for out in promoted:
+        if out["terminal"]:
+            continue
+        rv = out["review"]
+        involved = parties(out)
+        floor = BAND_FLOOR[rv["band"]]
+        under = [m for m in rv["reviewer_models"] if m and TIER_OF[m] < floor]
+        assert bool(under) == bool(rv["review_depth_reduced"]), (
+            f"promoted to {rv['band']} with {under} and depth_reduced="
+            f"{rv['review_depth_reduced']}")
+        if rv["judge_model"] and involved:
+            assert TIER_OF[rv["judge_model"]] >= max(TIER_OF[m] for m in involved)
+        if rv["independence_required"]:
+            models = [m for m in rv["reviewer_models"] if m]
+            assert out["selected_model"] not in models or rv["independence_compromised"], (
+                "the implementer sits in its own review on a promoted route")
+        # Not asserted: that the final confidence is still below the threshold.
+        # A promotion can seat better models and lift it back to the threshold,
+        # and the promotion is deliberately not reverted — `promoted_once`
+        # exists so the band does not oscillate. What must hold is that the
+        # number reported follows from the fallbacks reported, which
+        # `test_d20_the_emitted_confidence_matches_the_emitted_fallbacks` owns.
+
+
 def test_a_compensation_is_recorded_only_when_it_was_applied():
     """Round 3. `raise_effort_to_MAX_and_add_second_review` reported itself
     applied while doing only the first half."""

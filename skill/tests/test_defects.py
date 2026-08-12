@@ -1273,14 +1273,14 @@ def test_d18_terminal_precedence_is_pinned_where_two_reasons_are_true():
     # history branch when the budget was spent put an unconditional gate under
     # `on_retry_exhaustion`, so `notify_human` routed a task with no history at
     # all, at exit 0. The shipped value hid it; only a different value shows it.
-    for action in ("notify_human", "require_human_confirmation", "terminal"):
-        cfg = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
-                                            "on_retry_exhaustion": action}}
-        out = route(_task(task_class="MECHANICAL", prior_failures=cap), cfg)
-        assert out["terminal"], (
-            f"on_retry_exhaustion={action}: a task with no usable history routed "
-            f"anyway — {out['selected_model']}")
-        assert out["selected_model"] is None
+    # Round 18: this used to set `on_retry_exhaustion`, a key deleted in round
+    # 17 — an unknown key in a config the validator does not reject, so the loop
+    # was three identical iterations proving nothing. The gate is unconditional
+    # now, so what there is to assert is that it holds, once.
+    out = route(_task(task_class="MECHANICAL", prior_failures=cap), CFG)
+    assert out["terminal"] and out["selected_model"] is None
+    assert any("retry budget spent" in n for n in out["notes"]), (
+        "the terminal does not name the fact the caller must act on")
     assert not any("retry history required" in n for n in spent["notes"]), (
         "told to collect a history that cannot be used")
 
@@ -1468,13 +1468,15 @@ def test_d20_the_retry_cap_is_not_a_configurable_suggestion():
     is not a budget."""
     cap = CFG["retry"]["max_total_implementation_attempts"]
     history = ["gpt-5.6-luna"] * cap
-    for action in ("terminal", "require_human_confirmation", "notify_human"):
-        cfg = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
-                                            "on_retry_exhaustion": action}}
-        out = route(_task(task_class="MECHANICAL", prior_failures=cap,
-                          prior_models=list(history)), cfg)
-        assert out["requires_human_confirmation"], (
-            f"on_retry_exhaustion={action}: attempt {cap + 1} was dispatchable")
+    out = route(_task(task_class="MECHANICAL", prior_failures=cap,
+                      prior_models=list(history)), CFG)
+    assert out["requires_human_confirmation"], f"attempt {cap + 1} was dispatchable"
+    assert out["terminal"] == "HUMAN_REQUIRED"
+    # Round 18: the key that used to gate this is gone, and a deleted key must
+    # not linger in a test as a setting nobody reads — three iterations over a
+    # value with no consumer is the inert shape one layer up.
+    assert "on_retry_exhaustion" not in CFG["human_in_the_loop"]
+    assert any("retry budget spent" in n for n in out["notes"])
 
 
 def test_d19_a_recovered_seat_plan_is_not_reported_as_exhausted():

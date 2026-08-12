@@ -1231,6 +1231,107 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         except SupplyExhausted as exc:
             resolved, fallbacks, compensations = {}, [], []
             supply_exhausted = str(exc)
+        applied_compensations: list[str] = []
+        for note in compensations:
+            if note == "raise_effort_one_level":
+                effort = policy.effort_up(effort)
+                effort_notes.append("compensation: fallback lost family diversity, effort +1")
+                applied_compensations.append(note)
+            elif note == "raise_effort_to_MAX_and_add_second_review":
+                effort = policy.efforts[-1]
+                effort_notes.append("compensation: architect downgraded, effort raised to MAX")
+                # The name promises two things. Recording it while doing one is the
+                # same false report this module exists to avoid, so the extra
+                # reviewer is actually added — and if none can be resolved, the
+                # compensation is not claimed.
+                extra = _extra_reviewer(review, worker, policy, resolver)
+                if extra:
+                    review = dict(review)
+                    review["reviewers"] = list(review["reviewers"]) + [extra]
+                    # `independent` stays the BAND's answer. Round 4 added the flip
+                    # so the extra seat would be de-conflicted; round 10 showed what
+                    # it actually bought — a bonus reviewer upgrading the band's own
+                    # requirement, so that a LOW route whose *compensating* review
+                    # could not be isolated terminated the whole task, and the
+                    # independence invariants started applying to a band that never
+                    # asked. Seat allocation at the emit boundary is unconditional
+                    # and works on resolved models, so the extra seat is checked
+                    # either way; that is what makes this safe to drop.
+                    # A count, not a name. Recording the role invited exactly the
+                    # staleness `self_review_avoided` had to be rescued from: seat
+                    # allocation can re-seat that role afterwards, and then the
+                    # record names a reviewer who is not there. What the
+                    # compensation promises is a SEAT, so the seat count is what it
+                    # records.
+                    review["compensating_reviewers"] = review.get("compensating_reviewers", 0) + 1
+                    try:
+                        resolved, fallbacks, _ = resolver.resolve(roles_for(review))
+                    except SupplyExhausted as exc:
+                        supply_exhausted = supply_exhausted or str(exc)
+                    applied_compensations.append(note)
+                    effort_notes.append(f"compensation: added a second independent review ({extra})")
+                else:
+                    effort_notes.append(
+                        "compensation NOT fully applied: no additional reviewer could be resolved"
+                    )
+            else:
+                raise UnknownCompensationError(
+                    f"fallback_compensations declares the effect {note!r}, which no branch "
+                    f"implements; it would be reported as applied while doing nothing"
+                )
+        compensations = applied_compensations
+
+        # Final de-confliction, at the emit boundary rather than mid-pipeline.
+        #
+        # This invariant has now been broken four times, each in a different place,
+        # because it was being enforced at one point that later code could route
+        # around: the compensation path above appends a reviewer and flips
+        # `independent` to true, so a LOW-band review that never went through
+        # de-confliction was promoted to "independent" with the worker's own model
+        # sitting in a reviewer slot. Checking in the middle protects only the
+        # paths that existed when the check was written. Checking here protects
+        # every path, including ones added later, because nothing runs after it.
+        judge_role = disagreement["default_judge"] if (
+            review["band"] == "CRITICAL" or route_path == "disagreement") else None
+
+        # Seat allocation. This block is unconditional on purpose.
+        #
+        # The previous version wrapped it in `if review["independent"]:`, which is
+        # how the same defect survived a fifth round: a check moved to the boundary
+        # but placed behind a condition is not a boundary, it is a mid-pipeline
+        # check in a new location. The disagreement path sets a judge at ANY band,
+        # and LOW declares `independent: false`, so LOW + disagreement skipped seat
+        # allocation entirely and the implementer adjudicated its own work.
+        #
+        # Reviewer de-confliction is still gated on `independent` — LOW's
+        # worker-reviews-itself is documented design. The judge is not covered by
+        # that exemption: an adjudicator brought in to settle a dispute must not be
+        # one of the parties, whatever the band.
+        if review["independent"]:
+            review = _deconflict(review, worker, policy, resolver)
+
+        if judge_role:
+            review, judge_role = _seat_judge(review, worker, judge_role, policy, resolver)
+
+        try:
+            resolved, fallbacks, _ = resolver.resolve(
+                list(dict.fromkeys([worker] + list(review["reviewers"])
+                                   + ([judge_role] if judge_role else []))))
+            # The final seat plan resolved, so any shortage seen while exploring a
+            # preliminary one is not a fact about this route. Round 15: it was
+            # sticky, and a LOW disagreement route whose provisional
+            # `principal_architect` could not resolve stayed terminal even though
+            # `_seat_judge` had found a complete assignment.
+            supply_exhausted = None
+        except SupplyExhausted as exc:
+            resolved, fallbacks = {}, []
+            supply_exhausted = str(exc)
+        # From the FINAL fallbacks: the plan above is the one that ships, so
+        # the number the promotion decision reads is the number the route
+        # reports. Rounds 16-18 each moved this and each moved it wrong — into
+        # the loop reading a preliminary resolve, then after the loop where the
+        # post-conditions could not see the promotion. The plan and the decision
+        # belong in the same iteration.
         confidence = routing_confidence(task, fallbacks)
         threshold = cfg["router"]["confidence"]["extra_review_below"]
         # The policy is "raise the review band ONE level" — the loop exists so
@@ -1240,6 +1341,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         # CRITICAL every time; that regression put a CRITICAL human gate on
         # routine documentation work, and a gate that fires on everything
         # trains people to wave it through.
+        #
+        # Round 18: this settles the BAND only. Round 17 re-ran the promotion
+        # after the emit-boundary post-conditions had already passed, so a
+        # promoted route shipped without the depth, family and de-confliction
+        # checks — a change placed where the checks could not see it, which is
+        # the same shape as a check placed where later code routes around it.
+        # Everything the post-conditions inspect is now built after this loop,
+        # from the band it settled on.
         if confidence < threshold and review_band != "CRITICAL" and not promoted_once:
             promoted = policy.bands[policy.bands.index(review_band) + 1]
             overrides.append(f"low_routing_confidence_raised_review_to_{promoted}")
@@ -1250,101 +1359,6 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     else:  # pragma: no cover - the band ladder is shorter than the pass budget
         raise ConfigError("review band promotion failed to reach a fixed point")
 
-    applied_compensations: list[str] = []
-    for note in compensations:
-        if note == "raise_effort_one_level":
-            effort = policy.effort_up(effort)
-            effort_notes.append("compensation: fallback lost family diversity, effort +1")
-            applied_compensations.append(note)
-        elif note == "raise_effort_to_MAX_and_add_second_review":
-            effort = policy.efforts[-1]
-            effort_notes.append("compensation: architect downgraded, effort raised to MAX")
-            # The name promises two things. Recording it while doing one is the
-            # same false report this module exists to avoid, so the extra
-            # reviewer is actually added — and if none can be resolved, the
-            # compensation is not claimed.
-            extra = _extra_reviewer(review, worker, policy, resolver)
-            if extra:
-                review = dict(review)
-                review["reviewers"] = list(review["reviewers"]) + [extra]
-                # `independent` stays the BAND's answer. Round 4 added the flip
-                # so the extra seat would be de-conflicted; round 10 showed what
-                # it actually bought — a bonus reviewer upgrading the band's own
-                # requirement, so that a LOW route whose *compensating* review
-                # could not be isolated terminated the whole task, and the
-                # independence invariants started applying to a band that never
-                # asked. Seat allocation at the emit boundary is unconditional
-                # and works on resolved models, so the extra seat is checked
-                # either way; that is what makes this safe to drop.
-                # A count, not a name. Recording the role invited exactly the
-                # staleness `self_review_avoided` had to be rescued from: seat
-                # allocation can re-seat that role afterwards, and then the
-                # record names a reviewer who is not there. What the
-                # compensation promises is a SEAT, so the seat count is what it
-                # records.
-                review["compensating_reviewers"] = review.get("compensating_reviewers", 0) + 1
-                try:
-                    resolved, fallbacks, _ = resolver.resolve(roles_for(review))
-                except SupplyExhausted as exc:
-                    supply_exhausted = supply_exhausted or str(exc)
-                applied_compensations.append(note)
-                effort_notes.append(f"compensation: added a second independent review ({extra})")
-            else:
-                effort_notes.append(
-                    "compensation NOT fully applied: no additional reviewer could be resolved"
-                )
-        else:
-            raise UnknownCompensationError(
-                f"fallback_compensations declares the effect {note!r}, which no branch "
-                f"implements; it would be reported as applied while doing nothing"
-            )
-    compensations = applied_compensations
-
-    # Final de-confliction, at the emit boundary rather than mid-pipeline.
-    #
-    # This invariant has now been broken four times, each in a different place,
-    # because it was being enforced at one point that later code could route
-    # around: the compensation path above appends a reviewer and flips
-    # `independent` to true, so a LOW-band review that never went through
-    # de-confliction was promoted to "independent" with the worker's own model
-    # sitting in a reviewer slot. Checking in the middle protects only the
-    # paths that existed when the check was written. Checking here protects
-    # every path, including ones added later, because nothing runs after it.
-    judge_role = disagreement["default_judge"] if (
-        review["band"] == "CRITICAL" or route_path == "disagreement") else None
-
-    # Seat allocation. This block is unconditional on purpose.
-    #
-    # The previous version wrapped it in `if review["independent"]:`, which is
-    # how the same defect survived a fifth round: a check moved to the boundary
-    # but placed behind a condition is not a boundary, it is a mid-pipeline
-    # check in a new location. The disagreement path sets a judge at ANY band,
-    # and LOW declares `independent: false`, so LOW + disagreement skipped seat
-    # allocation entirely and the implementer adjudicated its own work.
-    #
-    # Reviewer de-confliction is still gated on `independent` — LOW's
-    # worker-reviews-itself is documented design. The judge is not covered by
-    # that exemption: an adjudicator brought in to settle a dispute must not be
-    # one of the parties, whatever the band.
-    if review["independent"]:
-        review = _deconflict(review, worker, policy, resolver)
-
-    if judge_role:
-        review, judge_role = _seat_judge(review, worker, judge_role, policy, resolver)
-
-    try:
-        resolved, fallbacks, _ = resolver.resolve(
-            list(dict.fromkeys([worker] + list(review["reviewers"])
-                               + ([judge_role] if judge_role else []))))
-        # The final seat plan resolved, so any shortage seen while exploring a
-        # preliminary one is not a fact about this route. Round 15: it was
-        # sticky, and a LOW disagreement route whose provisional
-        # `principal_architect` could not resolve stayed terminal even though
-        # `_seat_judge` had found a complete assignment.
-        supply_exhausted = None
-    except SupplyExhausted as exc:
-        resolved, fallbacks = {}, []
-        supply_exhausted = str(exc)
 
     # Post-condition, asserted rather than assumed. Reviewer duplication is
     # only a defect where independence was requested; a judge sharing any seat
@@ -1436,34 +1450,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         and fams[review["reviewers"][0]] != fams[worker]
     )
 
-    # Recomputed from the fallbacks actually emitted, and the decision that
-    # consumes it is re-run once. Round 16 fixed the reported number and left
-    # the decision on the discarded plan's value, so a route shipping
-    # confidence 0.75 kept the LOW review band that 0.95 had justified — the
-    # fixed point exists precisely so the promotion sees the final number, and
-    # recomputing after it had stepped outside that guarantee.
+    # The band is settled and the plan above was built from it, so the
+    # confidence that ships is the confidence of what ships. Round 16 found the
+    # two disagreeing; round 17's fix put the correction after the
+    # post-conditions and round 18 moved the whole plan below the loop instead.
     confidence = routing_confidence(task, fallbacks)
-    threshold = cfg["router"]["confidence"]["extra_review_below"]
-    if confidence < threshold and review_band != "CRITICAL" and not promoted_once:
-        review_band = policy.bands[policy.bands.index(review_band) + 1]
-        overrides.append(f"low_routing_confidence_raised_review_to_{review_band}")
-        promoted_once = True
-        review = select_review(review_band, worker, policy, resolver)
-        judge_role = disagreement["default_judge"] if (
-            review["band"] == "CRITICAL" or route_path == "disagreement") else None
-        if review["independent"]:
-            review = _deconflict(review, worker, policy, resolver)
-        if judge_role:
-            review, judge_role = _seat_judge(review, worker, judge_role, policy, resolver)
-        try:
-            resolved, fallbacks, _ = resolver.resolve(
-                list(dict.fromkeys([worker] + list(review["reviewers"])
-                                   + ([judge_role] if judge_role else []))))
-            supply_exhausted = None
-        except SupplyExhausted as exc:
-            resolved, fallbacks = {}, []
-            supply_exhausted = str(exc)
-        confidence = routing_confidence(task, fallbacks)
 
     review_independence = independence(review, task)
     judge = judge_role
@@ -1536,20 +1527,29 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # distinct models either — so `independence_compromised` is true, and round
     # 15 found it claiming the terminal while the actual cause sat in a note.
     # A report that names a symptom sends the operator to the wrong problem.
-    if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
+    if budget_spent:
         # Ahead of the shortage, for the reason the shortage was put ahead of
         # the seat collision: name the fact the caller has to act on. Round 17
         # found the mirror of the case round 16 fixed — a spent budget with a
         # complete history reported as `SUPPLY_EXHAUSTED`, which is true and is
         # not what stops the next attempt.
         #
-        # And unconditional, with no `on_retry_exhaustion` key above it. Round
-        # 16 made that key a control and round 17 measured all three of its
-        # actions producing the same route: the cap cannot legitimately vary, so
-        # a key offering to vary it is a constant wearing a config file — the
-        # shape this artifact has removed three times already.
+        # Unconditional, with no `on_retry_exhaustion` key above it: round 17
+        # measured all three of that key's actions producing the same route, so
+        # a key offering to vary a safety cap was a constant wearing a config
+        # file. No config value may dispatch an attempt past the cap.
+        #
+        # And it says so. Round 18: deleting the control left this terminal
+        # ANONYMOUS — `HUMAN_REQUIRED` with no cause, no note and nothing in the
+        # rationale, so the one fact the caller had to act on was the one thing
+        # the route did not state. Removing a control must not remove its
+        # disclosure.
         terminal = terminal or "HUMAN_REQUIRED"
         requires_human = True
+        worker_notes.append(
+            f"retry budget spent: {task.prior_failures} attempt(s) against a cap of "
+            f"{cfg['retry']['max_total_implementation_attempts']} — stop retrying and "
+            f"surface what was tried to a human")
 
     if supply_exhausted:
         worker_notes.append(f"supply exhausted: {supply_exhausted}")
@@ -1562,10 +1562,6 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         # ahead of the `terminal or` gate below is all the precedence the
         # reasoning ever asked for.
         terminal = terminal or "SUPPLY_EXHAUSTED"
-
-    if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
-        # Unconditional: no config value may dispatch an attempt past the cap.
-        requires_human = True
 
     if review.get("independence_compromised"):
         # No inner `if band_requires_independence`: it cannot be false here.
