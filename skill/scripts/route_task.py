@@ -1224,7 +1224,18 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     review_band = band
     promoted_once = False
     supply_exhausted: str | None = None
+    # Everything the loop body mutates has to be restored at the top of each
+    # pass, or the body is not idempotent and the "fixed point" is a fold.
+    # Round 19: moving the plan inside the loop (round 18's fix) broke the
+    # inherited assumption that a compensation runs at most once per route.
+    # `review`, `applied_compensations`, `judge_role` and `supply_exhausted`
+    # were already rebuilt per pass; `effort` and its notes were not, so a
+    # promoted route raised effort TWICE for one compensation — 16,268 routes
+    # shipped with the notes, the record and the effort all disagreeing, one of
+    # them reporting no compensation at all.
+    base_effort, base_effort_notes = effort, list(effort_notes)
     for _ in range(MAX_PROMOTION_PASSES):
+        effort, effort_notes = base_effort, list(base_effort_notes)
         review = select_review(review_band, worker, policy, resolver)
         try:
             resolved, fallbacks, compensations = resolver.resolve(roles_for(review))
@@ -1239,7 +1250,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                 applied_compensations.append(note)
             elif note == "raise_effort_to_MAX_and_add_second_review":
                 effort = policy.efforts[-1]
-                effort_notes.append("compensation: architect downgraded, effort raised to MAX")
+                # The note is written after the outcome is known. Round 19: it
+                # was written here, before, so a compensation that could not be
+                # completed still had "effort raised to MAX" in the notes while
+                # `fallback_compensations_applied` stayed empty — the notes
+                # claiming a compensation the record denied.
                 # The name promises two things. Recording it while doing one is the
                 # same false report this module exists to avoid, so the extra
                 # reviewer is actually added — and if none can be resolved, the
@@ -1264,10 +1279,17 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                     # compensation promises is a SEAT, so the seat count is what it
                     # records.
                     review["compensating_reviewers"] = review.get("compensating_reviewers", 0) + 1
-                    try:
-                        resolved, fallbacks, _ = resolver.resolve(roles_for(review))
-                    except SupplyExhausted as exc:
-                        supply_exhausted = supply_exhausted or str(exc)
+                    effort_notes.append(
+                        "compensation: architect downgraded, effort raised to MAX")
+                    # No re-resolve here. Round 19: this block read as "reflect
+                    # the extra seat in the plan" and was a dead store — every
+                    # one of its outputs is overwritten unconditionally by the
+                    # final resolve at the end of this pass, and nothing between
+                    # reads them (`_deconflict` and `_seat_judge` work through
+                    # `resolver.peek`). Eleventh instance of the class, and a
+                    # fossil besides: its `supply_exhausted or str(exc)` was the
+                    # sticky-shortage policy round 15 removed, preserved here
+                    # where it could not be seen.
                     applied_compensations.append(note)
                     effort_notes.append(f"compensation: added a second independent review ({extra})")
                 else:

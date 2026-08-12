@@ -622,9 +622,14 @@ def test_a_promoted_review_band_still_passes_every_emit_boundary_check():
     promoted = [o for o in routes()
                 if any("low_routing_confidence" in x for x in o["band_overrides_applied"])]
     assert len(promoted) > 100, f"only {len(promoted)} promoted routes in the sweep"
-    for out in promoted:
-        if out["terminal"]:
-            continue
+    # Round 19: the body skips terminal routes, so this passed with zero
+    # non-terminal promoted routes — a regression that terminalised all of them
+    # would have emptied the assertion instead of failing it.
+    dispatchable = [o for o in promoted if not o["terminal"]]
+    assert len(dispatchable) > 50, (
+        f"only {len(dispatchable)} promoted routes are dispatchable; the checks "
+        f"below run on almost nothing")
+    for out in dispatchable:
         rv = out["review"]
         involved = parties(out)
         floor = BAND_FLOOR[rv["band"]]
@@ -644,6 +649,48 @@ def test_a_promoted_review_band_still_passes_every_emit_boundary_check():
         # exists so the band does not oscillate. What must hold is that the
         # number reported follows from the fallbacks reported, which
         # `test_d20_the_emitted_confidence_matches_the_emitted_fallbacks` owns.
+
+
+def test_the_fixed_point_body_is_idempotent():
+    """Round 19. Round 18 moved the whole plan inside the bounded loop — the
+    right repair — and `effort` was the one piece of plan state not rebuilt at
+    the top of each pass. So a route that both compensated and promoted raised
+    effort TWICE for one compensation, and shipped its notes, its record and
+    its effort disagreeing: two "effort +1" notes, an empty
+    `fallback_compensations_applied`, and an effort two levels up. "Raise one
+    level" is the policy sentence; the route recorded none, said two, and did
+    two.
+
+    A fixed point whose body is not idempotent is a fold. What makes it
+    checkable is that every compensation the notes claim must appear in the
+    record, exactly once each."""
+    seen = 0
+    for out in routes():
+        if out["terminal"]:
+            continue
+        notes = [n for n in out["notes"] if n.startswith("compensation:")]
+        claimed = [n for n in notes if "NOT fully applied" not in n]
+        assert len(claimed) == len(set(claimed)), (
+            f"the same compensation was applied twice: {claimed}")
+        # One record per compensation, and the second-review compensation
+        # contributes two notes (effort + the seat) for its single record.
+        records = out["fallback_compensations_applied"]
+        assert len(records) == len(set(records)), f"duplicate record: {records}"
+        if claimed:
+            assert records, (
+                f"notes claim {claimed} while the record is empty — the pass "
+                f"that applied them is not the pass that shipped")
+        # And the other direction. Round 19: checking only notes-implies-record
+        # let a compensation be recorded with its note deleted — the operator
+        # reading the prose would not know it happened, which is the same
+        # silence in reverse.
+        for record in records:
+            expected = ("effort +1" if record == "raise_effort_one_level"
+                        else "effort raised to MAX")
+            assert any(expected in n for n in notes), (
+                f"{record!r} is recorded but no note says so: {notes}")
+        seen += len(claimed)
+    assert seen, "no compensation in the sweep — the assertion was vacuous"
 
 
 def test_a_compensation_is_recorded_only_when_it_was_applied():
