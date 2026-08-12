@@ -71,6 +71,22 @@ class UnknownCompensationError(ConfigError):
     """
 
 
+# The prose a cause is allowed to carry. Round 16: pairing a cause code with a
+# predicate closed half the gap — the half where the predicate drifts — and left
+# the other half open, because nothing observed `reason`. Round 14's Critical
+# was exactly a reason string narrowing while the predicate stayed put. A cause
+# now owns its wording, and `test_d19` checks the emitted rationale against this
+# table rather than against a comment.
+CAUSE_REASONS = {
+    "caller_declared_isolation_gap":
+        "the caller reported that isolation cannot be achieved here",
+    "retry_budget_spent": "the retry budget is spent",
+    "critical_review_band": "a CRITICAL review cannot be accepted automatically",
+    "no_adjudicator": "no adjudicator is available",
+    "review_below_band": "the review is staffed below its band",
+}
+
+
 @dataclass(frozen=True)
 class Control:
     """One configurable human-in-the-loop control.
@@ -85,7 +101,10 @@ class Control:
     cause: str
     fired: bool
     terminal: str
-    reason: str
+
+    @property
+    def reason(self) -> str:
+        return CAUSE_REASONS[self.cause]
 
 
 class SupplyExhausted(Exception):
@@ -1419,6 +1438,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         and fams[review["reviewers"][0]] != fams[worker]
     )
 
+    # Recomputed from the fallbacks actually emitted. The fixed point above
+    # computes confidence per candidate plan, and round 16 found a route
+    # carrying the confidence of a plan that was discarded — two emitted facts
+    # contradicting each other, with `routing_confidence` 0.95 beside two
+    # recorded fallbacks whose own formula gives 0.85. Whatever the loop
+    # explored, what ships is what the route says it is.
+    confidence = routing_confidence(task, fallbacks)
+
     review_independence = independence(review, task)
     judge = judge_role
 
@@ -1447,20 +1474,24 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     controls = [
         Control("on_independence_unachievable", "caller_declared_isolation_gap",
                 band_requires_independence and task.isolation_available is False,
-                "INDEPENDENCE_UNAVAILABLE",
-                "the caller reported that isolation cannot be achieved here"),
+                "INDEPENDENCE_UNAVAILABLE"),
+        # The action selects how loudly, never whether. Round 16: with a
+        # complete history and `notify_human` the cap+1th attempt shipped at
+        # exit 0 — a budget that any config value can opt out of is not a
+        # budget. The unconditional half lives below with the other
+        # non-negotiable gates; this control chooses terminal vs confirmation.
         Control("on_retry_exhaustion", "retry_budget_spent",
                 task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"],
-                "HUMAN_REQUIRED", "the retry budget is spent"),
+                "HUMAN_REQUIRED"),
         Control("on_any_critical_review", "critical_review_band",
                 review["band"] == "CRITICAL",
-                "HUMAN_REQUIRED", "a CRITICAL review cannot be accepted automatically"),
+                "HUMAN_REQUIRED"),
         Control("on_judge_unavailable", "no_adjudicator",
                 bool(review.get("judge_unavailable")),
-                "HUMAN_REQUIRED", "no adjudicator is available"),
+                "HUMAN_REQUIRED"),
         Control("on_review_depth_reduced", "review_below_band",
                 bool(review.get("review_depth_reduced")),
-                "HUMAN_REQUIRED", "the review is staffed below its band"),
+                "HUMAN_REQUIRED"),
     ]
 
     terminal = None
@@ -1496,7 +1527,19 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # A report that names a symptom sends the operator to the wrong problem.
     if supply_exhausted:
         worker_notes.append(f"supply exhausted: {supply_exhausted}")
-        terminal = "SUPPLY_EXHAUSTED"
+        # `terminal or`, not `=`. The stated design is that this outranks the
+        # states it PRODUCES — `independence_compromised` is one, because with
+        # nothing resolved the seats cannot be given distinct models. A missing
+        # retry history and a spent budget are not produced by it, and round 16
+        # found the plain assignment burying "pass --prior-models with one model
+        # id per failure" under a shortage the caller cannot fix. Placing this
+        # ahead of the `terminal or` gate below is all the precedence the
+        # reasoning ever asked for.
+        terminal = terminal or "SUPPLY_EXHAUSTED"
+        requires_human = True
+
+    if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
+        # Unconditional: no config value may dispatch an attempt past the cap.
         requires_human = True
 
     if review.get("independence_compromised"):
@@ -1516,8 +1559,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         fired_causes.append(control.cause)
         if action == "terminal":
             terminal = terminal or terminal_name
+            effort_notes.append(f"terminal/{key}: {why}")
         elif action == "require_human_confirmation":
             requires_human = True
+            effort_notes.append(f"confirm/{key}: {why}")
         elif action == "notify_human":
             # Deferred: whether the route proceeds is not known until every
             # control and every non-configurable terminal has been evaluated,
@@ -1691,6 +1736,16 @@ def explain(task: Task, r: dict) -> str:
         parts.append(f"Excluded as already-failed: {', '.join(r['excluded_prior_failures'])}.")
     if not r["cross_family_review"] and rv["independence_required"]:
         parts.append("cross_family_review=false — reviewers share a family; weigh the second verdict accordingly.")
+    # The rationale is what a person reads, so it names why a person is
+    # involved. Round 16: the causes were emitted as codes and the reasons sat
+    # in `notes`, so the prose a human sees never said which control fired —
+    # and the guard that checks prose against cause had nothing to check.
+    for note in r["notes"]:
+        if note.split("/", 1)[0] in ("terminal", "confirm", "notify_human"):
+            # Verbatim, not prettified: the declared wording is what the
+            # equivalence guard matches, and a capitalised copy is a different
+            # string that silently defeats it.
+            parts.append(f"Human control: {note.split(': ', 1)[1]}.")
     if r["requires_human_confirmation"]:
         parts.append("Requires human confirmation before proceeding.")
     return " ".join(parts)

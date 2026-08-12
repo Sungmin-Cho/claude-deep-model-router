@@ -1369,6 +1369,68 @@ def test_d18_an_operational_shortage_is_a_terminal_not_invalid_input():
     assert out["selected_model"] is None and out["requires_human_confirmation"]
 
 
+def test_d20_a_shortage_never_buries_a_reason_the_caller_can_act_on():
+    """Round 16. Round 15 gave `SUPPLY_EXHAUSTED` precedence so a symptom would
+    stop masking the cause, and used a plain assignment — which overshot the
+    stated reasoning. It outranks the states it PRODUCES; a missing retry
+    history is not one of them, and burying "pass --prior-models with one model
+    id per failure" under a shortage the caller cannot fix trades one wrong
+    report for its mirror image."""
+    everything = sorted(m["id"] for m in CFG["models"].values())
+    out = r(task_class="MECHANICAL", prior_failures=1, unavailable_models=everything)
+    assert out["terminal"] == "RETRY_HISTORY_REQUIRED", (
+        f"the actionable reason was replaced by {out['terminal']}")
+    assert any("one model id per failure" in n for n in out["notes"])
+
+    # And it still outranks what it does produce.
+    produced = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
+                 unavailable_models=everything[:6])
+    if produced["terminal"] == "SUPPLY_EXHAUSTED":
+        assert produced["review"]["independence_compromised"], "probe drifted"
+
+
+def test_d20_the_emitted_confidence_matches_the_emitted_fallbacks():
+    """Round 16. The fixed point computes confidence per candidate plan, and a
+    route that recovered from a failed pass shipped the discarded plan's number:
+    `routing_confidence` 0.95 beside two recorded fallbacks whose own formula
+    gives 0.85. Two emitted facts contradicting each other is the shape this
+    module's second load-bearing property forbids, and it is checkable in one
+    line because the formula is a function of what is emitted."""
+    from route_task import routing_confidence
+    checked = 0
+    for task_class in ("MECHANICAL", "IMPLEMENTATION", "ARCHITECTURE"):
+        for scarce in ([], ["claude-fable-5"], ["claude-fable-5", "claude-opus-5"],
+                       ["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+                        "gpt-5.6-luna", "gpt-5.6-sol"]):
+            for flags in ([], ["review_disagreement"], ["auth_sensitive"]):
+                task = _task(task_class=task_class, flags=list(flags),
+                             unavailable_models=list(scarce))
+                out = route(task, CFG)
+                assert out["routing_confidence"] == routing_confidence(
+                    task, out["fallbacks_applied"]), (
+                    f"{task_class}/{scarce}/{flags}: confidence "
+                    f"{out['routing_confidence']} does not follow from the "
+                    f"fallbacks it reports ({out['fallbacks_applied']})")
+                checked += 1
+    assert checked > 30
+
+
+def test_d20_the_retry_cap_is_not_a_configurable_suggestion():
+    """Round 16. `on_retry_exhaustion` selects how loudly the cap is announced,
+    never whether it holds — with a complete history and `notify_human` the
+    cap+1th attempt shipped at exit 0. A budget any config value can opt out of
+    is not a budget."""
+    cap = CFG["retry"]["max_total_implementation_attempts"]
+    history = ["gpt-5.6-luna"] * cap
+    for action in ("terminal", "require_human_confirmation", "notify_human"):
+        cfg = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
+                                            "on_retry_exhaustion": action}}
+        out = route(_task(task_class="MECHANICAL", prior_failures=cap,
+                          prior_models=list(history)), cfg)
+        assert out["requires_human_confirmation"], (
+            f"on_retry_exhaustion={action}: attempt {cap + 1} was dispatchable")
+
+
 def test_d19_a_recovered_seat_plan_is_not_reported_as_exhausted():
     """Round 15. `supply_exhausted` was set while exploring a PRELIMINARY seat
     set and never cleared, so a route whose final assignment resolved
@@ -1397,6 +1459,7 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
     logically equivalent while its reason string claimed a narrower cause —
     fails this immediately.
     """
+    from route_task import CAUSE_REASONS
     tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
     cap = CFG["retry"]["max_total_implementation_attempts"]
     ids = sorted(tier)
@@ -1415,9 +1478,20 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
             "review_below_band": bool(rv["review_depth_reduced"]),
         }
 
+    # The oracle must cover exactly the causes the router declares. A control
+    # added with a new cause and not added here would be swept past in silence:
+    # `got == want` holds trivially for a cause neither side knows about. This
+    # is the drift that matters, and unlike weakening the count it is
+    # detectable — a weakened threshold only shows up once something is
+    # already missing, which is too late to be a guard.
+    probe_out = route(_task(task_class="MECHANICAL"), CFG)
+    assert set(expected(_task(task_class="MECHANICAL"), probe_out)) == set(CAUSE_REASONS), (
+        f"the oracle covers {sorted(set(expected(_task(task_class='MECHANICAL'), probe_out)))} "
+        f"but the router declares {sorted(CAUSE_REASONS)}")
+
     checked = 0
     seen_causes: set = set()
-    for task_class in ("MECHANICAL", "IMPLEMENTATION", "ARCHITECTURE"):
+    for task_class in TASK_CLASSES:
         for dims in ((0, 0, 0, 0), (2, 2, 2, 0), (3, 3, 3, 3)):
             for flags in ([], ["auth_sensitive"], ["review_disagreement"],
                           ["auth_sensitive", "bridge_down"]):
@@ -1437,12 +1511,28 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
                                 f"{task_class}/{dims}/{flags}/iso={iso}/pf={pf}: "
                                 f"controls fired for {sorted(got)}, the inputs say "
                                 f"{sorted(want)}")
+                            # The other half of the gap. Round 16: pairing a
+                            # cause with a predicate caught the predicate
+                            # drifting; nothing observed the PROSE, which is
+                            # what round 14's Critical actually falsified. The
+                            # rationale must carry each fired cause's declared
+                            # wording, and must not carry any other cause's.
+                            for cause in CAUSE_REASONS:
+                                present = CAUSE_REASONS[cause] in out["rationale"]
+                                assert present == (cause in want), (
+                                    f"{task_class}/{dims}: rationale "
+                                    f"{'claims' if present else 'omits'} "
+                                    f"{cause!r} but the inputs say otherwise")
                             seen_causes |= want
                             checked += 1
     assert checked > 500, f"only {checked} routes reached the assertion"
-    assert len(seen_causes) >= 4, (
-        f"only {sorted(seen_causes)} were ever exercised; a cause no route "
-        f"triggers is a control this test cannot hold to anything")
+    # Every cause, not most of them. Round 16: `>= 4` of five let a
+    # task-class-dependent predicate drift out of the sweep unnoticed, and the
+    # docstring meanwhile claimed whole-input-space equivalence over three
+    # classes. It sweeps every class now and demands every cause.
+    assert seen_causes == set(CAUSE_REASONS), (
+        f"never exercised: {sorted(set(CAUSE_REASONS) - seen_causes)}; a cause no "
+        f"route triggers is a control this test cannot hold to anything")
 
 
 def test_d18_every_terminal_the_router_assigns_is_declared():
