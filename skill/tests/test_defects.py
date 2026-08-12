@@ -27,6 +27,7 @@ sys.path.insert(0, str(SKILL / "scripts"))
 
 from route_task import (  # noqa: E402
     BANDS,
+    TERMINAL_STATES,
     ROLES,
     TASK_CLASSES,
     Policy,
@@ -849,14 +850,28 @@ def test_d16_skill_md_stays_small_without_being_hollowed_out():
     # schema for a round, promising a key no route emits. Documentation drifts
     # in both directions.
     from route_task import Task, route as _route
-    emitted = set(_route(_task(task_class="MECHANICAL"), CFG))
+    sample = _route(_task(task_class="MECHANICAL"), CFG)
+    emitted = set(sample)
     start = text.index("task_class:  complexity:")
     schema_block = text[start:text.index("```", start)]
-    for line in schema_block.splitlines():
-        key = line.split(":")[0].strip()
-        if key and key.isidentifier() and not line.startswith(" ") and key != "review":
-            assert key in emitted, (
-                f"SKILL.md's output schema names {key!r}, which no route emits")
+    # Round 14: this read the FIRST key on each line and skipped the whole
+    # nested `review` block, so 16 of 44 declared fields were checked. Several
+    # lines declare three fields; the schema's densest part was invisible.
+    top, nested = set(sample), set(sample["review"])
+    for raw in schema_block.splitlines():
+        indented = raw.startswith(" ")
+        line = raw.split("#")[0]
+        for token in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*:", line):
+            if token in ("true", "false", "null"):
+                continue
+            pool = nested if indented else top
+            assert token in pool, (
+                f"SKILL.md's output schema names "
+                f"{'review.' if indented else ''}{token!r}, which no route emits")
+    # And the other direction, for the nested block the guard used to skip
+    # entirely: a field a route emits but the schema never mentions is drift too.
+    for key in sorted(emitted):
+        assert key in schema_block, f"the schema never mentions the emitted field {key!r}"
 
     # Terminal states must be enumerated, not summarised.
     from route_task import TERMINAL_STATES
@@ -1242,6 +1257,125 @@ def test_d15_every_reference_skill_md_names_actually_exists():
         assert fences % 2 == 0, f"{doc.name} has {fences} code fences — one is unclosed"
 
 
+def test_d18_terminal_precedence_is_pinned_where_two_reasons_are_true():
+    """Round 14. The ordering of the two unconditional gates carried six lines
+    of justification and no test: swapping them, or deleting the
+    `RETRY_HISTORY_REQUIRED` promotion entirely, failed nothing. The rule this
+    artifact holds itself to is that every fix comes with a regression test
+    that can fail, and the most-argued code in the round was outside it."""
+    cap = CFG["retry"]["max_total_implementation_attempts"]
+
+    # Budget spent AND no history: the budget is what the caller must act on,
+    # because there is no next attempt for a history to place.
+    spent = r(task_class="MECHANICAL", prior_failures=cap)
+    assert spent["terminal"] == "HUMAN_REQUIRED", spent["notes"]
+    assert not any("retry history required" in n for n in spent["notes"]), (
+        "told to collect a history that cannot be used")
+
+    # Below the cap, the history is the actionable reason even when other
+    # conditions are also true.
+    incomplete = r(task_class="MECHANICAL", prior_failures=1)
+    assert incomplete["terminal"] == "RETRY_HISTORY_REQUIRED"
+
+    # Missing history AND a compromised review: the caller can act on the
+    # history; it cannot act on the seat shortage.
+    both = None
+    for scarce in itertools.combinations(sorted(m["id"] for m in CFG["models"].values()), 4):
+        out = r(task_class="MECHANICAL", flags=["auth_sensitive"],
+                prior_failures=1, unavailable_models=list(scarce))
+        if out["review"]["independence_compromised"]:
+            both = out
+            break
+    assert both is not None, "no route reaches both conditions — assertion vacuous"
+    assert both["terminal"] == "RETRY_HISTORY_REQUIRED", (
+        f"the seat shortage masked the reason the caller can act on: {both['terminal']}")
+
+
+def test_d18_a_notified_control_never_describes_a_cause_that_did_not_occur():
+    """Round 14, found only by escalating the reviewer a capability tier.
+
+    `on_independence_unachievable` was narrowed to `review_independence ==
+    "unavailable"` under a comment claiming it now covered only the
+    caller-declared gap. The narrowing was logically INERT — `independence()`
+    returns exactly that whenever the router's own seats collide — so the
+    control still fired on both causes while its new reason string described
+    only one. With `notify_human` the result was a note on a TERMINAL route
+    reading "the caller reported that isolation cannot be achieved here —
+    proceeding without a gate", where the caller had reported nothing and the
+    route did not proceed. Both clauses false, in the artifact whose second
+    load-bearing property is that a recorded change must be a real change.
+    """
+    relaxed = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
+                                            "on_independence_unachievable": "notify_human"}}
+    seen = 0
+    for scarce in itertools.combinations(sorted(m["id"] for m in CFG["models"].values()), 4):
+        task = _task(task_class="MECHANICAL", flags=["auth_sensitive"],
+                     unavailable_models=list(scarce))
+        out = route(task, relaxed)
+        if not out["review"]["independence_compromised"]:
+            continue
+        seen += 1
+        assert task.isolation_available is None, "probe drifted"
+        for note in out["notes"]:
+            assert "the caller reported" not in note, (
+                f"the caller reported nothing, yet: {note}")
+            if out["terminal"]:
+                assert "proceeding without a gate" not in note, (
+                    f"terminal route {out['terminal']} claims it is proceeding: {note}")
+    assert seen, "no compromised route reached the assertion"
+
+    # And the control must still work for the cause it names.
+    declared = route(_task(task_class="IMPLEMENTATION", complexity=2, uncertainty=2,
+                           blast_radius=2, isolation_available=False), relaxed)
+    assert declared["review"]["review_independence"] == "unavailable"
+    assert any("the caller reported" in n for n in declared["notes"]), (
+        "the control no longer fires for the gap the caller did declare")
+
+
+def test_d18_an_operational_shortage_is_a_terminal_not_invalid_input():
+    """Round 14. `bridge_down` plus four concrete prior failures empties the
+    local family, and `resolve()` raised `ValidationError` — which the CLI
+    reports as exit 2, "invalid input", for a command that obeyed every
+    documented contract. A scheduler that tells "call a human" (1) from "fix
+    your input and retry" (2) was handed the wrong one, and the retry-exhaustion
+    gate that should have answered never ran."""
+    proc = cli("--class", "IMPLEMENTATION", "--complexity", "1", "--uncertainty", "1",
+               "--blast-radius", "1", "--reversibility", "0", "--flags", "bridge_down",
+               "--prior-failures", "4", "--prior-models",
+               "claude-haiku-4-5-20251001,claude-sonnet-5,claude-opus-5,claude-fable-5")
+    assert proc.returncode == 1, (
+        f"an operational shortage exited {proc.returncode}; 2 means the caller's "
+        f"input was wrong, and it was not")
+    assert "TERMINAL" in proc.stdout
+    assert "supply exhausted" in proc.stdout, "the reason is not reported"
+
+    out = r(task_class="IMPLEMENTATION", complexity=1, uncertainty=1, blast_radius=1,
+            flags=["bridge_down"], prior_failures=4,
+            prior_models=["claude-haiku-4-5-20251001", "claude-sonnet-5",
+                          "claude-opus-5", "claude-fable-5"])
+    assert out["terminal"] in TERMINAL_STATES
+    assert out["selected_model"] is None and out["requires_human_confirmation"]
+
+
+def test_d18_every_terminal_the_router_assigns_is_declared():
+    """Round 14. `TERMINAL_STATES` was a hand-maintained tuple beside the code
+    that assigns terminals — a second source of truth, which is what the config
+    header forbids and what this artifact has removed twice already. Adding a
+    fifth terminal without listing it would leave the documentation guard
+    passing while SKILL.md omitted it."""
+    src = (SKILL / "scripts" / "route_task.py").read_text()
+    assigned = set(re.findall(r'terminal\s*=\s*(?:terminal or )?"([A-Z_]+)"', src))
+    assigned |= set(re.findall(r'"([A-Z_]+)",\s*$', ""))
+    from route_task import TERMINAL_STATES
+    assert assigned, "no terminal assignment found — the pattern drifted"
+    assert assigned <= set(TERMINAL_STATES), (
+        f"route() assigns {sorted(assigned - set(TERMINAL_STATES))}, which "
+        f"TERMINAL_STATES does not declare")
+    assert set(TERMINAL_STATES) <= assigned, (
+        f"TERMINAL_STATES declares {sorted(set(TERMINAL_STATES) - assigned)}, "
+        f"which route() never assigns")
+
+
 def test_d17_a_self_reviewing_route_is_gated_whatever_the_config_says():
     """Round 13. `independence_compromised` — the router could not give the
     seats distinct models, so the implementer reviews itself — was an
@@ -1272,6 +1406,13 @@ def test_d17_a_self_reviewing_route_is_gated_whatever_the_config_says():
             assert out["requires_human_confirmation"], (
                 f"{task_class}/{scarce}: implementer {out['selected_model']} with "
                 f"reviewers {models} emitted without a gate")
+            # Round 14: checking only the gate let the terminal assignment be
+            # deleted with the test still green, leaving a dispatchable route
+            # whose reviewers are the implementer under another label.
+            assert out["terminal"] == "INDEPENDENCE_UNAVAILABLE", (
+                f"{task_class}/{scarce}: emitted {out['terminal']!r} with no "
+                f"distinct models for the seats")
+            assert out["selected_model"] is None
     assert seen, "no route reached independence_compromised — the assertion was vacuous"
 
 

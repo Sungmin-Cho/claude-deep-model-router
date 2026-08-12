@@ -115,9 +115,10 @@ RUNTIMES = ["claude_code", "codex"]
 PRIOR_HISTORY = [
     ([], 0),
     ([MODEL_IDS[2]], 1),
-    ([MODEL_IDS[0], MODEL_IDS[4]], 2),
-    ([MODEL_IDS[2], MODEL_IDS[2]], 2),
+    ([MODEL_IDS[1], MODEL_IDS[4]], 2),   # two tier-0 failures: headroom above
+    ([MODEL_IDS[3], MODEL_IDS[3]], 2),   # the same model twice, truthfully
     ([MODEL_IDS[6]], 1),
+    ([MODEL_IDS[0], MODEL_IDS[4]], 2),   # tier-3 failure: exhausts on purpose
     (["senior_engineer"], 1),            # invalid on purpose: alias
     ([], 2),                             # invalid on purpose: unaccounted failures
 ]
@@ -150,13 +151,16 @@ def _routes():
             # Projections, not objects: the sweep is ~200k routes and holding
             # every Task alive for the process lifetime buys nothing the
             # dimension guard needs.
+            out = route(task, CFG)
+            # Recorded only after the route succeeds, so TASKS and routes()
+            # stay index-aligned and a class can be measured on its own.
             TASKS.append((task.task_class,
                           (task.complexity, task.uncertainty,
                            task.blast_radius, task.reversibility),
                           tuple(task.flags), task.runtime,
                           tuple(task.unavailable_models),
                           tuple(task.prior_models), task.prior_failures))
-            yield route(task, CFG)
+            yield out
         except ValidationError:
             # Every candidate withheld: failing closed is a correct outcome.
             global _WITHHELD
@@ -222,12 +226,51 @@ def test_the_sweep_reaches_enough_retry_routes():
     `if terminal: continue` quietly lost its population — with the suite green.
     A ratio is what notices that; a presence check is not."""
     all_routes = routes()
-    retried = [o for o in all_routes
-               if not o["terminal"] and any("capability tier" in n for n in o["notes"])]
+    # Per history class, not in aggregate. Round 14: a single `> 10%` bar was
+    # satisfied while an entire valid history class terminalised — the surviving
+    # classes carried the ratio. A dimension that stops contributing has to be
+    # visible on its own, which is the same lesson as
+    # `test_every_swept_dimension_reaches_the_router`, one level up.
+    # A class whose strongest failure is the top tier exhausts the ladder by
+    # construction, so it is valid input that can never be dispatchable — it
+    # covers `ceiling_exhausted` and is measured for that instead.
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    top = max(tier.values())
+    valid = [(tuple(p), f) for p, f in PRIOR_HISTORY if f == 0
+             or (len(p) == f and all(m in set(MODEL_IDS) for m in p)
+                 and max((tier[m] for m in p), default=0) < top)]
+    exhausting = [(tuple(p), f) for p, f in PRIOR_HISTORY
+                  if f and len(p) == f and all(m in set(MODEL_IDS) for m in p)
+                  and max(tier[m] for m in p) == top]
+    # Exactly one. Exhaustion needs a representative, and more than one means a
+    # productive class was converted into a terminal one — which is how a
+    # dimension stops contributing without any count going to zero. Round 14
+    # caught the aggregate ratio surviving exactly that.
+    assert len(exhausting) == 1, (
+        f"{len(exhausting)} history classes exhaust the ladder by construction "
+        f"({exhausting}); each one is a class the seat invariants never see")
+    assert len(valid) >= 4, "the sweep no longer carries enough valid history classes"
+    by_class: dict = {}
+    for row, out in zip(TASKS, all_routes):
+        by_class.setdefault((row[5], row[6]), []).append(out)
+    for key in valid:
+        population = by_class.get(key, [])
+        assert population, f"history class {key} never reached the router"
+        if key[1] == 0:
+            continue
+        dispatchable = [o for o in population if not o["terminal"]]
+        assert len(dispatchable) > len(population) * 0.10, (
+            f"history class {key}: only {len(dispatchable)}/{len(population)} routes "
+            f"are dispatchable, so the seat invariants see almost none of it")
+
+    for key in exhausting:
+        population = by_class.get(key, [])
+        assert population, f"history class {key} never reached the router"
+        assert all(o["terminal"] for o in population), (
+            f"history class {key} names a top-tier failure yet {key} produced a "
+            f"dispatchable route — nothing is stronger than what already failed")
+
     blocked = [o for o in all_routes if o["terminal"] == "RETRY_HISTORY_REQUIRED"]
-    assert len(retried) > len(all_routes) * 0.10, (
-        f"only {len(retried)}/{len(all_routes)} routes actually take the retry "
-        f"branch; the seat invariants are running on a shrunken population")
     assert blocked, "no route exercises the retry-history terminal"
     assert len(blocked) < len(all_routes) * 0.40, (
         f"{len(blocked)}/{len(all_routes)} routes are terminal for want of a "

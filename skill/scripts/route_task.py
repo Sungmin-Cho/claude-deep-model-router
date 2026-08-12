@@ -71,6 +71,18 @@ class UnknownCompensationError(ConfigError):
     """
 
 
+class SupplyExhausted(Exception):
+    """No usable model exists for a role the route needs.
+
+    Round 14: this was a `ValidationError`, so the CLI reported exit 2,
+    "invalid input", for an input that obeyed every documented contract —
+    `bridge_down` plus four concrete prior failures leaves the local family
+    empty, which is an operational shortage the caller cannot fix by editing
+    its command. A scheduler that distinguishes "call a human" (1) from "fix
+    your input and retry" (2) was told the wrong one.
+    """
+
+
 class RouterInvariantError(AssertionError):
     """A post-condition of the router itself did not hold.
 
@@ -1050,10 +1062,9 @@ class Resolver:
             primary_id = cfg["models"][primary_key]["id"] if primary_key else None
             chosen_id = self.peek(role)
             if chosen_id is None:
-                raise ValidationError(
+                raise SupplyExhausted(
                     f"no usable model for role {role!r}: every candidate is unavailable, "
-                    f"already failed, or on the unreachable side of a downed bridge. "
-                    "This is an operational failure, not a route."
+                    f"already failed, or on the unreachable side of a downed bridge"
                 )
             resolved[role] = chosen_id
             if primary_id is not None and chosen_id != primary_id:
@@ -1144,6 +1155,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # Before anything resolves: a route whose retry history cannot be used will
     # not run, so nothing may be inferred from that history on the way there.
     history_note = history_gap(task, policy)
+    if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
+        # The budget is spent, so there is no next attempt for a history to
+        # place. Asking for one sends the caller on an errand whose result it
+        # cannot use, and hides the fact it has to act on until the second call.
+        history_note = None
     if history_note:
         task = replace(task, prior_models=[])
 
@@ -1174,9 +1190,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # below the escalation floor still emit as executable.
     review_band = band
     promoted_once = False
+    supply_exhausted: str | None = None
     for _ in range(MAX_PROMOTION_PASSES):
         review = select_review(review_band, worker, policy, resolver)
-        resolved, fallbacks, compensations = resolver.resolve(roles_for(review))
+        try:
+            resolved, fallbacks, compensations = resolver.resolve(roles_for(review))
+        except SupplyExhausted as exc:
+            resolved, fallbacks, compensations = {}, [], []
+            supply_exhausted = str(exc)
         confidence = routing_confidence(task, fallbacks)
         threshold = cfg["router"]["confidence"]["extra_review_below"]
         # The policy is "raise the review band ONE level" — the loop exists so
@@ -1229,7 +1250,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                 # compensation promises is a SEAT, so the seat count is what it
                 # records.
                 review["compensating_reviewers"] = review.get("compensating_reviewers", 0) + 1
-                resolved, fallbacks, _ = resolver.resolve(roles_for(review))
+                try:
+                    resolved, fallbacks, _ = resolver.resolve(roles_for(review))
+                except SupplyExhausted as exc:
+                    supply_exhausted = supply_exhausted or str(exc)
                 applied_compensations.append(note)
                 effort_notes.append(f"compensation: added a second independent review ({extra})")
             else:
@@ -1275,10 +1299,13 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     if judge_role:
         review, judge_role = _seat_judge(review, worker, judge_role, policy, resolver)
 
-    resolved, fallbacks, _ = resolver.resolve(
-        list(dict.fromkeys([worker] + list(review["reviewers"])
-                           + ([judge_role] if judge_role else [])))
-    )
+    try:
+        resolved, fallbacks, _ = resolver.resolve(
+            list(dict.fromkeys([worker] + list(review["reviewers"])
+                               + ([judge_role] if judge_role else []))))
+    except SupplyExhausted as exc:
+        resolved, fallbacks = {}, []
+        supply_exhausted = supply_exhausted or str(exc)
 
     # Post-condition, asserted rather than assumed. Reviewer duplication is
     # only a defect where independence was requested; a judge sharing any seat
@@ -1389,10 +1416,18 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # *bonus* reviewer's isolation gap terminate a LOW route.
     hitl = cfg["human_in_the_loop"]
     controls = [
-        # Only the caller-declared gap is a policy question. The router's own
-        # inability to seat distinct models is handled unconditionally above.
+        # Only the caller-declared gap is a policy question, and the predicate
+        # now says so. Round 14: narrowing it to `review_independence ==
+        # "unavailable"` was logically INERT — `independence()` returns exactly
+        # that whenever `independence_compromised` is set, so the disjunct
+        # removed was always redundant and not one route changed. The comment
+        # claimed a separation the code had not made, and the reason string
+        # changed to one that is false for the router's own seat collisions,
+        # which then appeared on terminal routes saying the caller had reported
+        # something it never reported. The caller's declaration is a field; it
+        # is read directly.
         ("on_independence_unachievable",
-         band_requires_independence and review_independence == "unavailable",
+         band_requires_independence and task.isolation_available is False,
          "INDEPENDENCE_UNAVAILABLE",
          "the caller reported that isolation cannot be achieved here"),
         ("on_retry_exhaustion",
@@ -1408,6 +1443,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
 
     terminal = None
     requires_human = False
+    notified: list[tuple[str, str]] = []
     # First, and outside the configurable set: a route whose history cannot be
     # used is not a policy choice, and it must not be masked by a control that
     # happens to fire on the same input. Round 13 found `prior_failures=4` with
@@ -1425,9 +1461,13 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # key a real choice must not include the choice to delete a protection that
     # was never optional.
     if review.get("independence_compromised"):
+        # No inner `if band_requires_independence`: it cannot be false here.
+        # `independence_compromised` is only ever set behind `review["independent"]`,
+        # which since round 13 is the band's own spec — so the flag implies the
+        # band asked. A condition that cannot be false reads as a safeguard and
+        # guards nothing, which is the shape this artifact keeps removing.
         requires_human = True
-        if band_requires_independence:
-            terminal = terminal or "INDEPENDENCE_UNAVAILABLE"
+        terminal = terminal or "INDEPENDENCE_UNAVAILABLE"
 
     for key, fired, terminal_name, why in controls:
         if not fired:
@@ -1438,8 +1478,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         elif action == "require_human_confirmation":
             requires_human = True
         elif action == "notify_human":
-            effort_notes.append(f"notify_human/{key}: {why} — proceeding without a gate, "
-                                f"per policy")
+            # Deferred: whether the route proceeds is not known until every
+            # control and every non-configurable terminal has been evaluated,
+            # and round 14 found this note asserting "proceeding without a
+            # gate" on a route that was terminal at exit 1.
+            notified.append((key, why))
         else:
             # No `else: treat it as the weakest action`. `Policy` validates this
             # vocabulary, but `Policy.of` caches on config identity and the
@@ -1452,6 +1495,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
 
     # Outcomes the config does not govern: these are properties of the route,
     # not policy choices.
+    if supply_exhausted:
+        worker_notes.append(f"supply exhausted: {supply_exhausted}")
+        terminal = terminal or "HUMAN_REQUIRED"
+        requires_human = True
+
     if terminal is None:
         if ceiling_exhausted:
             terminal = "HUMAN_REQUIRED"
@@ -1461,6 +1509,12 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # A terminal outcome always needs a person, whatever the controls above
     # decided — including the ones the config set to `notify_human`.
     requires_human = bool(terminal) or requires_human
+
+    for key, why in notified:
+        effort_notes.append(
+            f"notify_human/{key}: {why} — "
+            + ("recorded; the route is terminal for another reason"
+               if terminal else "proceeding without a gate, per policy"))
 
     # The router cannot verify where an isolation receipt came from: it is a
     # caller-supplied string bound to no dispatch, so `enforced` reports what

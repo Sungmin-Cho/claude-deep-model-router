@@ -441,6 +441,8 @@ excluded_prior_failures: []    # models withheld because they already failed
 escalation_count:  retry_count:
 routing_confidence:
 requires_human_confirmation:
+notes: []                      # every promotion, floor, compensation and
+                               # policy decision the route actually made
 rationale:   # names the band, the triggering flags, and every fallback
 ```
 
