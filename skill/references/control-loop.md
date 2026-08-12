@@ -43,7 +43,8 @@ stronger_model:                    2
 max_total_implementation_attempts: 4
 max_review_rounds:                 3
 max_judge_invocations:             1
-require_new_evidence_on_same_tier: true
+require_new_evidence_on_same_tier: true    # "tier" = capability_tier of the
+                                          # resolved model, not the role label
 ```
 
 **A second attempt at the same tier must carry a changed hypothesis or new
@@ -125,6 +126,7 @@ routing_metrics:
   independence_compromised: true | false
   judge_unavailable: true | false
   review_depth_reduced: []   # reviewers seated below the tier their band asks for
+  band_floor_unsatisfiable:  # that tier is unreachable under the binding in force
   cross_family_review: true | false
   fallbacks_applied: []
   escalation_count:

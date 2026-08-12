@@ -20,6 +20,7 @@ Run:  python3 -m pytest skill/tests/test_invariants.py -q
 """
 
 import itertools
+import json
 import sys
 from pathlib import Path
 
@@ -44,11 +45,11 @@ LOCAL_FAMILY = {"claude_code": "claude", "codex": "openai"}
 TIER_OF = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
 NOMINAL_TIER = {role: TIER_OF[CFG["models"][key]["id"]]
                 for role, key in CFG["role_bindings"]["default"].items()}
-BAND_FLOOR = {
-    band: min((NOMINAL_TIER[r] for r in (spec.get("reviewers") or spec.get("candidates") or [])
-               if r in NOMINAL_TIER), default=0)
-    for band, spec in CFG["review"].items()
-}
+# Written out, not recomputed. An oracle that repeats the implementation's
+# formula agrees with it even when the formula is wrong — including when a
+# renamed role makes a band's reviewer list empty and the floor silently
+# becomes 0, disabling the gate on both sides at once.
+BAND_FLOOR = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 2}
 
 # Dimension corners plus a midpoint. Bands are determined by the weighted sum,
 # so the corners cover every band and the midpoint catches boundary handling.
@@ -80,6 +81,13 @@ SCARCITY = [
     MODEL_IDS[1:3],
     MODEL_IDS[2:5],
     MODEL_IDS[:3],
+    # Round 7: every seat defect found in rounds 3-7 — and both of that round's
+    # behavioural Criticals — lives at 4-5 models withheld, which the sweep did
+    # not reach. `test_every_swept_dimension_actually_varies` counted SCARCITY
+    # as varying and so gave false assurance about coverage DEPTH.
+    MODEL_IDS[:5],
+    MODEL_IDS[2:7],
+    [MODEL_IDS[0], MODEL_IDS[1], MODEL_IDS[3], MODEL_IDS[5], MODEL_IDS[6]],
 ]
 
 RUNTIMES = ["claude_code", "codex"]
@@ -90,6 +98,12 @@ RUNTIMES = ["claude_code", "codex"]
 # left all twenty invariants green. Both spellings are swept — a role alias,
 # which the router resolves through the *current* binding, and a concrete id,
 # which it does not — because they take different paths through the exclusion.
+# Round 7: `prior_models` was varied but `prior_failures` was left at 0, so the
+# retry-escalation branch — where a role moved up while the resolved model
+# stayed at the same capability tier — was never entered by any of the 8,712
+# routes. Half a dimension is not a dimension.
+PRIOR_FAILURES = [0, 1, 2]
+
 PRIOR = [
     [],
     ["senior_engineer"],
@@ -100,22 +114,30 @@ PRIOR = [
 
 
 _WITHHELD = 0
+TASKS: list = []
 
 
 def _routes():
     """Every reachable route. Terminal ones are yielded too — several
     invariants are specifically about what a terminal route must withhold."""
-    for task_class, dims, flags, runtime, scarce, prior in itertools.product(
-        TASK_CLASSES, DIMENSIONS, FLAG_SETS, RUNTIMES, SCARCITY, PRIOR
+    for task_class, dims, flags, runtime, scarce, prior, failures in itertools.product(
+        TASK_CLASSES, DIMENSIONS, FLAG_SETS, RUNTIMES, SCARCITY, PRIOR, PRIOR_FAILURES
     ):
         c, u, b, rev = dims
         try:
-            yield route(Task(
+            task = Task(
                 task_class=task_class, complexity=c, uncertainty=u,
                 blast_radius=b, reversibility=rev, flags=list(flags),
                 runtime=runtime, unavailable_models=list(scarce),
-                prior_models=list(prior),
-            ), CFG)
+                prior_models=list(prior), prior_failures=failures,
+            )
+            # The task is recorded as CONSTRUCTED, not as intended. This is the
+            # only way to tell "the sweep lists two runtimes" from "two runtimes
+            # reach the router" — round 7 mutated `runtime=runtime` to a
+            # constant and every invariant stayed green, because the old check
+            # compared the sweep's own list against itself.
+            TASKS.append(task)
+            yield route(task, CFG)
         except ValidationError:
             # Every candidate withheld: failing closed is a correct outcome.
             global _WITHHELD
@@ -165,30 +187,47 @@ def test_the_sweep_is_large_and_reaches_the_interesting_states():
     assert not missing, f"the sweep never reached: {missing}"
 
 
-def test_every_swept_dimension_actually_varies():
-    """The generalisation of the round-6 failure.
+def test_every_swept_dimension_reaches_the_router():
+    """The generalisation of the round-6 failure, corrected in round 7.
 
-    Counting reached *output* states was not enough: the prior-failure
-    dimension existed in the invariant's filter but never in the sweep's
-    input, so the state it guarded was unreachable by construction and the
-    guard above had nothing to notice. A dimension that contributes one
-    distinct value is a dimension that is not being tested, whatever the
-    output counts say — so the sweep asserts its own inputs vary."""
-    dimensions = {
-        "TASK_CLASSES": TASK_CLASSES, "DIMENSIONS": DIMENSIONS,
-        "FLAG_SETS": FLAG_SETS, "RUNTIMES": RUNTIMES,
-        "SCARCITY": SCARCITY, "PRIOR": PRIOR,
+    Round 6's version compared the sweep's own lists against themselves and
+    then asserted `len(routes()) + _WITHHELD == len(product)` — an identity
+    that holds however the loop body is written. A reviewer proved it: mutating
+    `runtime=runtime` to `runtime="claude_code"` collapsed the runtime actually
+    reaching `Task` and all 22 invariants stayed green, which is precisely the
+    defect this test names in its own docstring.
+
+    So it asserts on the tasks the sweep CONSTRUCTED, at the router boundary.
+    A value listed in a dimension but dropped on the way into `Task()` shows up
+    here as a field with one distinct value.
+    """
+    routes()                     # force the sweep
+    assert TASKS, "no task was constructed"
+
+    observed = {
+        "task_class": {t.task_class for t in TASKS},
+        "dimensions": {(t.complexity, t.uncertainty, t.blast_radius, t.reversibility)
+                       for t in TASKS},
+        "flags": {tuple(t.flags) for t in TASKS},
+        "runtime": {t.runtime for t in TASKS},
+        "unavailable_models": {tuple(t.unavailable_models) for t in TASKS},
+        "prior_models": {tuple(t.prior_models) for t in TASKS},
+        "prior_failures": {t.prior_failures for t in TASKS},
     }
-    flat = [(k, len({tuple(v) if isinstance(v, (list, tuple)) else v for v in vals}))
-            for k, vals in dimensions.items()]
-    collapsed = [k for k, n in flat if n < 2]
-    assert not collapsed, f"swept dimension(s) contribute a single value: {collapsed}"
-
-    # And each must reach the router: a dimension varied in the list but
-    # dropped on the way into Task() is the same defect one layer down.
-    assert len(routes()) == len(list(itertools.product(
-        TASK_CLASSES, DIMENSIONS, FLAG_SETS, RUNTIMES, SCARCITY, PRIOR
-    ))) - _WITHHELD, "sweep size does not match the product of its dimensions"
+    expected = {
+        "task_class": len(set(TASK_CLASSES)),
+        "dimensions": len({tuple(d) for d in DIMENSIONS}),
+        "flags": len({tuple(f) for f in FLAG_SETS}),
+        "runtime": len(set(RUNTIMES)),
+        "unavailable_models": len({tuple(s) for s in SCARCITY}),
+        "prior_models": len({tuple(p) for p in PRIOR}),
+        "prior_failures": len(set(PRIOR_FAILURES)),
+    }
+    for field, seen in observed.items():
+        assert len(seen) == expected[field], (
+            f"{field}: the sweep lists {expected[field]} distinct values but "
+            f"{len(seen)} reached the router — a value is being dropped"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -310,18 +349,83 @@ def test_bridge_down_never_names_an_unreachable_family():
         assert not foreign, f"bridge down but emitted {sorted(foreign)} (local={local})"
 
 
+# Fields that legitimately name a model on a terminal route: they echo what the
+# CALLER supplied or withheld, and are not bindings anyone could dispatch.
+_ECHOES_CALLER_INPUT = (
+    "unavailable_models", "excluded_prior_failures", "excluded_as_ambiguous_alias",
+)
+
+
 def test_a_terminal_route_withholds_every_execution_binding():
-    """Rounds 3 and 4. Nulling only the worker left a consumer able to dispatch
-    the reviewers from a route whose own rationale said not to."""
+    """Rounds 3 and 4 — and round 7, through a field added in round 6.
+
+    The previous spelling ENUMERATED five fields. `review_depth_reduced` was
+    added later carrying a concrete model id, was not one of the five, and so
+    a terminal route handed back a dispatchable binding with all 114 tests
+    green. Enumerating the fields you remember re-opens this defect every time
+    the schema grows, so the property is asserted instead: on a terminal route,
+    no concrete model id appears anywhere except where the caller put it.
+    """
+    ids = {m["id"] for m in CFG["models"].values()}
+    seen = 0
     for out in routes():
         if not out["terminal"]:
             continue
+        seen += 1
         rv = out["review"]
         assert out["selected_model"] is None
         assert out["selected_effort"] is None
         assert rv["reviewer_models"] == []
         assert rv["judge_model"] is None
         assert rv["effort"] is None
+        echoed = set().union(*(set(out[k]) for k in _ECHOES_CALLER_INPUT))
+        named = {i for i in ids if i in json.dumps(out)} - echoed
+        assert not named, (
+            f"terminal route ({out['terminal']}) still names {sorted(named)} — "
+            f"a consumer can dispatch it")
+    assert seen, "no terminal route in the sweep"
+
+
+def test_a_reduced_depth_route_is_not_dispatchable_without_a_human():
+    """Round 7, from the security review. `requires_human_confirmation` is a
+    boolean in a JSON blob; the exit status is what a shell can act on. A route
+    that needs a human and exits 0 is a gate any caller treating success as
+    authorisation walks straight through."""
+    import subprocess
+    probe = ["--class", "IMPLEMENTATION", "--complexity", "0", "--uncertainty", "0",
+             "--blast-radius", "0", "--reversibility", "0",
+             "--flags", "auth_sensitive,bridge_down", "--runtime", "codex"]
+    proc = subprocess.run([sys.executable, str(SKILL / "scripts" / "route_task.py"), *probe],
+                          capture_output=True, text=True)
+    out = json.loads(subprocess.run(
+        [sys.executable, str(SKILL / "scripts" / "route_task.py"), *probe, "--format", "json"],
+        capture_output=True, text=True).stdout)
+    assert out["requires_human_confirmation"], "probe no longer reaches the gate"
+    assert out["review"]["review_depth_reduced"], "probe no longer reduces depth"
+    assert proc.returncode == 3, (
+        f"human-gated route exited {proc.returncode}; a caller reading exit status "
+        f"cannot tell it from a dispatchable one")
+
+
+def test_the_shortfall_record_carries_the_band_the_gate_actually_used():
+    """Round 7. The record's payload was asserted nowhere, so mutating
+    `band_requires` to 0 kept 114 tests green while handing the human a number
+    the router did not use. The floors are written out here rather than
+    recomputed from the config, because an oracle that repeats the
+    implementation's formula cannot detect an error in the formula."""
+    from route_task import Policy
+    assert Policy.of(CFG).band_reviewer_floor == BAND_FLOOR, "the router's floors drifted"
+    seen = 0
+    for out in routes():
+        rv = out["review"]
+        for short in rv["review_depth_reduced"]:
+            seen += 1
+            assert short["band_requires"] == BAND_FLOOR[rv["band"]]
+            if short["model"]:
+                assert short["capability_tier"] == TIER_OF[short["model"]]
+                assert short["capability_tier"] < short["band_requires"]
+            assert short["reviewer"] in rv["reviewers"]
+    assert seen, "no shortfall record in the sweep"
 
 
 # ---------------------------------------------------------------------------

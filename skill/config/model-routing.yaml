@@ -318,7 +318,11 @@ human_in_the_loop:
   # emit the route as though the band had been satisfied. Whether a weaker
   # review is acceptable for this particular change is a judgement about the
   # change, which is a human's to make and not the router's to assume.
+  # Enforced through the CLI exit status (3), not only through a boolean in
+  # the JSON: a caller that reads success as authorisation walks through a gate
+  # it cannot see. Terminal states stay 1; invalid input stays 2.
   on_review_depth_reduced:      require_human_confirmation
+  human_gate_exit_status:       3
   on_routing_confidence_below:  0.60   # escalate the routing decision itself
 
 # ---------------------------------------------------------------------------

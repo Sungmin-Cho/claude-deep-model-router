@@ -257,14 +257,20 @@ def test_d11_no_seat_is_held_twice():
     assert checked, "the sweep produced no dispatchable independent route"
 
 
-def test_d11_judge_is_never_weaker_than_the_reviewers_it_adjudicates():
+def test_d11_judge_is_never_weaker_than_any_party_it_adjudicates():
     for out in _sweep():
         rv = out["review"]
         if out["terminal"] or not rv["judge"]:
             continue
-        floor = max((ROLES.index(x) for x in rv["reviewers"]), default=0)
-        assert ROLES.index(rv["judge"]) >= floor, (
-            f"judge {rv['judge']} sits below reviewers {rv['reviewers']}"
+        # Round 7. This was the pre-round-6 spelling, left asserting the very
+        # property round 6 disproved: role ordinals are not capability. It gave
+        # false assurance (a reader sees judge strength covered twice) and it
+        # opposed the corrected invariant — the moment scarcity produced an
+        # ordinal/tier inversion, a CORRECT seating would have failed here.
+        tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+        parties = [m for m in [out["selected_model"], *rv["reviewer_models"]] if m]
+        assert tier[rv["judge_model"]] >= max(tier[m] for m in parties), (
+            f"judge {rv['judge_model']} is outranked by a party it adjudicates: {parties}"
         )
 
 
@@ -763,7 +769,10 @@ def test_d10_a_below_tier_substitute_is_only_taken_when_nothing_better_is_free()
             if role in rv["reviewers"]:
                 continue
             model = resolver.peek(role)          # asks the resolver, not the route
-            if model is None:
+            if model is None or model in used:
+                # A candidate whose model is already held could not have been
+                # taken anyway. Counting it was counting the rediscoveries this
+                # test was rewritten to stop counting.
                 continue
             free_seen += 1
             assert model in used or tier[model] < worker_tier, (
@@ -772,6 +781,82 @@ def test_d10_a_below_tier_substitute_is_only_taken_when_nothing_better_is_free()
             )
     assert checked, "no below-tier substitution in the sweep — the assertion was vacuous"
     assert free_seen, "no unseated candidate was ever resolved — the check was skipped"
+
+
+# ---------------------------------------------------------------------------
+# D13 — round 7: what the round-6 fixes broke, and what verified nothing
+# ---------------------------------------------------------------------------
+
+def test_d13_skill_md_stays_inside_its_line_budget():
+    """The handoff sets 500 lines for the entry point, and every round adds
+    contract to it. Left unenforced the budget is a comment, and the file that
+    both runtimes load on every invocation grows without anyone deciding to."""
+    lines = (SKILL / "SKILL.md").read_text().splitlines()
+    assert len(lines) <= 500, (
+        f"SKILL.md is {len(lines)} lines against a 500-line budget; move detail "
+        f"into references/ rather than raising the number")
+
+
+def test_d13_the_judge_retry_never_seats_the_implementer_as_its_own_reviewer():
+    """Round 6 relaxed the retry at LOW on the reasoning that LOW permits
+    self-review. LOW's exemption is about the reviewer the BAND CONFIGURED
+    landing on the implementer, not a licence for the router to move it there
+    to free a model for the judge. With the relaxation in place this exact
+    route traded a distinct, stronger reviewer for the implementer itself,
+    recorded nothing (LOW's depth floor is 0, so the shortfall gate cannot fire
+    either), and flipped requires_human_confirmation from true to false."""
+    out = r(task_class="MIGRATION", flags=["review_disagreement"], runtime="claude_code",
+            unavailable_models=["gpt-5.6-luna", "claude-haiku-4-5-20251001",
+                                "claude-sonnet-5", "claude-fable-5", "gpt-5.6-sol"])
+    rv = out["review"]
+    assert rv["band"] == "LOW" and out["route_path"] == "disagreement", "probe drifted"
+    assert out["selected_model"] not in rv["reviewer_models"], (
+        f"implementer {out['selected_model']} was re-seated as its own reviewer "
+        f"to free a judge: reviewers={rv['reviewer_models']} judge={rv['judge_model']}")
+    assert rv["judge_unavailable"] and out["requires_human_confirmation"], (
+        "with two models and three seats there is no independent judge; saying "
+        "otherwise buys the seat with the review")
+
+
+def test_d13_a_substitution_record_that_outlives_its_seat_is_raised_not_dropped():
+    """Round 7. The emit boundary used to filter records down to those matching
+    the final roster, which made every assertion about that match true by
+    construction — the round-6 defect shape, reintroduced by the round-6 fix.
+    Two reviewers proved it independently: `_restate` -> `[]` left 114 green.
+
+    So `_restate` is tested directly, and the boundary raises instead of
+    correcting."""
+    from route_task import _restate
+    rec = [{"replaced": "reasoning_specialist", "with": "principal_architect", "reason": "x"}]
+    # untouched: the record does not point at the re-seated role
+    assert _restate(rec, "senior_engineer", "worker_balanced") == rec
+    # re-pointed: the seat it named now holds someone else
+    assert _restate(rec, "principal_architect", "worker_balanced") == [
+        {"replaced": "reasoning_specialist", "with": "worker_balanced", "reason": "x"}]
+    # dropped: the displaced role came back, so nothing was substituted
+    assert _restate(rec, "principal_architect", "reasoning_specialist") == []
+    assert _restate(None, "a", "b") == []
+
+
+def test_d13_a_retry_escalates_to_a_stronger_model_not_merely_a_higher_role():
+    """Round 7. Moving the role up one is not an escalation; moving to a
+    stronger MODEL is. Under scarcity the next role along resolved to a peer at
+    the same capability_tier, so the retry re-ran at the strength that had just
+    failed while the note claimed a promotion and a tier-3 model sat unused.
+    The invariant sweep missed it because it varied `prior_models` but left
+    `prior_failures` at zero, so the branch was never entered."""
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    scarce = ["claude-haiku-4-5-20251001", "claude-sonnet-5", "gpt-5.6-luna"]
+    first = r(task_class="MECHANICAL", unavailable_models=list(scarce))
+    assert first["selected_model"], "probe drifted"
+    second = r(task_class="MECHANICAL", unavailable_models=list(scarce),
+               prior_failures=1, prior_models=[first["selected_model"]])
+    if second["terminal"]:
+        return                       # failing closed is a correct outcome
+    assert tier[second["selected_model"]] > tier[first["selected_model"]], (
+        f"retry after {first['selected_model']} (tier {tier[first['selected_model']]}) "
+        f"chose {second['selected_model']} (tier {tier[second['selected_model']]}) — "
+        f"same strength, recorded as an escalation: {second['notes']}")
 
 
 def _peek_model(out, role):

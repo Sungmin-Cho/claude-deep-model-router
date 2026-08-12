@@ -120,8 +120,7 @@ Other inputs worth knowing:
 | `--prior-failures N` | after a failed attempt; `--prior-models` accepts role aliases *or* model ids |
 | `--unavailable <role>` / `--unavailable-models <id>` | a specific role or model does not resolve |
 | `--flags bridge_down` | the whole cross-provider transport is unreachable — switches to the degraded single-provider binding |
-| `--isolation available\|unavailable` | whether isolation *can* be achieved this session |
-| `--isolation-evidence <ids>` | distinct session ids, one per dispatched reviewer |
+| `--isolation available\|unavailable` / `--isolation-evidence <ids>` | whether isolation *can* be achieved this session, and one distinct session id per dispatched reviewer |
 
 **Independence has five states, and only one of them is a claim.** A route is
 computed before any reviewer runs, so nothing known at routing time can prove
@@ -136,18 +135,21 @@ isolation happened:
 | `enforced` | one distinct session id per reviewer was supplied afterwards |
 
 `unavailable` and `degraded` are deliberately distinct: a confirmed gap and an
-unchecked one call for different responses.
+unchecked one call for different responses. **`enforced` does not unlock
+anything** — an isolation receipt is a string the caller passed in, bound to no
+real dispatch, so `CRITICAL` always asks a human and `enforced` reports the
+claim without treating it as proof. Making the strongest control in the policy
+openable by typing would be the exact failure this skill is about.
 
-**`enforced` does not unlock anything.** The router has no way to verify where
-an isolation receipt came from — it is a string the caller passed in, and
-nothing binds it to a real dispatch, to this route, or to a particular
-reviewer. So a `CRITICAL` review always asks a human, and `enforced` reports
-what the caller claims without treating it as proof. Making the strongest
-control in the policy openable by typing would be the exact failure this skill
-is about.
+Exit status is the part of this contract a shell can act on, so every outcome
+needing a person is nonzero: **0** dispatchable, **1** terminal, **2** invalid
+input, **3** executable only after a human confirms. `3` exists because
+`requires_human_confirmation` is a boolean inside a JSON blob — a caller that
+reads "the router succeeded" as "I may dispatch" walks straight through it, and
+a gate you cannot act on from a shell is disclosure, not a control.
 
-The script exits nonzero when the route reaches a terminal state. Those are
-normal outcomes that need a human, not routes to execute:
+The terminal states are normal outcomes that need a human, not routes to
+execute:
 
 | Terminal | Meaning |
 |---|---|
@@ -160,19 +162,24 @@ failing means the review itself cannot happen as specified, so there is nothing
 safe to dispatch. A missing adjudicator means the review can still run; what a
 human takes over is settling a disagreement, should one arise.
 
-Two things are compared on the **resolved model's `capability_tier`**, never on
-a role's position in the ladder: whether a judge outranks the parties it
-adjudicates, and whether a reviewer meets the tier its band asks for. Under
-scarcity a role holds whatever model is left — `worker_fast` can end up on the
-frontier model and `worker_balanced` on a weaker one — so ranking an assignment
-by role label ranks it backwards exactly when scarcity makes the ranking matter.
+**Every strength comparison reads the resolved model's `capability_tier`, never
+a role's position in the ladder** — judge-vs-party, reviewer-vs-band-floor,
+substitute-vs-replaced, and retry escalation alike. Under scarcity a role holds
+whatever model is left, so `worker_fast` can end up on the frontier model and
+`worker_balanced` on a weaker one; ranking by role label ranks the assignment
+backwards exactly when scarcity makes the ranking matter. A retry therefore
+climbs until the resolved tier actually *rises* — moving the label up one while
+the model stays at the strength that just failed is not an escalation.
 
-`review_depth_reduced` is non-empty when the seats that could actually be filled
-are weaker than the band requires. The route stays executable and asks a human:
-the router cannot restore the depth, and whether a thinner review is acceptable
-for this change is a judgement about the change. It never trades review depth
-for a judge seat — if the adjudicator can only be seated by demoting a reviewer
-below the band, the adjudicator is unavailable instead.
+`review_depth_reduced` is non-empty when the seats that could be filled are
+weaker than the band asks. The route stays executable and asks a human: the
+router cannot restore the depth, and whether a thinner review is acceptable is
+a judgement about the change. Review depth is never spent to buy a judge seat —
+neither by demoting a reviewer below the band nor by re-seating one onto the
+implementer's own model at any band; the adjudicator is reported unavailable
+instead. `band_floor_unsatisfiable` marks a shortage that will *not* clear by
+retrying, so a gate that can only ever be waved through is not presented as one
+that could be fixed. See `references/review-policy.md` for the seating rules.
 
 If you cannot run the script, compute it by hand from the tables below — the
 script reads `config/model-routing.yaml`, and this file describes the same
@@ -339,22 +346,19 @@ the relevant source, and the band's checklist. Not the other reviewer's
 verdict, findings, confidence, or any paraphrase — and not even a hint that
 another review is happening.
 
-**In Claude Code:** dispatch each reviewer as a separate subagent via the
-`Agent` tool, both in a single message so they run concurrently and neither can
-observe the other.
-
-**In Codex:** invoke each reviewer as a separate non-interactive execution with
-a fresh session. Do not reuse a session id across reviewers.
-
-**Either runtime, cross-family reviewer:** the bridge (`codex exec` /
-`claude -p`) spawns a fresh process, so isolation holds by construction.
+Mechanically: in Claude Code, dispatch each reviewer as a separate `Agent`
+subagent, all in one message so they run concurrently and none can observe
+another; in Codex, one non-interactive execution per reviewer with a fresh
+session id, never reused. A cross-family reviewer reached over the bridge
+(`codex exec` / `claude -p`) spawns a fresh process, so isolation holds by
+construction. `references/review-policy.md` has the per-runtime detail.
 
 If you cannot achieve real isolation, **do not claim it**. Run sequentially with
-the second reviewer forming its verdict before seeing anything else, record
-`review_independence: degraded`, and treat `PASS + PASS` on `CRITICAL` as
-`PASS_WITH_CHANGES` pending human confirmation. Claiming independence you did
-not enforce is the most damaging thing this skill can produce, because it
-converts a safety control into a false assurance.
+the second reviewer forming its verdict first, record `review_independence:
+degraded`, and treat `PASS + PASS` on `CRITICAL` as `PASS_WITH_CHANGES` pending
+human confirmation. Claiming independence you did not enforce is the most
+damaging thing this skill can produce: it converts a control into an assurance
+that is false.
 
 ### Reading verdicts
 
@@ -377,8 +381,9 @@ stronger model exists.
 
 A retry at the same tier must carry at least one of: new evidence (a log, a
 repro, a bisect, a failing assertion), a materially different hypothesis, or a
-stronger model. Asking the same model to try equivalent approaches again is the
-dominant cost-overrun mode in agent systems — escalate instead.
+stronger model — "stronger" measured on `capability_tier`, since under scarcity
+the next role along can resolve to a peer. Asking the same model to retry
+equivalent approaches is the dominant cost-overrun mode in agent systems.
 
 ```
 same_model_same_effort:            1
@@ -394,12 +399,12 @@ into auth-adjacent territory must be re-scored and re-routed, review policy
 included. This is mandatory, not optional.
 
 Exhausting the retry budget is a **normal terminal state**, not an error. Stop
-and tell the human what was tried, what evidence accumulated, and what you
-believe the blocking uncertainty is. Silent looping is the error.
+and tell the human what was tried, what evidence accumulated, and what the
+blocking uncertainty is. Silent looping is the error.
 
-Emit your own routing confidence, 0.0–1.0: at 0.80+ execute as routed; at
-0.60–0.79 execute but raise the review band one level; below 0.60 escalate the
-routing decision itself — re-classify at higher effort or ask a human.
+Emit your own routing confidence, 0.0–1.0: 0.80+ execute as routed; 0.60–0.79
+execute but raise the review band one level; below 0.60 escalate the routing
+decision itself — re-classify at higher effort or ask a human.
 
 ## Step 5 — Emit the route
 
@@ -420,9 +425,9 @@ review:
   independence_compromised:    # no distinct model was available for a seat
   judge_unavailable:           # no adjudicator at or above every party's tier
   review_depth_reduced: []     # [{reviewer, model, capability_tier, band_requires}]
+  band_floor_unsatisfiable:    # the binding itself cannot supply that tier
   self_review_avoided: []      # [{replaced, with, reason}]; `with` is always a
-                               # role in `reviewers` above — a record that names
-                               # someone not seated is a contradiction, not a note
+                               # role in `reviewers` above
   required_checks: []
   judge:  judge_model:         # null when judge_unavailable — a human adjudicates
 cross_family_review: true | false
@@ -442,10 +447,13 @@ Two pairs in there are deliberately not collapsed:
 - **`independence_required` vs `review_independence`.** The first is policy; the
   second is evidence. Reporting policy as if it were evidence is how a control
   becomes a false assurance.
-- **`selected_model` vs `terminal`.** A terminal state emits *no* execution
-  bindings — not the worker, not the reviewers, not the judge. Nulling only the
-  worker still left a consumer able to dispatch the reviewers from a route the
-  rationale said must not be executed.
+- **`selected_model` vs `terminal`.** A terminal state names *no* concrete model
+  anywhere except where the caller put one — not the worker, not the reviewers,
+  not the judge, not inside `review_depth_reduced`. Enumerating the fields to
+  null re-opens this every time the schema grows, so the property is what holds.
+  A `self_review_avoided` record that names a reviewer who is not seated, or a
+  `review_depth_reduced` entry whose `band_requires` is not the band's, is a
+  contradiction rather than a note.
 
 Optimize expected **total** task cost — correctness, engineering quality,
 latency, money, and human intervention together. Not the unit price of one
@@ -465,24 +473,24 @@ whether effort control exists, whether the cross-provider bridge works, and
 whether subagent isolation is available.
 
 A model that does not resolve is unavailable — fall back per
-`references/adapters.md` and record it. It must never be a hard failure.
+`references/adapters.md` and record it; never a hard failure.
 
 ## References
 
-Read these when the situation calls for them; they are not needed for a routine
-route.
+Read these when the situation calls for them; not needed for a routine route.
 
 - **`references/routing-policy.md`** — dimensions, bands, overrides, worker and
   effort selection in full, with the reasoning behind each weight.
 - **`references/model-profiles.md`** — the five roles, what each is for, what
   each must not be the sole authority on, and the current bindings.
 - **`references/review-policy.md`** — review by band, independence mechanics per
-  runtime, the reviewer output contract, and disagreement resolution.
+  runtime, who may hold the judge seat, the reviewer output contract, and
+  disagreement resolution.
 - **`references/control-loop.md`** — escalation triggers, retry limits, routing
   confidence, and the full observability schema.
 - **`references/adapters.md`** — runtime differences, effort mapping, transports,
-  and the complete fallback matrices. Read this when a model is unavailable or
-  you are working across the provider bridge.
+  and the complete fallback matrices. Read when a model is unavailable or you
+  are working across the provider bridge.
 - **`references/examples.md`** — worked routing decisions, including the four
   cases an earlier version of this policy got wrong.
 

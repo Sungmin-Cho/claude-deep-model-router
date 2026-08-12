@@ -281,7 +281,15 @@ When the seats cannot be arranged to satisfy both conditions, one reviewer may
 be re-seated to free a model — but never below the tier its band asks of a
 reviewer. Review depth is not currency for buying a judge seat. If the judge
 can only be seated by spending it, the judge is unavailable and a human settles
-any disagreement, which is a shortage the caller can act on. At `LOW` the
-implementer reviewing itself is the documented design, so its model is not
-treated as occupied when re-seating a reviewer — treating it as occupied
-invents a shortage and withholds a judge that was free.
+any disagreement, which is a shortage the caller can act on.
+
+`LOW`'s self-review exemption is narrower than it looks: it permits the reviewer
+the **band configured** to resolve onto the implementer's model. It is not a
+licence for the router to *move* a reviewer there. Re-seating a distinct,
+stronger reviewer onto the implementer in order to free a model for the judge
+buys the adjudicator with the review — and at `LOW` neither the substitution
+record nor the depth gate can report it, because the band's reviewer floor is
+zero. So the implementer's model is barred from a *replacement* reviewer at
+every band. With two models and three seats you cannot have both an independent
+reviewer and an independent adjudicator; saying `judge_unavailable` is the
+honest answer, not a false stop.

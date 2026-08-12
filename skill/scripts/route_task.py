@@ -26,8 +26,9 @@ Usage:
                   --blast-radius 2 --reversibility 1 \\
                   --flags auth_sensitive,unknown_root_cause
 
-Exit status is 1 for a terminal state (retry budget spent, or confidence below
-the escalation floor), 2 for invalid input, 0 otherwise.
+Exit status: 0 dispatchable as written; 1 terminal (no route to execute);
+2 invalid input; 3 executable only after a human confirms. 3 exists because a
+gate a caller cannot act on from a shell is not a gate.
 """
 
 from __future__ import annotations
@@ -109,10 +110,18 @@ class Policy:
             for role, key in cfg["role_bindings"]["default"].items()
         }
         self.band_reviewer_floor: dict[str, int] = {}
-        for band, spec in cfg["review"].items():
-            roles = spec.get("reviewers") or spec.get("candidates") or []
-            roles = [r for r in roles if r in nominal]
-            self.band_reviewer_floor[band] = min((nominal[r] for r in roles), default=0)
+        for band in self.bands:
+            spec = cfg["review"][band]
+            roles = [r for r in (spec.get("reviewers") or spec.get("candidates") or [])
+                     if r in nominal]
+            if not roles:
+                # Failing open to 0 would silently disable the depth gate for
+                # that band — the failure mode is invisible because the test
+                # oracle would compute the same 0.
+                raise ConfigError(
+                    f"review band {band!r} names no reviewer role present in the "
+                    f"default binding; its reviewer floor is undefined")
+            self.band_reviewer_floor[band] = min(nominal[r] for r in roles)
 
         # Which family survives when the cross-provider bridge is down.
         self.local_family: dict[str, str] = {
@@ -411,8 +420,27 @@ def apply_overrides(task: Task, band: str, policy: Policy) -> tuple[str, list[st
 # Stage 4 — worker
 # --------------------------------------------------------------------------
 
-def select_worker(task: Task, band: str, policy: Policy, binding: dict) -> tuple[str, list[str], bool]:
+def _promote_above(worker: str, failed: str, policy: Policy,
+                   resolver: "Resolver") -> str | None:
+    """The lowest role whose RESOLVED model outranks what `failed` resolved to.
+
+    `None` when no such role exists — a real exhaustion, not a clamp. Returns
+    the current worker unchanged when it already outranks the failure.
+    """
+    def tier(role):
+        model = resolver.peek(role)
+        return policy.tier_of[model] if model else -1
+
+    floor = tier(failed)
+    if tier(worker) > floor:
+        return worker
+    stronger = [r for r in policy.roles if tier(r) > floor]
+    return min(stronger, key=policy.roles.index, default=None)
+
+
+def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -> tuple[str, list[str], bool]:
     """Returns (worker, notes, ceiling_exhausted)."""
+    binding = resolver.binding
     cfg = policy.cfg
     notes: list[str] = []
     cell = cfg["worker_selection"][task.task_class][band]
@@ -454,8 +482,18 @@ def select_worker(task: Task, band: str, policy: Policy, binding: dict) -> tuple
                 # produced an "escalation" that re-ran the same model.
                 ceiling_exhausted = True
                 notes.append(f"retry ladder exhausted: {highest} is the top tier")
-            promoted = policy.role_max(worker, policy.role_above(highest))
-            if promoted != worker:
+            # Round 7. Moving the role up one is not an escalation; moving to a
+            # STRONGER MODEL is. Under scarcity the next role along resolves to
+            # a peer at the same capability tier, and the retry policy's own
+            # rule — `require_new_evidence_on_same_tier` — is silently broken
+            # while the note claims a promotion, with a stronger model unused.
+            # So the ladder is climbed until the resolved tier actually rises.
+            promoted = _promote_above(worker, highest, policy, resolver)
+            if promoted is None:
+                ceiling_exhausted = True
+                notes.append(f"retry ladder exhausted: no model is stronger than "
+                             f"what {highest} resolves to")
+            elif promoted != worker:
                 notes.append(f"escalated above failed tier {highest}")
                 worker = promoted
         else:
@@ -579,7 +617,12 @@ def _deconflict(spec: dict, worker: str, policy: Policy, resolver: "Resolver") -
     independent.
     """
     worker_model = resolver.peek(worker)
-    worker_tier = policy.roles.index(worker)
+    # Round 7. The ladder position was standing in for capability here too,
+    # while the config declares `capability_tier` the single axis for
+    # substitution-vs-replaced. Latent rather than live in today's registry —
+    # the fallback ladder happens to keep the two orderings agreeing — but one
+    # added entry makes it wrong, and nothing would notice.
+    worker_tier = policy.tier_of[worker_model] if worker_model else -1
     reviewers = list(spec["reviewers"])
     substitutions: list[dict] = []
     taken = {worker_model} if worker_model else set()
@@ -608,9 +651,9 @@ def _deconflict(spec: dict, worker: str, policy: Policy, resolver: "Resolver") -
         other_family = next((policy.family_of[m] for m in other_models if m), None)
         pick = max(
             pool,
-            key=lambda pair: (policy.roles.index(pair[0]) >= worker_tier,
+            key=lambda pair: (policy.tier_of[pair[1]] >= worker_tier,
                               policy.family_of[pair[1]] != other_family,
-                              policy.roles.index(pair[0])),
+                              policy.tier_of[pair[1]]),
             default=None,
         )
         if pick is None:
@@ -682,15 +725,28 @@ def _seat_judge(review: dict, worker: str, judge_role: str, policy: "Policy",
     # Retry once, freeing the strongest reviewer seat if another model that
     # still satisfies the band can take its place.
     floor = policy.band_reviewer_floor.get(review["band"], 0)
-    # The implementer's model is off-limits to a replacement reviewer only
-    # where the band asked for independence. At LOW the implementer reviewing
-    # itself is the documented design, so treating its model as taken invents
-    # a shortage and reports `judge_unavailable` for a judge that was free.
-    barred = taken(reviewers) if review["independent"] else {
-        resolver.peek(x) for x in reviewers}
+    # The implementer's model is off-limits to a REPLACEMENT reviewer at every
+    # band, `independent` or not.
+    #
+    # Round 6 relaxed this for LOW on the reasoning that LOW permits the
+    # implementer to review itself. That conflates two different things, and
+    # round 7 showed what the conflation costs. LOW's exemption is about the
+    # reviewer the BAND CONFIGURED resolving onto the implementer; it is not a
+    # licence for the router to MOVE the reviewer there. With the exemption in
+    # place a LOW route traded a distinct, stronger reviewer for the
+    # implementer itself in order to free a model for the judge, recorded
+    # nothing (LOW's depth floor is 0, so the shortfall gate cannot fire
+    # either), and turned `requires_human_confirmation` from true to false on
+    # the same input. That is a control being removed, not weakened.
+    #
+    # Refusing the trade means some routes report `judge_unavailable` where a
+    # judge looked reachable. It only looked reachable: with two models and
+    # three roles you cannot have both an independent reviewer and an
+    # independent adjudicator, and saying so is the honest answer.
     highest = max(range(len(reviewers)), key=lambda i: tier(reviewers[i]), default=None)
     if highest is not None:
-        used = barred - {resolver.peek(reviewers[highest])} | {
+        used = taken(reviewers) - {resolver.peek(reviewers[highest])} | {
+            resolver.peek(worker)} | {
             resolver.peek(x) for i, x in enumerate(reviewers) if i != highest}
         alternatives = [x for x in policy.roles
                         if x not in reviewers and resolver.peek(x)
@@ -734,7 +790,10 @@ def _extra_reviewer(review: dict, worker: str, policy: "Policy", resolver: "Reso
     taken = {resolver.peek(worker)} | {resolver.peek(x) for x in review["reviewers"]}
     pool = [x for x in policy.roles
             if x not in review["reviewers"] and x != worker and resolver.peek(x) not in taken]
-    return max(pool, key=policy.roles.index, default=None)
+    # Strongest by resolved model, not by ladder position — the config says
+    # every strength comparison reads `capability_tier`, and this one was left
+    # on role ordinals when the rest were converted.
+    return max(pool, key=lambda x: policy.tier_of[resolver.peek(x)], default=None)
 
 
 # --------------------------------------------------------------------------
@@ -923,7 +982,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     band = band_from_score(risk_score, policy)
     band, overrides, redundant_overrides, route_path = apply_overrides(task, band, policy)
 
-    worker, worker_notes, ceiling_exhausted = select_worker(task, band, policy, resolver.binding)
+    worker, worker_notes, ceiling_exhausted = select_worker(task, band, policy, resolver)
     effort, effort_notes = select_effort(task, band, policy)
     disagreement = cfg["review"]["disagreement"]
 
@@ -1069,12 +1128,36 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         for role in review["reviewers"] if resolved.get(role)
         and policy.tier_of[resolved[role]] < floor
     ]
-    recorded = review.get("self_review_avoided") or []
-    reconciled = [s for s in recorded if s.get("with") in review["reviewers"]]
-    if shortfall or len(reconciled) != len(recorded):
+    stale = [s for s in (review.get("self_review_avoided") or [])
+             if s.get("with") not in review["reviewers"]]
+    if stale:
+        # Silently dropping the record would satisfy every downstream check
+        # while destroying a disclosure the human was owed — and round 7 found
+        # that a corrective boundary also makes the assertions guarding it
+        # incapable of failing, because the emitted value then satisfies them
+        # by construction. Nothing upstream may produce this state; if one
+        # does, that is a defect in the pipeline and it says so out loud.
+        raise ConfigError(
+            f"substitution record outlived the seat it describes: {stale}; "
+            f"seats hold {review['reviewers']}"
+        )
+    # Scarcity and binding capacity produce the same shortfall and need
+    # different answers. Scarcity is recoverable: the human can wait for the
+    # model to come back. A binding that structurally cannot supply the tier is
+    # not — `openai_only` holds exactly one model at tier 2, so every HIGH
+    # route under a downed bridge on that side gates, permanently, and "proceed"
+    # is the only possible answer. This module's own reasoning is that a gate
+    # firing on everything trains people to wave it through, so the two are
+    # told apart in the output rather than presented identically.
+    seats = len(review["reviewers"]) + (1 if review["independent"] else 0)
+    supply = {cfg["models"][key]["id"] for role, key in resolver.binding.items()
+              if role in policy.roles}
+    unsatisfiable = bool(shortfall) and sum(
+        1 for m in supply if policy.tier_of[m] >= floor) < seats
+    if shortfall:
         review = dict(review)
         review["review_depth_reduced"] = shortfall
-        review["self_review_avoided"] = reconciled
+        review["band_floor_unsatisfiable"] = unsatisfiable
 
     fams = {r: policy.family_of[m] for r, m in resolved.items()}
     reviewer_families = {fams[r] for r in review["reviewers"] if r in fams}
@@ -1157,7 +1240,15 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             "self_review_avoided": review.get("self_review_avoided") or [],
             "independence_compromised": bool(review.get("independence_compromised")),
             "judge_unavailable": bool(review.get("judge_unavailable")),
-            "review_depth_reduced": review.get("review_depth_reduced") or [],
+            # A terminal route emits no concrete model anywhere, this field
+            # included. The shortfall is still reported — the human needs to
+            # know the review was thin — but with the binding withheld, the
+            # same way `fallbacks_applied` scrubs ids two fields below.
+            "review_depth_reduced": [
+                s if executable else {**s, "model": None}
+                for s in (review.get("review_depth_reduced") or [])
+            ],
+            "band_floor_unsatisfiable": bool(review.get("band_floor_unsatisfiable")),
         },
         "cross_family_review": cross_family,
         "fallbacks_applied": (
@@ -1209,10 +1300,15 @@ def explain(task: Task, r: dict) -> str:
         parts.append("Independence could not be established: no distinct model was available "
                      "for every seat.")
     if rv.get("judge_unavailable"):
-        parts.append("No independent adjudicator is available at or above the reviewers' tier; "
-                     "a human must resolve any disagreement.")
+        parts.append("No independent adjudicator is available at or above every party's tier "
+                     "(the implementer included); a human must resolve any disagreement.")
+    if rv.get("band_floor_unsatisfiable"):
+        parts.append("The binding in force cannot supply this band's reviewer tier at all, "
+                     "so the shortfall will not clear by retrying; proceeding at reduced "
+                     "depth or restoring the cross-provider bridge are the only options.")
     for short in (rv.get("review_depth_reduced") or []):
-        parts.append(f"Review depth reduced: {short['reviewer']} resolves to {short['model']} "
+        where = f" resolves to {short['model']}" if short["model"] else ""
+        parts.append(f"Review depth reduced: {short['reviewer']}{where} "
                      f"(tier {short['capability_tier']}), below the tier "
                      f"{short['band_requires']} this band asks of a reviewer.")
     if rv["judge"]:
@@ -1328,7 +1424,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2))
     else:
         _print_text(result)
-    return 1 if result["terminal"] else 0
+    # Exit status is the only part of this contract a shell can act on. A
+    # route that needs a human but exits 0 is a gate that any caller treating
+    # success as authorisation walks straight through — which is the shape
+    # this module rejects everywhere else ("disclosure is not a control"). So
+    # every human-gated outcome is nonzero, terminal or not. 1 is terminal;
+    # 3 is executable-after-approval, distinct so a caller can tell them apart.
+    if result["terminal"]:
+        return 1
+    return 3 if result["requires_human_confirmation"] else 0
 
 
 def _print_text(r: dict) -> None:
@@ -1359,8 +1463,9 @@ def _print_text(r: dict) -> None:
     elif rv["judge_unavailable"]:
         print("  judge:           UNAVAILABLE — a human settles any disagreement")
     for short in rv["review_depth_reduced"]:
-        print(f"  depth reduced:   {short['reviewer']} -> {short['model']} "
-              f"(tier {short['capability_tier']} < {short['band_requires']} required by band)")
+        print(f"  depth reduced:   {short['reviewer']}"
+              + (f" -> {short['model']}" if short["model"] else "")
+              + f" (tier {short['capability_tier']} < {short['band_requires']} required by band)")
     print(f"cross_family_review: {r['cross_family_review']}")
     print(f"fallbacks:   {r['fallbacks_applied'] or '(none)'}")
     if r["fallback_compensations_applied"]:
