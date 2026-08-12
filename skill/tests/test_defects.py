@@ -844,19 +844,102 @@ def test_d13_a_retry_escalates_to_a_stronger_model_not_merely_a_higher_role():
     the same capability_tier, so the retry re-ran at the strength that had just
     failed while the note claimed a promotion and a tier-3 model sat unused.
     The invariant sweep missed it because it varied `prior_models` but left
-    `prior_failures` at zero, so the branch was never entered."""
+    `prior_failures` at zero, so the branch was never entered.
+
+    Round 8 found that the escape hatch below — `if terminal: return` — was
+    excusing the very defect the test names. `_promote_above` measured its floor
+    with `resolver.peek(failed)`, which returns the failed model's REPLACEMENT
+    because the failure has already been excluded, so the floor was inflated to
+    a tier nothing had run at and the simplest documented retry
+    (`--prior-models senior_engineer`) terminated with "no model is stronger"
+    while an untried tier-3 model sat free. Terminal is now only accepted when
+    an independent check confirms nothing stronger was reachable.
+    """
     tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
-    scarce = ["claude-haiku-4-5-20251001", "claude-sonnet-5", "gpt-5.6-luna"]
-    first = r(task_class="MECHANICAL", unavailable_models=list(scarce))
-    assert first["selected_model"], "probe drifted"
-    second = r(task_class="MECHANICAL", unavailable_models=list(scarce),
-               prior_failures=1, prior_models=[first["selected_model"]])
-    if second["terminal"]:
-        return                       # failing closed is a correct outcome
-    assert tier[second["selected_model"]] > tier[first["selected_model"]], (
-        f"retry after {first['selected_model']} (tier {tier[first['selected_model']]}) "
-        f"chose {second['selected_model']} (tier {tier[second['selected_model']]}) — "
-        f"same strength, recorded as an escalation: {second['notes']}")
+    ids = sorted(tier)
+    # Every spelling of "what failed": a concrete id, a role alias, an alias
+    # outside `role_tiers` (which `failed_roles` used to drop entirely), and
+    # nothing at all.
+    shapes = [
+        ("concrete", lambda first: {"prior_models": [first]}),
+        ("alias senior_engineer", lambda _: {"prior_models": ["senior_engineer"]}),
+        ("alias reasoning_specialist", lambda _: {"prior_models": ["reasoning_specialist"]}),
+        ("concrete worker_balanced_alt model", lambda _: {"prior_models": ["gpt-5.6-terra"]}),
+        ("unnamed", lambda _: {}),
+    ]
+    for scarce in ([], ["claude-haiku-4-5-20251001", "claude-sonnet-5", "gpt-5.6-luna"],
+                   ["claude-fable-5"], ["claude-fable-5", "gpt-5.6-sol"]):
+        first = r(task_class="MECHANICAL", complexity=1, uncertainty=1, blast_radius=1,
+                  unavailable_models=list(scarce))
+        if not first["selected_model"]:
+            continue
+        for name, build in shapes:
+            kw = build(first["selected_model"])
+            second = r(task_class="MECHANICAL", complexity=1, uncertainty=1, blast_radius=1,
+                       unavailable_models=list(scarce), prior_failures=1, **kw)
+            # What tier did the previous attempt actually run at?
+            named = kw.get("prior_models")
+            if named:
+                ran = max(tier[m] if m in tier else
+                          tier[CFG["models"][CFG["role_bindings"]["default"][m]]["id"]]
+                          for m in named)
+            else:
+                ran = tier[first["selected_model"]]
+            reachable = [m for m in ids if m not in scarce and tier[m] > ran]
+            if second["terminal"]:
+                assert not reachable, (
+                    f"{name}/{scarce}: declared exhaustion above tier {ran} while "
+                    f"{reachable} were free — {second['notes']}")
+                continue
+            assert tier[second["selected_model"]] > ran, (
+                f"{name}/{scarce}: previous attempt ran at tier {ran}; retry chose "
+                f"{second['selected_model']} (tier {tier[second['selected_model']]}) "
+                f"and recorded {second['notes']}")
+
+
+def test_d13_a_confirmed_isolation_gap_is_terminal_where_the_band_requires_it():
+    """Round 8. The policy declares `on_independence_unachievable: terminal`,
+    and the five-state contract goes to the trouble of separating `unavailable`
+    (a confirmed gap) from `degraded` (an unchecked one). The router answered
+    both the same way — an ordinary route at exit 0 — which also falsified the
+    exhaustiveness claim the exit contract had just made."""
+    out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
+            isolation_available=False)
+    assert out["review"]["independence_required"], "probe drifted"
+    assert out["review"]["review_independence"] == "unavailable"
+    assert out["terminal"] == "INDEPENDENCE_UNAVAILABLE"
+    assert out["requires_human_confirmation"]
+    # And the band that does not ask for independence is untouched by this.
+    low = r(task_class="MECHANICAL", isolation_available=False)
+    assert not low["review"]["independence_required"] and not low["terminal"]
+
+
+def test_d13_the_human_gate_exit_status_comes_from_the_config():
+    """Round 8. The key was declared in `human_in_the_loop` and read nowhere;
+    the CLI hard-coded 3. The config's own rule is that a rule consumed nowhere
+    is a promise the system does not keep."""
+    import tempfile, yaml, os
+    cfg = load_config()
+    assert cfg["human_in_the_loop"]["human_gate_exit_status"] == 3
+    probe = ["--class", "IMPLEMENTATION", "--complexity", "0", "--uncertainty", "0",
+             "--blast-radius", "0", "--reversibility", "0",
+             "--flags", "auth_sensitive,bridge_down", "--runtime", "codex"]
+    assert cli(*probe).returncode == 3
+    # Change the policy and the CLI must follow it, or the key is decoration.
+    altered = dict(cfg)
+    altered["human_in_the_loop"] = {**cfg["human_in_the_loop"], "human_gate_exit_status": 7}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "model-routing.yaml"
+        path.write_text(yaml.safe_dump(altered))
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import sys;sys.path.insert(0,%r);import route_task as rt;"
+             "from pathlib import Path;"
+             "rt._DEFAULT_CFG=rt.load_config(Path(%r));sys.exit(rt.main(sys.argv[1:]))"
+             % (str(SKILL / "scripts"), str(path)), *probe],
+            capture_output=True, text=True)
+    assert proc.returncode == 7, (
+        f"config said 7, CLI returned {proc.returncode}: the key is not read")
 
 
 def _peek_model(out, role):

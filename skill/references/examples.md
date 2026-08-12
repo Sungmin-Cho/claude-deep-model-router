@@ -181,11 +181,11 @@ irreversible, "we have a rollback plan" is part of the deliverable.
 ```
 score=5  band=MEDIUM   worker=worker_balanced / MEDIUM
 review=MEDIUM: reasoning_specialist
-note: escalated above failed tier worker_fast
+note: escalated above capability tier 0
 ```
 
 Without the failure this routes to `worker_fast`. With it, the router refuses
-to hand the task back to the tier that already failed.
+to hand the task back to the capability tier that already failed.
 
 **This escalation now fires even when no model was named.** It used to require
 `prior_models` and silently lapse without it — the loop-prevention control

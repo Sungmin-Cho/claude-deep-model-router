@@ -136,7 +136,15 @@ def _routes():
             # reach the router" — round 7 mutated `runtime=runtime` to a
             # constant and every invariant stayed green, because the old check
             # compared the sweep's own list against itself.
-            TASKS.append(task)
+            # Projections, not objects: the sweep is ~200k routes and holding
+            # every Task alive for the process lifetime buys nothing the
+            # dimension guard needs.
+            TASKS.append((task.task_class,
+                          (task.complexity, task.uncertainty,
+                           task.blast_radius, task.reversibility),
+                          tuple(task.flags), task.runtime,
+                          tuple(task.unavailable_models),
+                          tuple(task.prior_models), task.prior_failures))
             yield route(task, CFG)
         except ValidationError:
             # Every candidate withheld: failing closed is a correct outcome.
@@ -165,7 +173,16 @@ def test_the_sweep_is_large_and_reaches_the_interesting_states():
     them — and that is precisely how earlier invariant tests passed while the
     invariants were false."""
     all_routes = routes()
-    assert len(all_routes) > 5000, f"sweep collapsed to {len(all_routes)} routes"
+    product = len(TASK_CLASSES) * len(DIMENSIONS) * len(FLAG_SETS) * len(RUNTIMES) \
+        * len(SCARCITY) * len(PRIOR) * len(PRIOR_FAILURES)
+    # Computed, not a magic threshold: `> 5000` would still have passed with
+    # 97% of the sweep gone. Withheld routes are a correct outcome, but they
+    # are bounded — if most of the space starts failing closed, that is a
+    # change worth failing on rather than absorbing.
+    assert len(all_routes) == product - _WITHHELD
+    assert _WITHHELD < product * 0.25, (
+        f"{_WITHHELD}/{product} routes now fail closed; the sweep is measuring "
+        f"validation, not routing")
 
     reached = {
         "terminal": sum(1 for o in all_routes if o["terminal"]),
@@ -204,16 +221,9 @@ def test_every_swept_dimension_reaches_the_router():
     routes()                     # force the sweep
     assert TASKS, "no task was constructed"
 
-    observed = {
-        "task_class": {t.task_class for t in TASKS},
-        "dimensions": {(t.complexity, t.uncertainty, t.blast_radius, t.reversibility)
-                       for t in TASKS},
-        "flags": {tuple(t.flags) for t in TASKS},
-        "runtime": {t.runtime for t in TASKS},
-        "unavailable_models": {tuple(t.unavailable_models) for t in TASKS},
-        "prior_models": {tuple(t.prior_models) for t in TASKS},
-        "prior_failures": {t.prior_failures for t in TASKS},
-    }
+    fields = ("task_class", "dimensions", "flags", "runtime",
+              "unavailable_models", "prior_models", "prior_failures")
+    observed = {name: {row[i] for row in TASKS} for i, name in enumerate(fields)}
     expected = {
         "task_class": len(set(TASK_CLASSES)),
         "dimensions": len({tuple(d) for d in DIMENSIONS}),
@@ -407,6 +417,47 @@ def test_a_reduced_depth_route_is_not_dispatchable_without_a_human():
         f"cannot tell it from a dispatchable one")
 
 
+def test_an_unsatisfiable_band_floor_means_no_amount_of_availability_would_help():
+    """Round 8. `band_floor_unsatisfiable` had no assertion anywhere — hard-code
+    it either way and 120 tests stayed green — and its arithmetic counted the
+    implementer against the reviewer floor unconditionally, so an ordinary
+    recoverable shortage was reported to the human as permanent, with the
+    message "will not clear by retrying". Both directions are checked here by
+    re-running the same route with nothing withheld: that is what "the binding
+    itself cannot supply this" means."""
+    # Never claimed where there is no shortfall to explain.
+    for out in routes():
+        if not out["review"]["review_depth_reduced"]:
+            assert not out["review"]["band_floor_unsatisfiable"], (
+                "claimed a structural shortage with no shortfall")
+
+    # Both directions, on routes whose answer is known independently of the
+    # implementation: withhold a model that the binding could spare, versus a
+    # binding that never had enough.
+    claude_only_recoverable = route(Task(
+        task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=1,
+        reversibility=0, flags=["auth_sensitive", "bridge_down"],
+        runtime="claude_code", unavailable_models=["claude-fable-5"]), CFG)
+    assert claude_only_recoverable["review"]["review_depth_reduced"], "probe drifted"
+    assert not claude_only_recoverable["review"]["band_floor_unsatisfiable"], (
+        "claude_only supplies two tier-2+ models; withholding one is scarcity, "
+        "not structural incapacity")
+    restored = route(Task(
+        task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=1,
+        reversibility=0, flags=["auth_sensitive", "bridge_down"],
+        runtime="claude_code"), CFG)
+    assert not restored["review"]["review_depth_reduced"], (
+        "the shortfall did not in fact clear — the probe is wrong, not the flag")
+
+    openai_only_structural = route(Task(
+        task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=1,
+        reversibility=0, flags=["auth_sensitive", "bridge_down"], runtime="codex"), CFG)
+    assert openai_only_structural["review"]["review_depth_reduced"], "probe drifted"
+    assert openai_only_structural["review"]["band_floor_unsatisfiable"], (
+        "openai_only holds one tier-2 model against two reviewer seats and "
+        "nothing is withheld — no retry can clear this")
+
+
 def test_the_shortfall_record_carries_the_band_the_gate_actually_used():
     """Round 7. The record's payload was asserted nowhere, so mutating
     `band_requires` to 0 kept 114 tests green while handing the human a number
@@ -533,8 +584,44 @@ def test_a_critical_domain_flag_always_reaches_high_review_and_worker():
         if not (set(out["critical_flags"]) & critical_flags):
             continue
         assert bands.index(out["review"]["band"]) >= bands.index("HIGH")
-        if out["selected_role"]:
-            assert ROLES.index(out["selected_role"]) >= ROLES.index("worker_balanced")
+        if out["selected_model"]:
+            # On the resolved tier, not the role label. Round 8: the retry
+            # ladder can legitimately leave the worker on a low-ordinal role
+            # holding a strong model, and the floor's meaning is "not the
+            # cheapest model", not "not that label".
+            floor_role = CFG["router"]["floors"]["critical_domain_worker"]
+            floor_tier = NOMINAL_TIER[floor_role]
+            assert TIER_OF[out["selected_model"]] >= floor_tier, (
+                f"critical-domain route dispatched {out['selected_model']} "
+                f"(tier {TIER_OF[out['selected_model']]}) below floor tier {floor_tier}")
+
+
+def test_the_critical_domain_worker_floor_is_currently_a_guard_not_an_active_rule():
+    """Round 8, and an honest one to record.
+
+    The floor cannot be mutation-tested: disabling it entirely leaves every one
+    of 570,240 paired critical-domain routes with the same dispatched model and
+    the same terminal state, because `worker_selection` already places every
+    class at `worker_balanced` or above once a critical-domain flag forces the
+    band to HIGH. So this test asserts the redundancy rather than pretending to
+    cover the rule — if an edit to `worker_selection` makes the floor
+    load-bearing, this fails and says so, which is the moment someone needs to
+    know the guard has become the thing holding the line."""
+    floor_role = CFG["router"]["floors"]["critical_domain_worker"]
+    floor_tier = NOMINAL_TIER[floor_role]
+    table = CFG["worker_selection"]
+    weak = []
+    for task_class, cells in table.items():
+        for band in ("HIGH", "CRITICAL"):
+            role = cells[band]
+            if role == "by_reasoning_centric":
+                continue                     # both branches are frontier roles
+            if NOMINAL_TIER[role] < floor_tier:
+                weak.append(f"{task_class}/{band} -> {role}")
+    assert not weak, (
+        f"worker_selection now places {weak} below the critical-domain floor "
+        f"({floor_role}, tier {floor_tier}); the floor has become load-bearing "
+        f"and needs real coverage, not this redundancy assertion")
 
 
 def test_review_depth_is_never_weaker_than_its_band_requires():

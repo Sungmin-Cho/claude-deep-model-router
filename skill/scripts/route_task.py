@@ -53,6 +53,16 @@ class ConfigError(RuntimeError):
     """Raised when the policy config cannot be read or is internally invalid."""
 
 
+class RouterInvariantError(AssertionError):
+    """A post-condition of the router itself did not hold.
+
+    Distinct from `ValidationError` (the caller's input is wrong) and
+    `ConfigError` (the policy is wrong): this one means the code produced a
+    state it promises never to produce, and mapping it onto "invalid input"
+    would blame the caller for a defect here.
+    """
+
+
 def load_config(path: Path = CONFIG_PATH) -> dict:
     """Read the policy. Raises rather than exiting, so importing this module
     can never terminate the interpreter."""
@@ -420,22 +430,40 @@ def apply_overrides(task: Task, band: str, policy: Policy) -> tuple[str, list[st
 # Stage 4 — worker
 # --------------------------------------------------------------------------
 
-def _promote_above(worker: str, failed: str, policy: Policy,
-                   resolver: "Resolver") -> str | None:
-    """The lowest role whose RESOLVED model outranks what `failed` resolved to.
+def _failed_tier(task: Task, policy: Policy, binding: dict) -> int | None:
+    """The capability tier of the strongest model that ALREADY FAILED.
 
-    `None` when no such role exists — a real exhaustion, not a clamp. Returns
-    the current worker unchanged when it already outranks the failure.
+    Measured on what ran, which is not what the role resolves to now: the
+    failed model is in `Resolver.unusable`, so `peek` returns its replacement.
+    Round 8 found all three consequences of confusing the two — a floor
+    inflated to the replacement's tier declaring false exhaustion on the
+    simplest documented retry, an escalation that skipped a tier, and (through
+    `failed_roles`, which drops any binding entry outside `role_tiers`) a
+    `gpt-5.6-terra` failure that was not seen at all.
+
+    Concrete ids are read directly. A role alias is read through the binding in
+    force — the model that role HELD when it ran.
+    """
+    tiers = []
+    for item in task.prior_models:
+        if item in policy.model_ids:
+            tiers.append(policy.tier_of[item])
+        elif item in binding:
+            tiers.append(policy.tier_of[policy.cfg["models"][binding[item]]["id"]])
+    return max(tiers) if tiers else None
+
+
+def _promote_above(floor: int, policy: Policy, resolver: "Resolver") -> str | None:
+    """The weakest role whose RESOLVED model outranks `floor`.
+
+    `None` when no such role exists — a real exhaustion, not a clamp.
     """
     def tier(role):
         model = resolver.peek(role)
         return policy.tier_of[model] if model else -1
 
-    floor = tier(failed)
-    if tier(worker) > floor:
-        return worker
     stronger = [r for r in policy.roles if tier(r) > floor]
-    return min(stronger, key=policy.roles.index, default=None)
+    return min(stronger, key=lambda r: (tier(r), policy.roles.index(r)), default=None)
 
 
 def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -> tuple[str, list[str], bool]:
@@ -467,43 +495,64 @@ def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -
             notes.append("investigation promotion: unknown root cause")
 
     if task.critical_flags(policy):
-        promoted = policy.role_max(worker, cfg["router"]["floors"]["critical_domain_worker"])
-        if promoted != worker:
-            notes.append("critical-domain floor raised worker to worker_balanced")
-            worker = promoted
+        # The floor is written in the config as a role, but what it means is a
+        # minimum CAPABILITY — "not the cheapest model" — so it is enforced on
+        # the resolved tier. Enforcing the label instead breaks in both
+        # directions under scarcity: it can demand a promotion that lands on a
+        # weaker model, and it reads a `worker_fast` seat holding the frontier
+        # model as a floor violation. The retry ladder above can legitimately
+        # leave the worker on a low-ordinal role holding a strong model.
+        named = cfg["router"]["floors"]["critical_domain_worker"]
+        floor_tier = policy.tier_of[cfg["models"][resolver.binding[named]]["id"]]
+        current = resolver.peek(worker)
+        if current is None or policy.tier_of[current] < floor_tier:
+            promoted = _promote_above(floor_tier - 1, policy, resolver)
+            # Recorded only when the MODEL moves. Measured over 570,240 paired
+            # critical-domain routes this floor never changes the dispatched
+            # model or the terminal state — `worker_selection` already places
+            # every class at `worker_balanced` or above once a critical-domain
+            # flag forces the band to HIGH. It fired a note on 2,145 of them
+            # anyway, which is this module's own forbidden shape: a recorded
+            # change that changed nothing. It stays as a guard against a future
+            # edit to that table; it does not get to claim credit meanwhile.
+            if promoted is not None and resolver.peek(promoted) != current:
+                notes.append(f"critical-domain floor raised worker to {promoted} "
+                             f"(capability tier {floor_tier} or better)")
+                worker = promoted
 
     ceiling_exhausted = False
     if task.prior_failures >= 1:
-        failed = task.failed_roles(policy, binding)
-        if failed:
-            highest = max(failed, key=policy.roles.index)
-            if policy.at_ceiling(highest):
-                # There is no tier above the ceiling. Silently clamping here
-                # produced an "escalation" that re-ran the same model.
-                ceiling_exhausted = True
-                notes.append(f"retry ladder exhausted: {highest} is the top tier")
-            # Round 7. Moving the role up one is not an escalation; moving to a
-            # STRONGER MODEL is. Under scarcity the next role along resolves to
-            # a peer at the same capability tier, and the retry policy's own
-            # rule — `require_new_evidence_on_same_tier` — is silently broken
-            # while the note claims a promotion, with a stronger model unused.
-            # So the ladder is climbed until the resolved tier actually rises.
-            promoted = _promote_above(worker, highest, policy, resolver)
+        # One rule for both branches, on one axis. When the caller named what
+        # failed, the floor is that model's tier. When it did not, the floor is
+        # the tier this task would have been routed to anyway — which is what
+        # the previous attempt ran. The unnamed branch used to climb the role
+        # ladder blindly and, under scarcity, landed a tier BELOW where it
+        # started while recording an escalation.
+        current = policy.tier_of[resolver.peek(worker)] if resolver.peek(worker) else -1
+        floor = _failed_tier(task, policy, binding)
+        named = floor is not None
+        if floor is None:
+            # Nothing was named, so the previous attempt ran wherever this task
+            # routes to — which is exactly where it routes to now, since
+            # nothing has been excluded.
+            floor = current
+
+        if current > floor:
+            # Excluding the failed model has already moved the worker above it.
+            # Demanding a further promotion here declared exhaustion while the
+            # route in hand was a correct, stronger retry.
+            notes.append(f"retry resolves above the failed capability tier {floor} "
+                         f"without promotion")
+        else:
+            promoted = _promote_above(floor, policy, resolver)
             if promoted is None:
                 ceiling_exhausted = True
-                notes.append(f"retry ladder exhausted: no model is stronger than "
-                             f"what {highest} resolves to")
-            elif promoted != worker:
-                notes.append(f"escalated above failed tier {highest}")
-                worker = promoted
-        else:
-            if policy.at_ceiling(worker):
-                ceiling_exhausted = True
-                notes.append("retry ladder exhausted: already at the top tier")
-            promoted = policy.role_above(worker, task.prior_failures)
-            if promoted != worker:
-                notes.append(f"escalated above failed tier (unnamed) after "
-                             f"{task.prior_failures} failure(s)")
+                notes.append(f"retry ladder exhausted: no usable model is stronger than "
+                             f"capability tier {floor}"
+                             + ("" if named else " (no prior model was named)"))
+            else:
+                notes.append(f"escalated above capability tier {floor}"
+                             + (f" after {task.prior_failures} failure(s)" if not named else ""))
                 worker = promoted
 
     return worker, notes, ceiling_exhausted
@@ -724,7 +773,7 @@ def _seat_judge(review: dict, worker: str, judge_role: str, policy: "Policy",
 
     # Retry once, freeing the strongest reviewer seat if another model that
     # still satisfies the band can take its place.
-    floor = policy.band_reviewer_floor.get(review["band"], 0)
+    floor = policy.band_reviewer_floor[review["band"]]
     # The implementer's model is off-limits to a REPLACEMENT reviewer at every
     # band, `independent` or not.
     #
@@ -754,7 +803,11 @@ def _seat_judge(review: dict, worker: str, judge_role: str, policy: "Policy",
         for alt in sorted(alternatives, key=tier):
             trial = list(reviewers)
             trial[highest] = alt
-            if (found := pick(trial)) and resolver.peek(found) not in taken(trial):
+            # `pick` already excludes every model in `taken(trial)`, so a second
+            # test of the same thing here could never fail — the exact shape this
+            # module keeps finding elsewhere, sitting in the function that hunts
+            # it. One check, in one place.
+            if (found := pick(trial)):
                 review = dict(review)
                 review["reviewers"] = trial
                 # The seat that a substitution record pointed at has just been
@@ -789,7 +842,8 @@ def _extra_reviewer(review: dict, worker: str, policy: "Policy", resolver: "Reso
     """A reviewer whose model is not already in use by the worker or a peer."""
     taken = {resolver.peek(worker)} | {resolver.peek(x) for x in review["reviewers"]}
     pool = [x for x in policy.roles
-            if x not in review["reviewers"] and x != worker and resolver.peek(x) not in taken]
+            if x not in review["reviewers"] and x != worker
+            and resolver.peek(x) and resolver.peek(x) not in taken]
     # Strongest by resolved model, not by ladder position — the config says
     # every strength comparison reads `capability_tier`, and this one was left
     # on role ordinals when the rest were converted.
@@ -1121,7 +1175,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # final roster. A record that names a reviewer who is not there is worse
     # than no record: it is the rationale asserting a fact about the route that
     # the route contradicts.
-    floor = policy.band_reviewer_floor.get(review["band"], 0)
+    floor = policy.band_reviewer_floor[review["band"]]
     shortfall = [
         {"reviewer": role, "model": resolved[role],
          "capability_tier": policy.tier_of[resolved[role]], "band_requires": floor}
@@ -1137,7 +1191,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         # incapable of failing, because the emitted value then satisfies them
         # by construction. Nothing upstream may produce this state; if one
         # does, that is a defect in the pipeline and it says so out loud.
-        raise ConfigError(
+        raise RouterInvariantError(
             f"substitution record outlived the seat it describes: {stale}; "
             f"seats hold {review['reviewers']}"
         )
@@ -1149,9 +1203,20 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # is the only possible answer. This module's own reasoning is that a gate
     # firing on everything trains people to wave it through, so the two are
     # told apart in the output rather than presented identically.
-    seats = len(review["reviewers"]) + (1 if review["independent"] else 0)
-    supply = {cfg["models"][key]["id"] for role, key in resolver.binding.items()
-              if role in policy.roles}
+    # The implementer occupies a distinct model only where independence is
+    # required, and it counts against the floor-tier supply only if it is
+    # itself at or above the floor — a `worker_balanced` implementer does not
+    # consume a tier-2 model. Counting it unconditionally over-stated the
+    # requirement by one and reported an ordinary, recoverable shortage as
+    # permanent, pushing the operator toward "proceed at reduced depth" on a
+    # gate that restoring one model would have cleared.
+    worker_model = resolved.get(worker)
+    seats = len(review["reviewers"]) + (
+        1 if review["independent"] and worker_model
+        and policy.tier_of[worker_model] >= floor else 0)
+    # Every id the binding can reach, including roles outside `role_tiers`
+    # (`worker_balanced_alt`) that the fallback ladder can still seat.
+    supply = {cfg["models"][key]["id"] for key in resolver.binding.values()}
     unsatisfiable = bool(shortfall) and sum(
         1 for m in supply if policy.tier_of[m] >= floor) < seats
     if shortfall:
@@ -1170,7 +1235,17 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     judge = judge_role
 
     terminal = None
-    if review.get("independence_compromised"):
+    if review["independent"] and review_independence == "unavailable":
+        # The caller stated positively that isolation cannot be achieved here,
+        # and the band requires it. That is `on_independence_unachievable`,
+        # which the policy calls terminal — the review cannot be run as
+        # specified, so there is nothing safe to dispatch. It was previously
+        # emitted as an ordinary route at exit 0, which made the exhaustiveness
+        # claim in SKILL.md ("every outcome needing a person is nonzero")
+        # false, and left `unavailable` answering the same as `degraded` after
+        # the policy went to the trouble of distinguishing them.
+        terminal = "INDEPENDENCE_UNAVAILABLE"
+    elif review.get("independence_compromised"):
         # The band asked for independent review and no assignment of distinct
         # models could provide it. Emitting a dispatchable route here would
         # hand back reviewers that are the implementer wearing another label,
@@ -1432,7 +1507,11 @@ def main(argv: list[str] | None = None) -> int:
     # 3 is executable-after-approval, distinct so a caller can tell them apart.
     if result["terminal"]:
         return 1
-    return 3 if result["requires_human_confirmation"] else 0
+    gate = policy.cfg["human_in_the_loop"]["human_gate_exit_status"]
+    if not isinstance(gate, int) or gate in (0, 1, 2):
+        raise ConfigError(
+            f"human_gate_exit_status must be an integer distinct from 0/1/2, got {gate!r}")
+    return gate if result["requires_human_confirmation"] else 0
 
 
 def _print_text(r: dict) -> None:

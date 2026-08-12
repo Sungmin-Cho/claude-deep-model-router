@@ -44,7 +44,9 @@ max_total_implementation_attempts: 4
 max_review_rounds:                 3
 max_judge_invocations:             1
 require_new_evidence_on_same_tier: true    # "tier" = capability_tier of the
-                                          # resolved model, not the role label
+                                          # model that RAN, not the role label
+                                          # and not what the role resolves to
+                                          # once the failure is excluded
 ```
 
 **A second attempt at the same tier must carry a changed hypothesis or new

@@ -155,21 +155,19 @@ execute:
 |---|---|
 | `HUMAN_REQUIRED` | the retry budget is spent; no executable route is emitted |
 | `ESCALATE_ROUTING` | routing confidence fell below 0.60 — re-classify at higher effort or ask a human |
-| `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and no assignment of distinct models could provide it |
+| `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and it cannot be had: no assignment of distinct models exists, or the caller reported isolation unavailable |
 
-`judge_unavailable` is deliberately **not** a terminal state. Independence
-failing means the review itself cannot happen as specified, so there is nothing
-safe to dispatch. A missing adjudicator means the review can still run; what a
-human takes over is settling a disagreement, should one arise.
+`judge_unavailable` is deliberately **not** terminal: independence failing means
+the review cannot happen as specified, so nothing is safe to dispatch, whereas a
+missing adjudicator leaves the review runnable and only hands a human the job of
+settling a disagreement.
 
 **Every strength comparison reads the resolved model's `capability_tier`, never
 a role's position in the ladder** — judge-vs-party, reviewer-vs-band-floor,
-substitute-vs-replaced, and retry escalation alike. Under scarcity a role holds
-whatever model is left, so `worker_fast` can end up on the frontier model and
-`worker_balanced` on a weaker one; ranking by role label ranks the assignment
-backwards exactly when scarcity makes the ranking matter. A retry therefore
-climbs until the resolved tier actually *rises* — moving the label up one while
-the model stays at the strength that just failed is not an escalation.
+substitute-vs-replaced, critical-domain floor, and retry escalation alike. Under
+scarcity a role holds whatever model is left, so `worker_fast` can end up on the
+frontier model and `worker_balanced` on a weaker one; ranking by role label
+ranks the assignment backwards exactly when scarcity makes it matter.
 
 `review_depth_reduced` is non-empty when the seats that could be filled are
 weaker than the band asks. The route stays executable and asks a human: the
@@ -379,11 +377,13 @@ Escalate on **evidence**: a failed acceptance check, a stated low confidence,
 an unstable plan, a reviewer finding. Not on a hunch, and not merely because a
 stronger model exists.
 
-A retry at the same tier must carry at least one of: new evidence (a log, a
-repro, a bisect, a failing assertion), a materially different hypothesis, or a
-stronger model — "stronger" measured on `capability_tier`, since under scarcity
-the next role along can resolve to a peer. Asking the same model to retry
-equivalent approaches is the dominant cost-overrun mode in agent systems.
+A retry must reach a **strictly higher `capability_tier` than the model that
+ran**, or say it cannot. That tier is read from what the model held when it ran,
+never from what its role resolves to afterwards — the failure is excluded by
+then, so that reads the replacement. A retry at the same tier must carry new
+evidence (a log, a repro, a bisect, a failing assertion) or a materially
+different hypothesis; asking the same model to retry equivalent approaches is
+the dominant cost-overrun mode in agent systems.
 
 ```
 same_model_same_effort:            1

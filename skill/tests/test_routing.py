@@ -93,8 +93,16 @@ def test_s4_failed_worker_escalates_rather_than_retrying():
         prior_failures=1,
         prior_models=["worker_fast"],
     )
-    assert at_least(out["selected_role"], "worker_balanced")
-    assert any("escalated above failed tier" in n for n in out["notes"])
+    # On the model, not the label. Round 8: excluding the failed model already
+    # moves `worker_fast` onto `claude-sonnet-5` — the very model
+    # `worker_balanced` would have supplied — so the role-label assertion failed
+    # on a route that satisfies this test's own intent exactly. What §S4
+    # requires is that the retry does not re-run what failed and is stronger.
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    failed = CFG["models"][CFG["role_bindings"]["default"]["worker_fast"]]["id"]
+    assert out["selected_model"] != failed
+    assert tier[out["selected_model"]] > tier[failed]
+    assert any("capability tier" in n for n in out["notes"]), out["notes"]
 
 
 def test_s5_hard_logical_verification_routes_to_reasoning():
