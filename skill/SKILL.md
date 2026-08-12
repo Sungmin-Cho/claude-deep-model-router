@@ -117,7 +117,7 @@ Other inputs worth knowing:
 |---|---|
 | `--format json` | machine-readable route |
 | `--runtime codex` | the Codex effort spelling |
-| `--prior-failures N` | after a failed attempt; `--prior-models` accepts role aliases *or* model ids |
+| `--prior-failures N` | after a failed attempt; `--prior-models` must then name **one concrete model id per failure** |
 | `--unavailable <role>` / `--unavailable-models <id>` | a specific role or model does not resolve |
 | `--flags bridge_down` | the whole cross-provider transport is unreachable — switches to the degraded single-provider binding |
 | `--isolation available\|unavailable` / `--isolation-evidence <ids>` | whether isolation *can* be achieved this session, and one distinct session id per dispatched reviewer |
@@ -156,6 +156,7 @@ execute:
 | `HUMAN_REQUIRED` | the retry budget is spent; no executable route is emitted |
 | `ESCALATE_ROUTING` | routing confidence fell below 0.60 — re-classify at higher effort or ask a human |
 | `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and it cannot be had — no distinct-model assignment exists, or the caller reported isolation unavailable |
+| `RETRY_HISTORY_REQUIRED` | `--prior-failures N` without one concrete model id per failure. The router does not guess what ran |
 
 `judge_unavailable` is deliberately **not** terminal: independence failing means
 the review cannot happen as specified, so nothing is safe to dispatch, whereas a
@@ -377,14 +378,14 @@ an unstable plan, a reviewer finding. Not on a hunch, and not merely because a
 stronger model exists.
 
 A retry must reach a **strictly higher `capability_tier` than the model that
-ran**, or report exhaustion. Pass `--prior-models` with a **concrete model id**:
-`route()` is stateless while this rule is historical, so every other spelling
-makes the router *infer* what ran, and an inferred retry is disclosed as
-`retry_history_inferred` and gated on human confirmation — availability can have
-changed since. A concrete id needs no inference and is not gated.
-`references/control-loop.md` covers the inference and where it has gone wrong.
-The same-tier budgets below are real, but the router will not route one; it
-reports exhaustion and asks a human.
+ran**, and never a weaker one than the same task with no failures. **The router
+does not reconstruct what ran — it asks.** `--prior-failures N` requires
+`--prior-models` to name N concrete model ids (repeat one that failed twice);
+anything else is `RETRY_HISTORY_REQUIRED`. `route()` is stateless while this
+rule is historical, so the party that knows — the caller, which dispatched them
+— supplies it. Every route emits `selected_model`; keep it. The same-tier
+budgets below are real, but the router will not route one: it reports
+exhaustion and asks a human.
 
 ```
 same_model_same_effort:            1

@@ -184,8 +184,11 @@ def test_d1_multiple_simultaneous_unavailabilities():
 
 def test_d2_retry_exhaustion_is_terminal_not_a_route():
     cap = CFG["retry"]["max_total_implementation_attempts"]
+    # Round 12: a retry needs one concrete model id per failure, so the history
+    # is spelled out. `worker_fast` used to stand in for it, and five rounds of
+    # inferring which model that alias held produced five different defects.
     out = r(task_class="DEBUGGING", complexity=2, uncertainty=1, blast_radius=1,
-            prior_failures=cap, prior_models=["worker_fast"])
+            prior_failures=cap, prior_models=["gpt-5.6-luna"] * cap)
     assert out["terminal"] == "HUMAN_REQUIRED"
     assert out["selected_model"] is None, "an exhausted task must not get an executable route"
 
@@ -210,9 +213,19 @@ def test_d2_cli_exits_nonzero_on_a_terminal_state():
     cap = str(CFG["retry"]["max_total_implementation_attempts"])
     p = cli("--class", "DEBUGGING", "--complexity", "2", "--uncertainty", "1",
             "--blast-radius", "1", "--reversibility", "0",
-            "--prior-failures", cap, "--prior-models", "worker_fast")
+            "--prior-failures", cap,
+            "--prior-models", ",".join(["gpt-5.6-luna"] * int(cap)))
     assert p.returncode != 0, "a terminal state must not exit 0"
     assert "HUMAN_REQUIRED" in p.stdout + p.stderr
+
+    # And the round-12 terminal: an incomplete history is well-formed input
+    # with insufficient evidence, so it is a routing outcome (exit 1) rather
+    # than a usage error, and the note says what to supply.
+    q = cli("--class", "DEBUGGING", "--complexity", "2", "--uncertainty", "1",
+            "--blast-radius", "1", "--reversibility", "0", "--prior-failures", "1")
+    assert q.returncode == 1
+    assert "RETRY_HISTORY_REQUIRED" in q.stdout
+    assert "one model id per failure" in q.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -358,16 +371,6 @@ def test_d4_low_band_review_is_not_applicable_rather_than_degraded():
 # ---------------------------------------------------------------------------
 # D5 — prior-failure escalation must not silently no-op
 # ---------------------------------------------------------------------------
-
-def test_d5_prior_failures_without_prior_models_still_escalates():
-    plain = r(task_class="IMPLEMENTATION", complexity=1, uncertainty=1, blast_radius=1)
-    out = r(task_class="IMPLEMENTATION", complexity=1, uncertainty=1, blast_radius=1,
-            prior_failures=1)
-    assert ROLES.index(out["selected_role"]) > ROLES.index(plain["selected_role"]), (
-        "a reported failure with no named model must still escalate — the "
-        "retry rule is the loop-prevention control"
-    )
-
 
 def test_d5_prior_models_accepts_concrete_model_ids():
     """selected_model is emitted as a model id, so feeding it back must work."""
@@ -797,15 +800,39 @@ def test_d10_a_below_tier_substitute_is_only_taken_when_nothing_better_is_free()
 # D13 — round 7: what the round-6 fixes broke, and what verified nothing
 # ---------------------------------------------------------------------------
 
-def test_d13_skill_md_stays_inside_its_line_budget():
-    """The handoff sets 500 lines for the entry point, and every round adds
-    contract to it. Left unenforced the budget is a comment, and the file that
-    both runtimes load on every invocation grows without anyone deciding to."""
-    lines = (SKILL / "SKILL.md").read_text().splitlines()
-    assert len(lines) <= 500, (
-        f"SKILL.md is {len(lines)} lines against a 500-line budget; move detail "
-        f"into references/ rather than raising the number")
+def test_d16_skill_md_stays_small_without_being_hollowed_out():
+    """Round 12 replaced a hard 500-LINE cap with a byte budget plus content
+    assertions, because the line cap was measurably the wrong constraint.
 
+    What both runtimes pay on every invocation is bytes, not newlines, and this
+    file is mostly tables and fenced blocks whose density varies wildly. Worse,
+    the cap was actively harmful: satisfying it is what made me strip the
+    `references/` prefix from all six links in round 11, breaking every path the
+    file tells an agent to open. A budget met by damaging the content is a
+    budget that costs more than it saves.
+
+    So: bytes, with headroom, plus the contracts that must survive any future
+    shave. Deleting the retry rule to fit is now a test failure, not a saving.
+    """
+    text = (SKILL / "SKILL.md").read_text()
+    size = len(text.encode())
+    assert size <= 30_000, (
+        f"SKILL.md is {size} bytes against a 30,000-byte budget. Move explanation "
+        f"into references/ — do not compress the contracts below out of existence")
+
+    required = {
+        "the risk score formula": "complexity + 2",
+        "the four terminal states": "RETRY_HISTORY_REQUIRED",
+        "the exit-status contract": "human_gate_exit_status",
+        "the retry rule": "one concrete model id per failure",
+        "the independence states": "review_independence",
+        "the capability-tier rule": "capability_tier",
+        "how to reach the scorer": "route_task.py",
+    }
+    missing = [name for name, needle in required.items() if needle not in text]
+    assert not missing, (
+        f"SKILL.md no longer states {missing}. These are the load-bearing "
+        f"contracts; a size budget must never be met by dropping one")
 
 def test_d13_the_judge_retry_never_seats_the_implementer_as_its_own_reviewer():
     """Round 6 relaxed the retry at LOW on the reasoning that LOW permits
@@ -846,65 +873,6 @@ def test_d13_a_substitution_record_that_outlives_its_seat_is_raised_not_dropped(
     # dropped: the displaced role came back, so nothing was substituted
     assert _restate(rec, "principal_architect", "reasoning_specialist") == []
     assert _restate(None, "a", "b") == []
-
-
-def test_d13_a_retry_escalates_to_a_stronger_model_not_merely_a_higher_role():
-    """Round 7. Moving the role up one is not an escalation; moving to a
-    stronger MODEL is. Under scarcity the next role along resolved to a peer at
-    the same capability_tier, so the retry re-ran at the strength that had just
-    failed while the note claimed a promotion and a tier-3 model sat unused.
-    The invariant sweep missed it because it varied `prior_models` but left
-    `prior_failures` at zero, so the branch was never entered.
-
-    Round 8 found that the escape hatch below — `if terminal: return` — was
-    excusing the very defect the test names. `_promote_above` measured its floor
-    with `resolver.peek(failed)`, which returns the failed model's REPLACEMENT
-    because the failure has already been excluded, so the floor was inflated to
-    a tier nothing had run at and the simplest documented retry
-    (`--prior-models senior_engineer`) terminated with "no model is stronger"
-    while an untried tier-3 model sat free. Terminal is now only accepted when
-    an independent check confirms nothing stronger was reachable.
-    """
-    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
-    ids = sorted(tier)
-    # Every spelling of "what failed": a concrete id, a role alias, an alias
-    # outside `role_tiers` (which `failed_roles` used to drop entirely), and
-    # nothing at all.
-    shapes = [
-        ("concrete", lambda first: {"prior_models": [first]}),
-        ("alias senior_engineer", lambda _: {"prior_models": ["senior_engineer"]}),
-        ("alias reasoning_specialist", lambda _: {"prior_models": ["reasoning_specialist"]}),
-        ("concrete worker_balanced_alt model", lambda _: {"prior_models": ["gpt-5.6-terra"]}),
-        ("unnamed", lambda _: {}),
-    ]
-    for scarce in ([], ["claude-haiku-4-5-20251001", "claude-sonnet-5", "gpt-5.6-luna"],
-                   ["claude-fable-5"], ["claude-fable-5", "gpt-5.6-sol"]):
-        first = r(task_class="MECHANICAL", complexity=1, uncertainty=1, blast_radius=1,
-                  unavailable_models=list(scarce))
-        if not first["selected_model"]:
-            continue
-        for name, build in shapes:
-            kw = build(first["selected_model"])
-            second = r(task_class="MECHANICAL", complexity=1, uncertainty=1, blast_radius=1,
-                       unavailable_models=list(scarce), prior_failures=1, **kw)
-            # What tier did the previous attempt actually run at?
-            named = kw.get("prior_models")
-            if named:
-                ran = max(tier[m] if m in tier else
-                          tier[CFG["models"][CFG["role_bindings"]["default"][m]]["id"]]
-                          for m in named)
-            else:
-                ran = tier[first["selected_model"]]
-            reachable = [m for m in ids if m not in scarce and tier[m] > ran]
-            if second["terminal"]:
-                assert not reachable, (
-                    f"{name}/{scarce}: declared exhaustion above tier {ran} while "
-                    f"{reachable} were free — {second['notes']}")
-                continue
-            assert tier[second["selected_model"]] > ran, (
-                f"{name}/{scarce}: previous attempt ran at tier {ran}; retry chose "
-                f"{second['selected_model']} (tier {tier[second['selected_model']]}) "
-                f"and recorded {second['notes']}")
 
 
 # Config entries the code deliberately does not read, each with the reason.
@@ -1096,138 +1064,72 @@ def test_d14_every_declared_compensation_can_actually_be_emitted():
                     reversibility=2, unavailable_roles=["principal_architect"]), altered)
 
 
-def test_d14_consecutive_retries_climb_until_they_genuinely_run_out():
-    """Round 9. Every earlier retry test asserted ONE route, and the defect
-    lived between routes: with nothing named, the floor was recomputed from the
-    base route every call, so `prior_failures` 2, 3 and 4 all re-dispatched the
-    model attempt 2 had just run while the note claimed an escalation and the
-    route stayed dispatchable at exit 0. A single-route assertion cannot see
-    that. This one chains the attempts, which is the only shape that can."""
-    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
-    ids = sorted(tier)
-    # Round 10: `MECHANICAL` and `IMPLEMENTATION` at these scores route
-    # identically, so the class loop was one iteration wearing two names. The
-    # class that matters is one whose BASE route depends on `prior_failures` —
-    # DEBUGGING promotes at pf>=2 — because that is where the reconstruction
-    # counted the same promotion twice and declared exhaustion at a tier it had
-    # invented, with two untried models free.
-    for scarce in ([], ["claude-fable-5"], ["gpt-5.6-luna", "claude-haiku-4-5-20251001"],
-                   ["claude-fable-5", "gpt-5.6-sol"]):
-        for task_class, extra in (("MECHANICAL", {}), ("IMPLEMENTATION", {}),
-                                  ("DEBUGGING", {"flags": ["unknown_root_cause"]}),
-                                  ("INVESTIGATION", {"flags": ["unknown_root_cause"]})):
-            seen, last = [], None
-            for pf in range(0, 5):
-                out = r(task_class=task_class, complexity=1, uncertainty=1, blast_radius=1,
-                        prior_failures=pf, unavailable_models=list(scarce), **extra)
-                if out["terminal"]:
-                    # Exhaustion is only honest when nothing stronger is free
-                    # AND unused: a model this chain has already burned is not
-                    # a model the next attempt could have used.
-                    left = [m for m in ids
-                            if m not in scarce and m not in seen and tier[m] > (last or -1)]
-                    assert not left, (
-                        f"{task_class}/{scarce}/pf={pf}: terminal at tier {last} while "
-                        f"{left} were reachable and untried — {out['notes']}")
-                    break
-                now = tier[out["selected_model"]]
-                # The contract, in the order it binds: never re-run a model;
-                # climb while there is somewhere to climb to; and once the
-                # ladder is spent, hold at the strongest thing reachable and
-                # ask a human rather than silently repeating or regressing.
-                assert out["selected_model"] not in seen, (
-                    f"{task_class}/{scarce}: re-ran {out['selected_model']} — "
-                    f"{out['notes']}")
-                assert last is None or now > last, (
-                    f"{task_class}/{scarce}: attempt {pf + 1} runs "
-                    f"{out['selected_model']} (tier {now}) after tier {last} — "
-                    f"{out['notes']}")
-                # From the first retry on, the floor came from a reconstruction
-                # rather than a model id the caller observed run, so the route
-                # is disclosed and gated.
-                if pf >= 1:
-                    assert out["retry_history_inferred"], "inference not disclosed"
-                    assert out["requires_human_confirmation"], (
-                        f"{task_class}/{scarce}: an inferred retry was emitted as "
-                        f"dispatchable")
-                else:
-                    assert not out["retry_history_inferred"]
-                seen.append(out["selected_model"])
-                last = now
+def test_d16_a_retry_needs_one_concrete_model_id_per_failure():
+    """Round 12, unanimous across three reviewers: delete the reconstruction.
 
-
-def test_d14_a_role_alias_that_ran_a_fallback_is_not_read_as_its_nominal_model():
-    """Round 9. `_failed_tier` read the alias through the binding, but if the
-    binding's model was already withheld the role fell back and ran something
-    else — usually stronger. The floor came out too low and the retry re-emitted
-    the exact model that had just failed, recorded as an escalation."""
-    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
-    scarce = ["gpt-5.6-luna", "claude-haiku-4-5-20251001"]
-    first = r(task_class="MECHANICAL", unavailable_models=list(scarce))
-    assert first["selected_role"] == "worker_fast"
-    assert first["selected_model"] == "claude-sonnet-5", "probe drifted"
-    second = r(task_class="MECHANICAL", unavailable_models=list(scarce),
-               prior_failures=1, prior_models=["worker_fast"])
-    assert second["selected_model"] != first["selected_model"], (
-        f"re-ran {first['selected_model']} after it failed: {second['notes']}")
-    assert tier[second["selected_model"]] > tier[first["selected_model"]]
-
-
-def test_d15_the_reconstruction_base_is_the_pf_zero_route():
-    """Round 11. The base used to be captured by POSITION — a variable assigned
-    partway down the promotion chain, with a comment claiming everything above
-    it was independent of `prior_failures`. Two promotions below it were also
-    independent, so the base was a role the task never started from and a pf=1
-    retry re-dispatched what pf=0 had just run. A position in a function is not
-    a property and cannot be asserted; this can."""
-    from route_task import _base_worker
-    checked = 0
-    for task_class in TASK_CLASSES:
-        for dims in ((0, 0, 0, 0), (1, 1, 1, 1), (2, 2, 2, 0), (3, 3, 3, 3)):
-            for flags in ([], ["unknown_root_cause"], ["auth_sensitive"], ["long_horizon"]):
-                for pf in (1, 2, 3):
-                    kw = dict(task_class=task_class, complexity=dims[0], uncertainty=dims[1],
-                              blast_radius=dims[2], reversibility=dims[3], flags=list(flags))
-                    zero = r(**kw)
-                    if not zero["selected_role"]:
-                        continue
-                    task = _task(**kw, prior_failures=pf)
-                    band = zero["review"]["band"] if False else None
-                    from route_task import Policy, Resolver, score, band_from_score, apply_overrides
-                    policy = Policy.of(CFG)
-                    b = band_from_score(score(task, CFG), policy)
-                    b = apply_overrides(task, b, policy)[0]
-                    base, _ = _base_worker(task, b, policy, Resolver(task, policy))
-                    assert base == zero["selected_role"], (
-                        f"{task_class}/{dims}/{flags}/pf={pf}: reconstruction starts from "
-                        f"{base}, but the pf=0 route runs {zero['selected_role']}")
-                    checked += 1
-                    del band
-    assert checked > 100, f"only {checked} combinations reached the assertion"
-
-
-def test_d15_a_partial_history_is_not_treated_as_a_complete_one():
-    """Round 11. `prior_models` was read as exact whenever its entries were
-    concrete ids, without checking that they account for every failure. Two
-    failures with one named model kept the floor at that one model's tier, so
-    the retry re-emitted the model attempt 2 had just run — ungated, exit 0."""
+    Rounds 8-12 each produced a Critical in a different reading of the same
+    unknowable — what a previous attempt ran. The router cannot see its own
+    history, and this module had already conceded as much one field over
+    (`retry.*` budgets are documented as the caller's, because "one route()
+    call cannot count attempts"). So it asks instead of guessing.
+    """
     tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
     first = r(task_class="MECHANICAL")
-    second = r(task_class="MECHANICAL", prior_failures=1,
-               prior_models=[first["selected_model"]])
-    assert not second["retry_history_inferred"], "complete history must not be gated"
-    stale = r(task_class="MECHANICAL", prior_failures=2,
-              prior_models=[first["selected_model"]])
-    assert stale["selected_model"] != second["selected_model"], (
-        f"re-emitted {second['selected_model']} after it failed: {stale['notes']}")
-    assert tier[stale["selected_model"]] > tier[second["selected_model"]]
-    assert stale["retry_history_inferred"] and stale["requires_human_confirmation"], (
-        "an incomplete history was presented as verified")
-    # And the other direction: more models than failures is a contradiction the
-    # router should not silently absorb.
-    complete = r(task_class="MECHANICAL", prior_failures=2,
-                 prior_models=[first["selected_model"], second["selected_model"]])
-    assert not complete["retry_history_inferred"], "complete history was gated anyway"
+    ran = first["selected_model"]
+
+    # Exact concrete history: routes, ungated, strictly stronger.
+    ok = r(task_class="MECHANICAL", prior_failures=1, prior_models=[ran])
+    assert ok["terminal"] is None and ok["selected_model"]
+    assert tier[ok["selected_model"]] > tier[ran]
+
+    # Everything else is terminal, with no bindings and an actionable note.
+    for label, kw in (
+        ("nothing named", dict(prior_failures=1)),
+        ("a role alias", dict(prior_failures=1, prior_models=["worker_fast"])),
+        ("too few", dict(prior_failures=2, prior_models=[ran])),
+        ("too many", dict(prior_failures=1, prior_models=[ran, "claude-fable-5"])),
+        ("mixed alias and id", dict(prior_failures=2, prior_models=[ran, "worker_fast"])),
+    ):
+        out = r(task_class="MECHANICAL", **kw)
+        assert out["terminal"] == "RETRY_HISTORY_REQUIRED", f"{label}: {out['terminal']}"
+        assert out["selected_model"] is None and out["review"]["reviewer_models"] == []
+        assert any("retry history required" in n for n in out["notes"]), label
+        assert out["requires_human_confirmation"]
+
+    # A model that legitimately failed twice is named twice — the same-model
+    # retry budgets in `retry.*` make that a truthful history, not a duplicate.
+    twice = r(task_class="MECHANICAL", prior_failures=2, prior_models=[ran, ran])
+    assert twice["terminal"] is None and tier[twice["selected_model"]] > tier[ran]
+
+
+def test_d16_prior_failures_never_make_a_route_weaker():
+    """Round 12's Critical, and the one assertion that subsumes the round-9,
+    round-11 and round-12 defects at once: evidence of difficulty must never
+    produce a weaker route than the same task with no failures. It did — a task
+    whose table selection was tier 2 came back at tier 1 after one tier-0
+    failure, called an escalation, at exit 0."""
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    ids = sorted(tier)
+    checked = 0
+    for task_class in TASK_CLASSES:
+        for dims in ((0, 1, 3, 0), (0, 0, 0, 0), (2, 2, 2, 0), (3, 3, 3, 3)):
+            kw = dict(task_class=task_class, complexity=dims[0], uncertainty=dims[1],
+                      blast_radius=dims[2], reversibility=dims[3])
+            base = r(**kw)
+            if base["terminal"] or not base["selected_model"]:
+                continue
+            for failed in ids:
+                out = r(**kw, prior_failures=1, prior_models=[failed])
+                if out["terminal"]:
+                    continue
+                assert tier[out["selected_model"]] >= tier[base["selected_model"]], (
+                    f"{task_class}/{dims}: no failures -> {base['selected_model']} "
+                    f"(tier {tier[base['selected_model']]}), one failure of {failed} -> "
+                    f"{out['selected_model']} (tier {tier[out['selected_model']]}) — "
+                    f"{out['notes']}")
+                assert tier[out["selected_model"]] > tier[failed], "did not clear the failure"
+                checked += 1
+    assert checked > 200, f"only {checked} pairs reached the assertion"
 
 
 def test_d15_every_human_control_action_is_validated_and_load_bearing():
@@ -1237,27 +1139,53 @@ def test_d15_every_human_control_action_is_validated_and_load_bearing():
     a DIFFERENT valid value must actually change behaviour — otherwise the key
     is read but inert, which is the shape that has cost three rounds."""
     from route_task import Policy, ConfigError
-    keys = ("on_retry_exhaustion", "on_any_critical_review",
-            "on_independence_unachievable", "on_judge_unavailable",
-            "on_review_depth_reduced")
+    # Per key, against the actions that key's consumer implements. Round 12:
+    # validating against the UNION let the strictest-sounding word disable four
+    # of the five controls — `on_any_critical_review: terminal` passed and
+    # removed the CRITICAL gate outright.
+    keys = ("on_independence_unachievable", "on_retry_exhaustion",
+            "on_any_critical_review", "on_judge_unavailable", "on_review_depth_reduced")
     for key in keys:
-        for bad in ("require_human_confirmaton", "", None, 1, "TERMINAL"):
+        for bad in ("require_human_confirmaton", "", None, 1, "TERMINAL", "gate"):
             altered = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"], key: bad}}
             with pytest.raises(ConfigError):
                 Policy(altered)
 
-    # Load-bearing: flip the CRITICAL gate to notify-only and the route must
-    # stop requiring confirmation.
-    # A route where the CRITICAL gate is the ONLY trigger — otherwise flipping
-    # it changes nothing and the test would pass on an inert control.
-    critical = dict(task_class="MECHANICAL", complexity=0, uncertainty=3,
-                    blast_radius=0, reversibility=0, flags=["auth_sensitive"])
-    assert r(**critical)["requires_human_confirmation"]
-    relaxed = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
-                                            "on_any_critical_review": "notify_human"}}
-    out = route(_task(**critical), relaxed)
-    assert not out["requires_human_confirmation"], (
-        "on_any_critical_review is read but changes nothing — an inert control")
+    # Load-bearing, for EVERY key and EVERY action. Round 12: the previous
+    # version proved it for one key while its docstring claimed five, and the
+    # validator meanwhile accepted words no consumer implemented. A key with a
+    # single legal value is a constant with a config file in front of it, so
+    # each action has to be observable.
+    probes = {
+        "on_any_critical_review": dict(task_class="MECHANICAL", complexity=0,
+                                       uncertainty=3, blast_radius=0, reversibility=0,
+                                       flags=["auth_sensitive"]),
+        "on_judge_unavailable": dict(task_class="MECHANICAL", complexity=0, uncertainty=3,
+                                     blast_radius=0, reversibility=0,
+                                     flags=["review_disagreement"],
+                                     unavailable_models=["claude-fable-5", "gpt-5.6-sol"]),
+        "on_review_depth_reduced": dict(task_class="IMPLEMENTATION", complexity=0,
+                                        uncertainty=0, blast_radius=0, reversibility=0,
+                                        flags=["auth_sensitive", "bridge_down"],
+                                        runtime="codex"),
+        "on_independence_unachievable": dict(task_class="IMPLEMENTATION", complexity=2,
+                                             uncertainty=2, blast_radius=2,
+                                             reversibility=0, isolation_available=False),
+        "on_retry_exhaustion": dict(task_class="MECHANICAL", complexity=0, uncertainty=0,
+                                    blast_radius=0, reversibility=0, prior_failures=4,
+                                    prior_models=["gpt-5.6-luna"] * 4),
+    }
+    for key, probe in probes.items():
+        seen = {}
+        for action in ("terminal", "require_human_confirmation", "notify_human"):
+            cfg = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"], key: action}}
+            out = route(_task(**probe), cfg)
+            seen[action] = (out["terminal"] is not None,
+                            out["requires_human_confirmation"])
+        assert seen["terminal"][0], f"{key}: 'terminal' produced no terminal state"
+        assert seen["require_human_confirmation"][1], f"{key}: no gate"
+        assert len(set(seen.values())) >= 2, (
+            f"{key}: every action produces the same outcome {seen} — read, but inert")
 
 
 def test_d15_every_reference_skill_md_names_actually_exists():

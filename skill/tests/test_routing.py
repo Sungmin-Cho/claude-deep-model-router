@@ -87,19 +87,23 @@ def test_s3_complex_multi_file_feature():
 
 
 def test_s4_failed_worker_escalates_rather_than_retrying():
+    # Round 12: `--prior-models` takes concrete model ids now. A role alias does
+    # not say which model held that seat on the attempt that failed, and five
+    # rounds of trying to infer it produced five different defects, so the
+    # router asks instead. The scenario is unchanged — a failed worker escalates.
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    failed = CFG["models"][CFG["role_bindings"]["default"]["worker_fast"]]["id"]
     out = r(
         task_class="IMPLEMENTATION",
         complexity=1, uncertainty=1, blast_radius=1,
         prior_failures=1,
-        prior_models=["worker_fast"],
+        prior_models=[failed],
     )
     # On the model, not the label. Round 8: excluding the failed model already
     # moves `worker_fast` onto `claude-sonnet-5` — the very model
     # `worker_balanced` would have supplied — so the role-label assertion failed
     # on a route that satisfies this test's own intent exactly. What §S4
     # requires is that the retry does not re-run what failed and is stronger.
-    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
-    failed = CFG["models"][CFG["role_bindings"]["default"]["worker_fast"]]["id"]
     assert out["selected_model"] != failed
     assert tier[out["selected_model"]] > tier[failed]
     assert any("capability tier" in n for n in out["notes"]), out["notes"]

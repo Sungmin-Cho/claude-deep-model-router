@@ -144,17 +144,26 @@ class Policy:
         # `apply_overrides` in this same file already refuses an unknown effect
         # key for exactly this reason; being strict there and lax here is the
         # asymmetry that turns a safety rule into decoration.
-        actions = {"terminal", "require_human_confirmation", "notify_human"}
-        for key in ("on_retry_exhaustion", "on_any_critical_review",
-                    "on_independence_unachievable", "on_judge_unavailable",
-                    "on_review_depth_reduced"):
+        # Per key, against the actions THAT KEY'S CONSUMER IMPLEMENTS — not a
+        # union of every word the vocabulary contains. Round 12: validating
+        # against the union let the strictest-sounding word disable four of the
+        # five controls. `on_any_critical_review: terminal` passed validation
+        # and removed the CRITICAL gate entirely; `on_independence_unachievable:
+        # require_human_confirmation` removed both the terminal AND the gate.
+        # The error message promised the opposite of what the check did.
+        implemented = {"terminal", "require_human_confirmation", "notify_human"}
+        for key, allowed in ((k, implemented) for k in (
+                "on_independence_unachievable", "on_retry_exhaustion",
+                "on_any_critical_review", "on_judge_unavailable",
+                "on_review_depth_reduced")):
             if key not in cfg["human_in_the_loop"]:
                 raise ConfigError(f"human_in_the_loop is missing {key!r}")
             value = cfg["human_in_the_loop"][key]
-            if value not in actions:
+            if value not in allowed:
                 raise ConfigError(
-                    f"human_in_the_loop.{key} = {value!r} is not one of {sorted(actions)}; "
-                    f"an unrecognised action would silently disable the control it names")
+                    f"human_in_the_loop.{key} = {value!r}; this router implements "
+                    f"{sorted(allowed)} for that key. A word it does not implement "
+                    f"reads as policy and disables the control it names.")
 
         gate = cfg["human_in_the_loop"]["human_gate_exit_status"]
         # Process exit status is truncated to eight bits, so 256 is 0 — a
@@ -479,37 +488,6 @@ def apply_overrides(task: Task, band: str, policy: Policy) -> tuple[str, list[st
 # Stage 4 — worker
 # --------------------------------------------------------------------------
 
-def _failed_tier(task: Task, policy: Policy, resolver: "Resolver") -> int | None:
-    """The capability tier of the strongest model that ALREADY FAILED.
-
-    Three spellings of "what ran" have now been tried, and only the third is
-    right, so the reasoning is worth keeping:
-
-    * `resolver.peek(role)` is the REPLACEMENT — the failure is already in
-      `unusable` by the time this is asked. Using it inflated the floor and
-      declared exhaustion on the simplest documented retry (round 8).
-    * the binding's nominal model is what the role would hold if nothing were
-      scarce. But if that model was already in the caller's `unavailable_models`
-      on the previous attempt, the role fell back and ran something else —
-      typically STRONGER — so the floor came out too low and the retry
-      re-emitted the exact model that had just failed (round 9).
-    * the candidate ladder, filtered by what the caller withheld and nothing
-      else, is what that role actually held when it ran. That is this.
-
-    A concrete model id needs none of it and is read directly; callers that can
-    supply one should, because it is the only spelling that carries no
-    inference at all.
-    """
-    tiers = []
-    for item in task.prior_models:
-        if item in policy.model_ids:
-            tiers.append(policy.tier_of[item])
-            continue
-        if (held := resolver.held_by(item)):
-            tiers.append(policy.tier_of[held])
-    return max(tiers) if tiers else None
-
-
 def _promote_above(floor: int, policy: Policy, resolver: "Resolver") -> str | None:
     """The weakest role whose RESOLVED model outranks `floor`.
 
@@ -526,8 +504,6 @@ def _promote_above(floor: int, policy: Policy, resolver: "Resolver") -> str | No
     removing policy that changes nothing while reading as protective, and
     adding some in the same breath would be worse than the defect.
 
-    What actually mitigates a history that cannot be verified is the human gate
-    on `retry_history_inferred`, not an exclusion that never excludes.
     """
     def tier(role):
         model = resolver.peek(role)
@@ -537,34 +513,9 @@ def _promote_above(floor: int, policy: Policy, resolver: "Resolver") -> str | No
     return min(stronger, key=lambda r: (tier(r), policy.roles.index(r)), default=None)
 
 
-def _base_worker(task: Task, band: str, policy: Policy,
-                 resolver: "Resolver") -> tuple[str, "Resolver"]:
-    """The worker this task would get with no prior failures, and the resolver
-    that would have bound it.
-
-    Computed by running selection again at `prior_failures = 0`, not by
-    capturing a variable partway down the promotion chain. Round 11 found the
-    capture placed above two promotions that are NOT keyed on `prior_failures`
-    (INVESTIGATION's, and the critical-domain floor), so the reconstruction's
-    base was a role the task never actually started from and a `pf=1` retry
-    re-dispatched the model `pf=0` had just run. The comment claiming "the
-    lines above are pf-independent" was false when it was written; a position
-    in a function is not a property, and it cannot be asserted. This can:
-    `test_d15_the_reconstruction_base_is_the_pf_zero_route` checks it over the
-    whole class x band x flag space.
-    """
-    # A clean resolver as well as a clean task: the caller's resolver already
-    # has the prior failures in `unusable`, so asking it what attempt 1 held
-    # returns attempt 1's REPLACEMENT. That is the same confusion, one level
-    # up, that `held_by` exists to prevent — and it inflated the reconstructed
-    # base by a tier, turning a valid retry into a false exhaustion.
-    clean = replace(task, prior_failures=0, prior_models=[])
-    return select_worker(clean, band, policy, Resolver(clean, policy))[0], Resolver(clean, policy)
-
-
 def select_worker(task: Task, band: str, policy: Policy,
                   resolver: "Resolver") -> tuple[str, list[str], bool, bool]:
-    """Returns (worker, notes, ceiling_exhausted, retry_history_inferred)."""
+    """Returns (worker, notes, ceiling_exhausted, retry_history_missing)."""
     binding = resolver.binding
     cfg = policy.cfg
     notes: list[str] = []
@@ -630,83 +581,63 @@ def select_worker(task: Task, band: str, policy: Policy,
             # which asserts the dispatched tier rather than this note.
 
     ceiling_exhausted = False
-    inferred = False
+    history_missing = False
     if task.prior_failures >= 1:
-        # One rule for both branches, on one axis. When the caller named what
-        # failed, the floor is that model's tier. When it did not, the floor is
-        # the tier this task would have been routed to anyway — which is what
-        # the previous attempt ran. The unnamed branch used to climb the role
-        # ladder blindly and, under scarcity, landed a tier BELOW where it
-        # started while recording an escalation.
-        named_floor = _failed_tier(task, policy, resolver)
-        # History is COMPLETE only when every failure is accounted for by a
-        # concrete model id. Round 11: `prior_models=["luna"]` with
-        # `prior_failures=2` was read as exact because its one entry was
-        # concrete, so the floor stayed at luna's tier and the retry re-emitted
-        # the model attempt 2 had just run — ungated, at exit 0. Both numbers
-        # are inputs; comparing them is all it takes to notice.
-        complete = (named_floor is not None
-                    and len(task.prior_models) >= task.prior_failures
-                    and all(m in policy.model_ids for m in task.prior_models))
-        inferred = not complete
-        floor = named_floor if named_floor is not None else -1
-        if not complete:
-            # Nothing was named. The previous attempt ran wherever this task
-            # routes to — and, since this function produced that route too, the
-            # attempt before it ran one promotion lower, and so on. Round 9
-            # found the earlier version flat in `prior_failures`: it recomputed
-            # the BASE tier every call, so attempts 3, 4 and 5 all re-dispatched
-            # the model attempt 2 had just run while the note claimed an
-            # escalation and the route stayed dispatchable at exit 0. The
-            # magnitude has to be walked back, because `route()` is stateless
-            # and `prior_failures` is the only record of it that exists.
-            # Whatever the caller told us, reconstruct the ladder the router
-            # itself would have walked and take the stronger of the two floors.
-            # A partial history is a lower bound, not a fact.
-            base_role, base_resolver = _base_worker(task, band, policy, resolver)
-            base = base_resolver.peek(base_role)
-            recon = policy.tier_of[base] if base else -1
-            for _ in range(task.prior_failures - 1):
-                step = _promote_above(recon, policy, base_resolver)
-                if step is None:
-                    break
-                recon = policy.tier_of[base_resolver.peek(step)]
-            floor = max(floor, recon)
-
-        # No "the worker already resolves above the floor, keep it" shortcut.
-        # It looked like a saving and was the hole both round-11 Criticals came
-        # through: `current` is often exactly the model the previous attempt
-        # ran, so accepting it re-dispatched a known failure while the note
-        # reported an escalation past a tier nothing had run at.
-        if True:
-            promoted = _promote_above(floor, policy, resolver)
-            if promoted is None:
-                # Exhaustion is terminal in both spellings, but it says which
-                # it is. Round 10 rejected an earlier version of this branch
-                # because the tier it claimed nothing could beat had been
-                # invented by a mis-counted reconstruction; that arithmetic is
-                # fixed above, so the claim is now well-founded. What it still
-                # cannot be is *observed* — hence the wording, and hence the
-                # human gate on every inferred retry.
-                #
-                # The alternative considered and rejected: emit the strongest
-                # model still unused. It is a real option, but every one of
-                # them is weaker than the attempt that just failed, and a route
-                # that regresses in strength while calling itself a retry is
-                # the shape this module spends its whole length refusing.
-                ceiling_exhausted = True
-                notes.append(
-                    f"retry ladder exhausted: no usable model is stronger than "
-                    f"capability tier {floor}"
-                    + ("" if complete else " (reconstructed: the caller did not "
-                                           "account for every prior failure)"))
-            else:
-                notes.append(f"escalated above capability tier {floor}"
-                             + ("" if complete else
-                                f" (reconstructed from {task.prior_failures} failure(s))"))
+        # The router does not reconstruct its own history. It asks for it.
+        #
+        # Rounds 8 through 12 each produced a Critical here, each in a DIFFERENT
+        # reading of the same unknowable — `peek` (returns the replacement), the
+        # nominal binding (misses a fallback), the candidate ladder (missed a
+        # withholding channel), a base captured by position (missed two
+        # promotions), and then the consumer of the floor rather than the floor
+        # itself (a retry weaker than the first attempt, at exit 0). Five
+        # readings, five defects, one radius. All three reviewers of round 12
+        # independently recommended deleting the mechanism instead of reading it
+        # a sixth way, and the decisive argument is internal: this module
+        # already concedes that attempt history belongs to the caller —
+        # `retry.same_model_same_effort` and its siblings are documented as
+        # "budget for the CALLING agent's loop; one route() call cannot count
+        # attempts". Reconstructing WHICH MODELS those uncounted attempts ran is
+        # the same claim it declined to make, one field over.
+        #
+        # Disclosing the guess and gating it on a human was the previous answer.
+        # It asked a person to validate a reconstruction they have no better
+        # information about than the router did, which is this module's own
+        # definition of disclosure standing in for a control.
+        #
+        # So: one concrete model id per prior failure, or no route. The caller
+        # always has them — it just dispatched them, and `selected_model` is in
+        # every route this script emits.
+        concrete = [m for m in task.prior_models if m in policy.model_ids]
+        if len(concrete) != task.prior_failures or len(concrete) != len(task.prior_models):
+            history_missing = True
+            notes.append(
+                f"retry history required: {task.prior_failures} prior failure(s) but "
+                f"{len(concrete)} concrete model id(s) supplied"
+                + (" (role aliases do not identify what ran)"
+                   if len(concrete) != len(task.prior_models) else "")
+                + " — pass --prior-models with one model id per failure")
+        else:
+            floor = max(policy.tier_of[m] for m in concrete)
+            current = resolver.peek(worker)
+            if current is not None and policy.tier_of[current] > floor:
+                # Already stronger than everything that failed. `_promote_above`
+                # returns the WEAKEST role above the floor, so taking it here
+                # could only move the route down — which round 12 caught doing
+                # exactly that: a task whose table selection was tier 2 came
+                # back at tier 1 after one tier-0 failure, called an escalation,
+                # at exit 0. Evidence of difficulty must never weaken a route.
+                notes.append(f"retry keeps {worker}: already above the failed "
+                             f"capability tier {floor}")
+            elif (promoted := _promote_above(floor, policy, resolver)) is not None:
+                notes.append(f"escalated above capability tier {floor}")
                 worker = promoted
+            else:
+                ceiling_exhausted = True
+                notes.append(f"retry ladder exhausted: no usable model is stronger "
+                             f"than capability tier {floor}")
 
-    return worker, notes, ceiling_exhausted, inferred
+    return worker, notes, ceiling_exhausted, history_missing
 
 
 # --------------------------------------------------------------------------
@@ -1211,7 +1142,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     band = band_from_score(risk_score, policy)
     band, overrides, redundant_overrides, route_path = apply_overrides(task, band, policy)
 
-    worker, worker_notes, ceiling_exhausted, inferred_history = \
+    worker, worker_notes, ceiling_exhausted, history_missing = \
         select_worker(task, band, policy, resolver)
     effort, effort_notes = select_effort(task, band, policy)
     disagreement = cfg["review"]["disagreement"]
@@ -1430,79 +1361,73 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     review_independence = independence(review, task)
     judge = judge_role
 
-    terminal = None
     band_requires_independence = bool(
         cfg["review"][review["band"]].get("independent", False))
-    unachievable = cfg["human_in_the_loop"]["on_independence_unachievable"]
-    if (band_requires_independence and review_independence == "unavailable"
-            and unachievable == "terminal"):
-        # The caller stated positively that isolation cannot be achieved here,
-        # and THE BAND requires it. The band's own spec, not `review`'s flag:
-        # the architect-downgrade compensation sets that flag at any band, so
-        # keying off it terminated LOW routes because a *bonus* second review
-        # could not be isolated — a compensation punishing the caller for its
-        # own best effort. That is `on_independence_unachievable`,
-        # which the policy calls terminal — the review cannot be run as
-        # specified, so there is nothing safe to dispatch. It was previously
-        # emitted as an ordinary route at exit 0, which made the exhaustiveness
-        # claim in SKILL.md ("every outcome needing a person is nonzero")
-        # false, and left `unavailable` answering the same as `degraded` after
-        # the policy went to the trouble of distinguishing them.
-        terminal = "INDEPENDENCE_UNAVAILABLE"
-    elif (band_requires_independence and review.get("independence_compromised")
-          and unachievable == "terminal"):
-        # THE BAND asked for independent review and no assignment of distinct
-        # models could provide it. Same correction as the branch above: the
-        # route-level flag is set by the architect compensation at any band, so
-        # keying off it let a bonus reviewer's collision terminate a LOW route. Emitting a dispatchable route here would
-        # hand back reviewers that are the implementer wearing another label,
-        # with a boolean alongside saying so — disclosure standing in for a
-        # control. There is no safe route to emit, so none is.
-        terminal = "INDEPENDENCE_UNAVAILABLE"
-    elif (task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]
-          and cfg["human_in_the_loop"]["on_retry_exhaustion"] in
-          ("notify_human", "require_human_confirmation")):
-        terminal = "HUMAN_REQUIRED"
-    elif ceiling_exhausted:
-        terminal = "HUMAN_REQUIRED"
-    elif confidence < cfg["router"]["confidence"]["escalate_below"]:
-        terminal = "ESCALATE_ROUTING"
 
-    # The router cannot verify where an isolation receipt came from. It is a
-    # caller-supplied string; nothing here binds it to an actual dispatch, to
-    # this route, or to a particular reviewer. Letting it clear the CRITICAL
-    # gate would make the strongest control in the policy forgeable by typing.
-    # So CRITICAL always asks a human, and `enforced` reports what the caller
-    # claims without acting on it as proof.
-    # Read from the policy rather than restated here. Round 10's instrumented
-    # config test showed every one of these keys being declared and never read:
-    # the behaviours were right and hardcoded, which is the same "two places
-    # holding one rule" the config header forbids, and it meant editing the
-    # policy changed nothing.
+    # One dispatcher over the configured actions, instead of five hand-written
+    # comparisons. Round 12 found those comparisons validated against a UNION of
+    # the vocabulary while each consumer implemented one word of it, so the
+    # strictest-sounding value silently removed the control — and a key with
+    # exactly one implemented value is not configuration at all, it is a
+    # constant with a config file in front of it. Every action is implemented
+    # here, so every key genuinely selects behaviour and a test can prove it.
+    #
+    # `band_requires_independence` is the BAND's spec, not `review`'s flag: the
+    # architect compensation sets that flag at any band, and keying off it let a
+    # *bonus* reviewer's isolation gap terminate a LOW route.
     hitl = cfg["human_in_the_loop"]
-    gate = "require_human_confirmation"
-    requires_human = bool(
-        terminal
-        or (review["band"] == "CRITICAL" and hitl["on_any_critical_review"] == gate)
-        # Disclosure is not a control. A route whose reviewers could not be
-        # given distinct models is one where the implementer reviews itself;
-        # emitting it as dispatchable and hoping the consumer reads a boolean
-        # is exactly the false-assurance shape this policy exists to avoid.
-        or review.get("independence_compromised")
-        or (review.get("judge_unavailable") and hitl["on_judge_unavailable"] == gate)
-        # A review staffed below its band is a weaker review than the risk
-        # score asked for. The router cannot restore the depth, so it stops
-        # pretending the band was met and hands the trade-off to a human.
-        or (review.get("review_depth_reduced") and hitl["on_review_depth_reduced"] == gate)
-        # The retry floor came from an inference, not from a model id the
-        # caller observed run. `route()` is stateless while the retry rule is
-        # historical, so the router reconstructs that history from the state it
-        # can see now — and availability can have changed since. The
-        # reconstruction is the best available evidence and it is not proof, so
-        # it is disclosed and gated rather than acted on silently. Pass a
-        # concrete `--prior-models <id>` and this does not fire.
-        or inferred_history
-    )
+    controls = [
+        ("on_independence_unachievable",
+         band_requires_independence and (review_independence == "unavailable"
+                                         or review.get("independence_compromised")),
+         "INDEPENDENCE_UNAVAILABLE",
+         "the band requires independent review and it cannot be provided"),
+        ("on_retry_exhaustion",
+         task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"],
+         "HUMAN_REQUIRED", "the retry budget is spent"),
+        ("on_any_critical_review", review["band"] == "CRITICAL",
+         "HUMAN_REQUIRED", "a CRITICAL review cannot be accepted automatically"),
+        ("on_judge_unavailable", bool(review.get("judge_unavailable")),
+         "HUMAN_REQUIRED", "no adjudicator is available"),
+        ("on_review_depth_reduced", bool(review.get("review_depth_reduced")),
+         "HUMAN_REQUIRED", "the review is staffed below its band"),
+    ]
+
+    terminal = None
+    requires_human = False
+    for key, fired, terminal_name, why in controls:
+        if not fired:
+            continue
+        action = hitl[key]
+        if action == "terminal":
+            terminal = terminal or terminal_name
+        elif action == "require_human_confirmation":
+            requires_human = True
+        else:                                    # notify_human
+            effort_notes.append(f"{key}: {why} — proceeding without a gate, per policy")
+
+    # Outcomes the config does not govern: these are properties of the route,
+    # not policy choices.
+    if terminal is None:
+        if history_missing:
+            # Not `ValidationError`: the input is well-formed, the evidence is
+            # incomplete. Terminal already means "no executable bindings, a
+            # human takes over", and the note names exactly what to supply.
+            terminal = "RETRY_HISTORY_REQUIRED"
+        elif ceiling_exhausted:
+            terminal = "HUMAN_REQUIRED"
+        elif confidence < cfg["router"]["confidence"]["escalate_below"]:
+            terminal = "ESCALATE_ROUTING"
+
+    # A terminal outcome always needs a person, whatever the controls above
+    # decided — including the ones the config set to `notify_human`.
+    requires_human = bool(terminal) or requires_human
+
+    # The router cannot verify where an isolation receipt came from: it is a
+    # caller-supplied string bound to no dispatch, so `enforced` reports what
+    # the caller claims and unlocks nothing. That is why the CRITICAL control
+    # above keys on the band and never on the receipt — making the strongest
+    # gate in the policy openable by typing is the failure this skill is about.
 
     # A terminal route emits no execution bindings at all. Nulling only the
     # worker left a consumer able to dispatch the reviewers from a route the
@@ -1564,7 +1489,6 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "unavailable_models": sorted(resolver.blocked),
         "excluded_prior_failures": sorted(resolver.failed),
         "excluded_as_ambiguous_alias": sorted(resolver.ambiguous),
-        "retry_history_inferred": bool(inferred_history),
         "escalation_count": task.prior_failures,
         "retry_count": task.prior_failures,
         "routing_confidence": confidence,
@@ -1778,9 +1702,7 @@ def _print_text(r: dict) -> None:
     if r["excluded_prior_failures"]:
         print(f"excluded:    {r['excluded_prior_failures']} (already failed)")
     print(f"confidence:  {r['routing_confidence']}")
-    if r["retry_history_inferred"]:
-        print("retry history: RECONSTRUCTED — pass --prior-models <model-id> for every "
-              "prior failure to route this automatically")
+
     if r["requires_human_confirmation"]:
         print("human:       CONFIRMATION REQUIRED")
     if r["notes"]:

@@ -50,38 +50,30 @@ require_new_evidence_on_same_tier: true    # "tier" = capability_tier of the
 
 ### Which model "ran"
 
-Three spellings have been tried and only the third is right:
+The router does not work this out. It requires the caller to say.
 
-* **what the role resolves to now** — wrong. The failure is already excluded by
-  then, so this reads its *replacement*; used as the floor it inflated the
-  requirement and declared exhaustion while an untried stronger model was free.
-* **the role's nominal binding** — wrong. If that model was already withheld on
-  the previous attempt, the role fell back and ran something else, usually
-  stronger; the floor came out too low and the retry re-emitted the exact model
-  that had just failed, recorded as an escalation.
-* **the role's candidate ladder filtered by what the caller withheld, and
-  nothing else** — right. That is what the role held when it ran.
+Three readings were tried and each was wrong in a different way: what the role
+resolves to *now* (the failure is excluded by then, so that is its replacement);
+the role's nominal binding (if that model was withheld, the role fell back and
+ran something else); and the candidate ladder (which missed one of the caller's
+two withholding channels). Two further attempts to reconstruct the ladder from
+`prior_failures` alone were wrong again — once by counting a promotion twice,
+once by reading a partial history as complete.
 
-A concrete model id in `--prior-models` skips all of it, which is why callers
-that can supply one should. With no prior model named at all, the router walks
-its own ladder back `prior_failures - 1` steps from the **`prior_failures`-independent**
-base: it produced those attempts, so it can reconstruct them — and it must,
-because `route()` is stateless and `prior_failures` is the only record of the
-history that exists. Reconstructing from today's base instead double-counts any
-promotion that is itself keyed on `prior_failures` (DEBUGGING with
-`unknown_root_cause` promotes at 2+), which produced a false "nothing is
-stronger" at a tier the reconstruction had invented.
+The reason is structural, not a run of bad luck: `route()` is stateless while
+this rule is historical, and availability can change between attempts, so no
+amount of care recovers a fact the function cannot see. This policy already
+conceded the same point one field over — `same_model_same_effort` and its
+siblings are the *caller's* budgets, because one `route()` call cannot count
+attempts. Reconstructing which models those uncounted attempts ran is the same
+claim, and it does not become true by being disclosed.
 
-### What an inference costs
-
-Anything other than a concrete model id makes the route's floor an inference,
-and the route says so: `retry_history_inferred: true`, and human confirmation is
-required. Two things the router cannot see justify that gate — the role may have
-held a fallback rather than its nominal binding, and **availability can have
-changed between attempts**, so a model the reconstruction places at tier 1 may
-in fact have been tier 2. Neither is recoverable statelessly. The gate is the
-honest response: the route is still emitted, and a person decides whether the
-reconstruction is good enough for this change.
+So `--prior-failures N` requires `--prior-models` to carry **N concrete model
+ids**, repeating one that legitimately failed more than once. A role alias does
+not identify a model; a short list is not a history. Anything else is
+`RETRY_HISTORY_REQUIRED`: terminal, no bindings, and a note naming what to
+supply. The caller has the ids — every route this router emits contains
+`selected_model`.
 
 **A second attempt at the same tier must carry a changed hypothesis or new
 evidence.** Without one, the attempt is not permitted and the router must
