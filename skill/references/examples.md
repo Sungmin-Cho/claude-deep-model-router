@@ -187,11 +187,13 @@ note: escalated above capability tier 0
 Without the failure this routes to `worker_fast`. With it, the router refuses
 to hand the task back to the capability tier that already failed.
 
-**This escalation now fires even when no model was named.** It used to require
-`prior_models` and silently lapse without it — the loop-prevention control
-switching itself off on a missing optional field, exactly when it mattered.
-`--prior-models` also accepts concrete model ids now, since `selected_model` is
-emitted as an id and feeding it back has to work.
+**The escalation requires the history.** `--prior-failures 1` on its own — or
+with a role alias, or with the wrong number of ids — is
+`RETRY_HISTORY_REQUIRED`: terminal, no bindings, exit 1, with a note naming what
+to pass. Five rounds of inferring which model a previous attempt ran produced
+five different defects, so the router asks the one party that knows. Feed back
+the `selected_model` of each failed attempt — it is already in the route you
+dispatched from.
 
 ---
 

@@ -102,15 +102,26 @@ RUNTIMES = ["claude_code", "codex"]
 # retry-escalation branch — where a role moved up while the resolved model
 # stayed at the same capability tier — was never entered by any of the 8,712
 # routes. Half a dimension is not a dimension.
-PRIOR_FAILURES = [0, 1, 2]
-
-PRIOR = [
-    [],
-    ["senior_engineer"],
-    ["worker_fast", "worker_balanced"],
-    [MODEL_IDS[2]],
-    [MODEL_IDS[0], MODEL_IDS[4]],
+# Round 13: `PRIOR` and `PRIOR_FAILURES` used to be independent dimensions, and
+# making an unusable history terminal turned 10 of their 15 combinations into
+# routes that emit no bindings at all. Every seat invariant below opens with
+# `if out["terminal"]: continue`, so two thirds of this sweep's population
+# vanished while all 131 tests stayed green — the exact failure mode this file
+# exists to prevent, caused by the round that deleted the mechanism.
+#
+# They are chosen as a PAIR now, so each entry is a history that is valid by
+# construction, plus two deliberately invalid ones to keep the terminal path
+# populated. `test_the_sweep_reaches_enough_retry_routes` guards the ratio.
+PRIOR_HISTORY = [
+    ([], 0),
+    ([MODEL_IDS[2]], 1),
+    ([MODEL_IDS[0], MODEL_IDS[4]], 2),
+    ([MODEL_IDS[2], MODEL_IDS[2]], 2),
+    ([MODEL_IDS[6]], 1),
+    (["senior_engineer"], 1),            # invalid on purpose: alias
+    ([], 2),                             # invalid on purpose: unaccounted failures
 ]
+
 
 
 _WITHHELD = 0
@@ -120,8 +131,8 @@ TASKS: list = []
 def _routes():
     """Every reachable route. Terminal ones are yielded too — several
     invariants are specifically about what a terminal route must withhold."""
-    for task_class, dims, flags, runtime, scarce, prior, failures in itertools.product(
-        TASK_CLASSES, DIMENSIONS, FLAG_SETS, RUNTIMES, SCARCITY, PRIOR, PRIOR_FAILURES
+    for task_class, dims, flags, runtime, scarce, (prior, failures) in itertools.product(
+        TASK_CLASSES, DIMENSIONS, FLAG_SETS, RUNTIMES, SCARCITY, PRIOR_HISTORY
     ):
         c, u, b, rev = dims
         try:
@@ -174,7 +185,7 @@ def test_the_sweep_is_large_and_reaches_the_interesting_states():
     invariants were false."""
     all_routes = routes()
     product = len(TASK_CLASSES) * len(DIMENSIONS) * len(FLAG_SETS) * len(RUNTIMES) \
-        * len(SCARCITY) * len(PRIOR) * len(PRIOR_FAILURES)
+        * len(SCARCITY) * len(PRIOR_HISTORY)
     # Computed, not a magic threshold: `> 5000` would still have passed with
     # 97% of the sweep gone. Withheld routes are a correct outcome, but they
     # are bounded — if most of the space starts failing closed, that is a
@@ -204,6 +215,25 @@ def test_the_sweep_is_large_and_reaches_the_interesting_states():
     assert not missing, f"the sweep never reached: {missing}"
 
 
+def test_the_sweep_reaches_enough_retry_routes():
+    """Round 13. The counts above are all `> 0`, which a surviving third
+    satisfies. When an unusable retry history became terminal, two thirds of
+    this sweep stopped filling a seat and every invariant guarded by
+    `if terminal: continue` quietly lost its population — with the suite green.
+    A ratio is what notices that; a presence check is not."""
+    all_routes = routes()
+    retried = [o for o in all_routes
+               if not o["terminal"] and any("capability tier" in n for n in o["notes"])]
+    blocked = [o for o in all_routes if o["terminal"] == "RETRY_HISTORY_REQUIRED"]
+    assert len(retried) > len(all_routes) * 0.10, (
+        f"only {len(retried)}/{len(all_routes)} routes actually take the retry "
+        f"branch; the seat invariants are running on a shrunken population")
+    assert blocked, "no route exercises the retry-history terminal"
+    assert len(blocked) < len(all_routes) * 0.40, (
+        f"{len(blocked)}/{len(all_routes)} routes are terminal for want of a "
+        f"history; the sweep is measuring the guard, not the router")
+
+
 def test_every_swept_dimension_reaches_the_router():
     """The generalisation of the round-6 failure, corrected in round 7.
 
@@ -230,8 +260,8 @@ def test_every_swept_dimension_reaches_the_router():
         "flags": len({tuple(f) for f in FLAG_SETS}),
         "runtime": len(set(RUNTIMES)),
         "unavailable_models": len({tuple(s) for s in SCARCITY}),
-        "prior_models": len({tuple(p) for p in PRIOR}),
-        "prior_failures": len(set(PRIOR_FAILURES)),
+        "prior_models": len({tuple(p) for p, _ in PRIOR_HISTORY}),
+        "prior_failures": len({f for _, f in PRIOR_HISTORY}),
     }
     for field, seen in observed.items():
         assert len(seen) == expected[field], (
@@ -362,7 +392,7 @@ def test_bridge_down_never_names_an_unreachable_family():
 # Fields that legitimately name a model on a terminal route: they echo what the
 # CALLER supplied or withheld, and are not bindings anyone could dispatch.
 _ECHOES_CALLER_INPUT = (
-    "unavailable_models", "excluded_prior_failures", "excluded_as_ambiguous_alias",
+    "unavailable_models", "excluded_prior_failures",
 )
 
 

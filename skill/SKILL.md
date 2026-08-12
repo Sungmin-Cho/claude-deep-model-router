@@ -418,7 +418,7 @@ reasoning_centric:
 risk_score:  risk_band:   band_overrides_applied: []   critical_flags: []
 band_overrides_redundant: []   # fired, but another rule had already got there
 route_path:                    # null, or "disagreement"
-terminal:                      # null, HUMAN_REQUIRED, or ESCALATE_ROUTING
+terminal:                      # null, or one of the four in the table above
 selected_role:  selected_model:  selected_effort:  selected_effort_native:
 review:
   band:  reviewers: []  reviewer_models: []  effort:
@@ -438,9 +438,6 @@ fallbacks_applied: []          # only recorded when the model actually changed
 fallback_compensations_applied: []
 unavailable_models: []
 excluded_prior_failures: []    # models withheld because they already failed
-excluded_as_ambiguous_alias: []# withheld because a role alias spans bindings; these did not run
-retry_history_inferred:        # the retry floor came from an inference, not
-                               # from a model id the caller observed run
 escalation_count:  retry_count:
 routing_confidence:
 requires_human_confirmation:

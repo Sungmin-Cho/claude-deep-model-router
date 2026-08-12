@@ -42,6 +42,13 @@ from typing import Any
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "model-routing.yaml"
 
+# Every terminal this router can emit. Named here so documentation tests can
+# assert the set rather than a sample of it.
+TERMINAL_STATES = (
+    "HUMAN_REQUIRED", "ESCALATE_ROUTING", "INDEPENDENCE_UNAVAILABLE",
+    "RETRY_HISTORY_REQUIRED",
+)
+
 MAX_PROMOTION_PASSES = 4   # bounded fixed point; the band ladder is only 4 deep
 
 
@@ -291,8 +298,9 @@ class Task:
                                frozenset(policy.roles), "role")
         self._require_str_list("unavailable_models", self.unavailable_models,
                                policy.model_ids, "model id")
-        # prior_models accepts a role alias or a concrete model id, because
-        # selected_model is emitted as an id and feeding it back must work.
+        # An alias is accepted by validation and refused by `history_gap`, so
+        # the caller gets an actionable terminal naming the flag rather than a
+        # usage error. What it must never do is reach resolution.
         self._require_str_list("prior_models", self.prior_models,
                                frozenset(policy.roles) | policy.model_ids, "role or model id")
         if self.implementation_role is not None:
@@ -368,28 +376,18 @@ class Task:
                 out.extend(r for r, k in binding.items() if k == key and r in policy.roles)
         return out
 
-    def failed_and_ambiguous(self, policy: Policy, resolver: "Resolver") -> tuple[set[str], set[str]]:
-        """(models that demonstrably failed, models excluded only as ambiguous).
+    def failed_models(self, policy: Policy) -> set[str]:
+        """The models that already failed, as concrete ids.
 
-        Excluding every binding's reading of a role alias is the safe choice —
-        under-exclusion re-runs a known failure. But reporting all of them as
-        "already failed" states something untrue about models that never ran,
-        which is the reporting-layer version of the defect this module is
-        built to avoid. The two sets are kept apart so the caution stays and
-        the claim stays accurate.
+        Round 13 removed the alias half of this. `prior_models` only reaches
+        resolution when `history_gap` passed, and that requires every entry to
+        be a concrete id — so the branch that resolved an alias to "the model it
+        probably held", along with the `excluded_as_ambiguous_alias` field it
+        fed, became unreachable the moment the router stopped inferring history.
+        Leaving them would have been a permanently-empty field and a dead
+        inference, which is the shape this artifact keeps having to delete.
         """
-        failed: set[str] = set()
-        ambiguous: set[str] = set()
-        for item in self.prior_models:
-            if item in policy.model_ids:
-                failed.add(item)
-                continue
-            if (actual := resolver.held_by(item)):
-                failed.add(actual)
-            for candidate_binding in policy.cfg["role_bindings"].values():
-                if (key := candidate_binding.get(item)):
-                    ambiguous.add(policy.cfg["models"][key]["id"])
-        return failed, ambiguous - failed
+        return {m for m in self.prior_models if m in policy.model_ids}
 
 
 # --------------------------------------------------------------------------
@@ -488,6 +486,33 @@ def apply_overrides(task: Task, band: str, policy: Policy) -> tuple[str, list[st
 # Stage 4 — worker
 # --------------------------------------------------------------------------
 
+def history_gap(task: Task, policy: Policy) -> str | None:
+    """Why this task's retry history cannot be used, or `None` if it can.
+
+    Checked BEFORE anything resolves. Round 13: the check sat inside
+    `select_worker`, which runs after `Resolver.__init__` has already read
+    `prior_models` — so an alias still produced inferred `excluded_prior_failures`
+    on a route whose whole point was that aliases identify nothing, a history
+    long enough to exhaust every candidate raised `ValidationError` (exit 2,
+    "invalid input") before the terminal could be reported, and a configurable
+    terminal could fire first and hide the real reason.
+
+    `prior_failures == 0` is checked too: naming models that failed while
+    declaring no failures is a contradiction, and it was silently accepted —
+    the models were excluded from resolution and the route emitted at exit 0.
+    """
+    named, count = list(task.prior_models), task.prior_failures
+    concrete = [m for m in named if m in policy.model_ids]
+    if len(concrete) == len(named) == count:
+        return None
+    detail = ""
+    if len(concrete) != len(named):
+        detail = " (role aliases do not identify which model held that seat)"
+    return (f"retry history required: {count} prior failure(s) but {len(concrete)} "
+            f"concrete model id(s) supplied{detail} — pass --prior-models with one "
+            f"model id per failure")
+
+
 def _promote_above(floor: int, policy: Policy, resolver: "Resolver") -> str | None:
     """The weakest role whose RESOLVED model outranks `floor`.
 
@@ -515,7 +540,7 @@ def _promote_above(floor: int, policy: Policy, resolver: "Resolver") -> str | No
 
 def select_worker(task: Task, band: str, policy: Policy,
                   resolver: "Resolver") -> tuple[str, list[str], bool, bool]:
-    """Returns (worker, notes, ceiling_exhausted, retry_history_missing)."""
+    """Returns (worker, notes, ceiling_exhausted)."""
     binding = resolver.binding
     cfg = policy.cfg
     notes: list[str] = []
@@ -581,8 +606,10 @@ def select_worker(task: Task, band: str, policy: Policy,
             # which asserts the dispatched tier rather than this note.
 
     ceiling_exhausted = False
-    history_missing = False
-    if task.prior_failures >= 1:
+    # `history_gap` is the same predicate `route()` checked before resolving. It
+    # is asked again here rather than passed in, so this function cannot be
+    # called into the retry branch with a history it must not act on.
+    if task.prior_failures >= 1 and history_gap(task, policy) is None:
         # The router does not reconstruct its own history. It asks for it.
         #
         # Rounds 8 through 12 each produced a Critical here, each in a DIFFERENT
@@ -608,17 +635,10 @@ def select_worker(task: Task, band: str, policy: Policy,
         # So: one concrete model id per prior failure, or no route. The caller
         # always has them — it just dispatched them, and `selected_model` is in
         # every route this script emits.
-        concrete = [m for m in task.prior_models if m in policy.model_ids]
-        if len(concrete) != task.prior_failures or len(concrete) != len(task.prior_models):
-            history_missing = True
-            notes.append(
-                f"retry history required: {task.prior_failures} prior failure(s) but "
-                f"{len(concrete)} concrete model id(s) supplied"
-                + (" (role aliases do not identify what ran)"
-                   if len(concrete) != len(task.prior_models) else "")
-                + " — pass --prior-models with one model id per failure")
-        else:
-            floor = max(policy.tier_of[m] for m in concrete)
+        # The structure was checked before this function ran (see
+        # `history_gap`), so reaching here means the history is exact.
+        floor = max(policy.tier_of[m] for m in task.prior_models)
+        if True:
             current = resolver.peek(worker)
             if current is not None and policy.tier_of[current] > floor:
                 # Already stronger than everything that failed. `_promote_above`
@@ -637,7 +657,7 @@ def select_worker(task: Task, band: str, policy: Policy,
                 notes.append(f"retry ladder exhausted: no usable model is stronger "
                              f"than capability tier {floor}")
 
-    return worker, notes, ceiling_exhausted, history_missing
+    return worker, notes, ceiling_exhausted
 
 
 # --------------------------------------------------------------------------
@@ -977,23 +997,8 @@ class Resolver:
         # nominal binding — so the floor believed one model had failed and the
         # exclusion set removed another, and the model that actually ran came
         # straight back out of `peek`. One function answers it now.
-        self.failed, self.ambiguous = task.failed_and_ambiguous(policy, self)
-        self.unusable = self.blocked | self.failed | self.ambiguous
-
-    def held_by(self, alias: str) -> str | None:
-        """The model this role alias held on the attempt that failed.
-
-        Not what it resolves to now (the failure is excluded by then, so that
-        reads the replacement), and not its nominal binding (if that model was
-        already withheld, the role fell back to something else — usually
-        stronger). The candidate ladder minus everything the caller withheld,
-        through BOTH withholding channels, is what it actually held.
-        """
-        for key in self._candidates(alias):
-            model_id = self.policy.cfg["models"][key]["id"]
-            if model_id not in self.blocked:
-                return model_id
-        return None
+        self.failed = task.failed_models(policy)
+        self.unusable = self.blocked | self.failed
 
     def _candidates(self, role: str) -> list[str]:
         cfg = self.policy.cfg
@@ -1136,14 +1141,21 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     policy = Policy.of(cfg)
     task.validate(policy)
 
+    # Before anything resolves: a route whose retry history cannot be used will
+    # not run, so nothing may be inferred from that history on the way there.
+    history_note = history_gap(task, policy)
+    if history_note:
+        task = replace(task, prior_models=[])
+
     resolver = Resolver(task, policy)
 
     risk_score = score(task, cfg)
     band = band_from_score(risk_score, policy)
     band, overrides, redundant_overrides, route_path = apply_overrides(task, band, policy)
 
-    worker, worker_notes, ceiling_exhausted, history_missing = \
-        select_worker(task, band, policy, resolver)
+    worker, worker_notes, ceiling_exhausted = select_worker(task, band, policy, resolver)
+    if history_note:
+        worker_notes.append(history_note)
     effort, effort_notes = select_effort(task, band, policy)
     disagreement = cfg["review"]["disagreement"]
 
@@ -1377,11 +1389,12 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # *bonus* reviewer's isolation gap terminate a LOW route.
     hitl = cfg["human_in_the_loop"]
     controls = [
+        # Only the caller-declared gap is a policy question. The router's own
+        # inability to seat distinct models is handled unconditionally above.
         ("on_independence_unachievable",
-         band_requires_independence and (review_independence == "unavailable"
-                                         or review.get("independence_compromised")),
+         band_requires_independence and review_independence == "unavailable",
          "INDEPENDENCE_UNAVAILABLE",
-         "the band requires independent review and it cannot be provided"),
+         "the caller reported that isolation cannot be achieved here"),
         ("on_retry_exhaustion",
          task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"],
          "HUMAN_REQUIRED", "the retry budget is spent"),
@@ -1395,6 +1408,27 @@ def route(task: Task, cfg: dict | None = None) -> dict:
 
     terminal = None
     requires_human = False
+    # First, and outside the configurable set: a route whose history cannot be
+    # used is not a policy choice, and it must not be masked by a control that
+    # happens to fire on the same input. Round 13 found `prior_failures=4` with
+    # no models reported as `HUMAN_REQUIRED`, and a missing history alongside an
+    # isolation gap reported as `INDEPENDENCE_UNAVAILABLE` — both true, neither
+    # the reason the caller has to act on.
+    if history_note:
+        terminal = "RETRY_HISTORY_REQUIRED"
+
+    # Likewise not configurable: a review whose seats could not be given
+    # distinct models is the implementer reviewing itself. It was an
+    # unconditional gate before this dispatcher existed, and round 13 caught the
+    # move making it optional — `notify_human` emitted a route with two
+    # identical reviewers, `independence_required: true`, at exit 0. Making a
+    # key a real choice must not include the choice to delete a protection that
+    # was never optional.
+    if review.get("independence_compromised"):
+        requires_human = True
+        if band_requires_independence:
+            terminal = terminal or "INDEPENDENCE_UNAVAILABLE"
+
     for key, fired, terminal_name, why in controls:
         if not fired:
             continue
@@ -1403,18 +1437,23 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             terminal = terminal or terminal_name
         elif action == "require_human_confirmation":
             requires_human = True
-        else:                                    # notify_human
-            effort_notes.append(f"{key}: {why} — proceeding without a gate, per policy")
+        elif action == "notify_human":
+            effort_notes.append(f"notify_human/{key}: {why} — proceeding without a gate, "
+                                f"per policy")
+        else:
+            # No `else: treat it as the weakest action`. `Policy` validates this
+            # vocabulary, but `Policy.of` caches on config identity and the
+            # config is a mutable dict, so a value changed after the first route
+            # reaches here unvalidated — and defaulting an unknown word to
+            # "notify" is a control failing OPEN, which is the one direction it
+            # must never fail.
+            raise ConfigError(
+                f"human_in_the_loop.{key} = {action!r} is not an implemented action")
 
     # Outcomes the config does not govern: these are properties of the route,
     # not policy choices.
     if terminal is None:
-        if history_missing:
-            # Not `ValidationError`: the input is well-formed, the evidence is
-            # incomplete. Terminal already means "no executable bindings, a
-            # human takes over", and the note names exactly what to supply.
-            terminal = "RETRY_HISTORY_REQUIRED"
-        elif ceiling_exhausted:
+        if ceiling_exhausted:
             terminal = "HUMAN_REQUIRED"
         elif confidence < cfg["router"]["confidence"]["escalate_below"]:
             terminal = "ESCALATE_ROUTING"
@@ -1488,7 +1527,6 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "fallback_compensations_applied": compensations,
         "unavailable_models": sorted(resolver.blocked),
         "excluded_prior_failures": sorted(resolver.failed),
-        "excluded_as_ambiguous_alias": sorted(resolver.ambiguous),
         "escalation_count": task.prior_failures,
         "retry_count": task.prior_failures,
         "routing_confidence": confidence,
@@ -1552,9 +1590,6 @@ def explain(task: Task, r: dict) -> str:
         parts.append(f"Compensations: {', '.join(r['fallback_compensations_applied'])}.")
     if r["excluded_prior_failures"]:
         parts.append(f"Excluded as already-failed: {', '.join(r['excluded_prior_failures'])}.")
-    if r["excluded_as_ambiguous_alias"]:
-        parts.append("Also withheld because a role alias is ambiguous across bindings "
-                     f"(these did not run): {', '.join(r['excluded_as_ambiguous_alias'])}.")
     if not r["cross_family_review"] and rv["independence_required"]:
         parts.append("cross_family_review=false — reviewers share a family; weigh the second verdict accordingly.")
     if r["requires_human_confirmation"]:
@@ -1584,7 +1619,8 @@ def build_parser(policy: Policy) -> argparse.ArgumentParser:
                    help=f"comma-separated; known: {', '.join(sorted(policy.known_flags))}")
     p.add_argument("--prior-failures", type=int, default=0)
     p.add_argument("--prior-models", default="",
-                   help="comma-separated role aliases or model ids that already failed")
+                   help="comma-separated concrete model ids that already failed — one "
+                        "per --prior-failures; a role alias does not identify what ran")
     p.add_argument("--runtime", default="claude_code", choices=sorted(policy.runtimes))
     p.add_argument("--unavailable", default="", help="comma-separated unavailable roles")
     p.add_argument("--unavailable-models", default="", help="comma-separated unavailable model ids")

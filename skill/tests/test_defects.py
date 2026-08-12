@@ -150,16 +150,26 @@ def test_d1_a_failed_model_is_never_re_emitted_under_a_new_role():
     """Role-tier escalation alone is not enough: in a degraded binding the top
     roles collapse onto one model, so 'escalating' re-ran what just failed
     while recording a promotion that never happened."""
+    # Round 13: this loop used role aliases, and once an alias history became
+    # terminal every one of its six iterations hit `if out["terminal"]: continue`
+    # — a regression test for a shipped Critical executing zero assertions,
+    # green. Concrete ids now, and the escape hatch has to prove it is honest.
+    checked = 0
     for runtime in ("claude_code", "codex"):
-        for prior in ("worker_balanced", "senior_engineer", "reasoning_specialist"):
+        for prior in ("claude-sonnet-5", "claude-opus-5", "gpt-5.6-sol"):
             out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=1, blast_radius=1,
                     runtime=runtime, flags=["bridge_down"],
                     prior_failures=1, prior_models=[prior])
             if out["terminal"]:
+                assert out["terminal"] != "RETRY_HISTORY_REQUIRED", (
+                    f"{runtime}/{prior}: a complete concrete history was rejected")
                 continue          # failing closed is an acceptable outcome
+            checked += 1
             failed = set(out["excluded_prior_failures"])
+            assert failed, f"{runtime}/{prior}: the named failure was not excluded"
             leak = emitted_models(out) & failed
             assert not leak, f"{runtime}/{prior}: re-emitted the failed model {leak}"
+    assert checked, "every iteration was terminal — the assertions never ran"
 
 
 def test_d1_unavailable_accepts_model_ids_too():
@@ -834,6 +844,25 @@ def test_d16_skill_md_stays_small_without_being_hollowed_out():
         f"SKILL.md no longer states {missing}. These are the load-bearing "
         f"contracts; a size budget must never be met by dropping one")
 
+    # Round 13: the guard checked for content that must be PRESENT and missed a
+    # field the code had deleted — `retry_history_inferred` survived in the
+    # schema for a round, promising a key no route emits. Documentation drifts
+    # in both directions.
+    from route_task import Task, route as _route
+    emitted = set(_route(_task(task_class="MECHANICAL"), CFG))
+    start = text.index("task_class:  complexity:")
+    schema_block = text[start:text.index("```", start)]
+    for line in schema_block.splitlines():
+        key = line.split(":")[0].strip()
+        if key and key.isidentifier() and not line.startswith(" ") and key != "review":
+            assert key in emitted, (
+                f"SKILL.md's output schema names {key!r}, which no route emits")
+
+    # Terminal states must be enumerated, not summarised.
+    from route_task import TERMINAL_STATES
+    for name in TERMINAL_STATES:
+        assert name in text, f"SKILL.md does not name the {name} terminal"
+
 def test_d13_the_judge_retry_never_seats_the_implementer_as_its_own_reviewer():
     """Round 6 relaxed the retry at LOW on the reasoning that LOW permits
     self-review. LOW's exemption is about the reviewer the BAND CONFIGURED
@@ -1213,40 +1242,84 @@ def test_d15_every_reference_skill_md_names_actually_exists():
         assert fences % 2 == 0, f"{doc.name} has {fences} code fences — one is unclosed"
 
 
-def test_d14_an_alias_is_resolved_through_both_withholding_channels():
-    """Round 10. The caller can withhold by model id OR by role, and
-    `_failed_tier` read only the first — so behind `--unavailable <role>`, which
-    the config header calls the documented route, the alias resolved to a model
-    that had been withheld and never ran. The floor came out at that model's
-    tier and the retry escalated straight back onto the model that had actually
-    failed, while `excluded_prior_failures` named one that never ran.
+def test_d17_a_self_reviewing_route_is_gated_whatever_the_config_says():
+    """Round 13. `independence_compromised` — the router could not give the
+    seats distinct models, so the implementer reviews itself — was an
+    unconditional gate until round 12 folded it into a configurable control.
+    With `on_independence_unachievable: notify_human` it then emitted a route
+    with two identical reviewers, `independence_required: true`, at exit 0.
 
-    The round-9 test used the model channel only, which is exactly the input the
-    round-9 implementation handled, so it could not see this."""
-    first = r(task_class="REFACTORING", complexity=2,
-              unavailable_roles=["senior_engineer", "reasoning_specialist"])
-    held = first["selected_model"]
-    nominal = CFG["models"][CFG["role_bindings"]["default"]["senior_engineer"]]["id"]
+    Round 12's own Critical was "a validated word silently removes the control
+    it names"; this is the same defect with the opposite word. Making a key a
+    real choice must not include the choice to delete a protection that was
+    never optional — so the gate is outside the dispatcher, and this test looks
+    at it through the config value that would hide it."""
+    relaxed = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
+                                            "on_independence_unachievable": "notify_human"}}
+    seen = 0
+    for scarce in itertools.combinations(sorted(m["id"] for m in CFG["models"].values()), 4):
+        for task_class in ("MECHANICAL", "IMPLEMENTATION"):
+            task = _task(task_class=task_class, flags=["auth_sensitive"],
+                         unavailable_models=list(scarce))
+            try:
+                out = route(task, relaxed)
+            except ValidationError:
+                continue
+            if not out["review"]["independence_compromised"]:
+                continue
+            seen += 1
+            models = [m for m in out["review"]["reviewer_models"] if m]
+            assert out["requires_human_confirmation"], (
+                f"{task_class}/{scarce}: implementer {out['selected_model']} with "
+                f"reviewers {models} emitted without a gate")
+    assert seen, "no route reached independence_compromised — the assertion was vacuous"
 
-    retry = r(task_class="REFACTORING", complexity=2,
-              unavailable_roles=["senior_engineer", "reasoning_specialist"],
-              prior_failures=1, prior_models=["senior_engineer"])
-    # What `senior_engineer` HELD, not what the binding nominally names.
-    ladder = Resolver(_task(task_class="REFACTORING", complexity=2,
-                            unavailable_roles=["senior_engineer", "reasoning_specialist"]),
-                      Policy.of(CFG))
-    actually_ran = ladder.held_by("senior_engineer")
-    assert actually_ran != nominal, "probe drifted: the alias no longer falls back"
 
-    assert actually_ran in retry["excluded_prior_failures"], (
-        f"the model the alias held ({actually_ran}) was not excluded; "
-        f"excluded={retry['excluded_prior_failures']}")
-    assert nominal not in retry["excluded_prior_failures"], (
-        f"{nominal} was withheld and never ran, yet is reported as already-failed")
-    assert actually_ran not in emitted_models(retry), (
-        f"re-emitted {actually_ran} after it failed: {retry['notes']}")
-    del first, held
+def test_d17_an_unimplemented_action_fails_closed_even_on_a_cached_config():
+    """Round 13. `Policy.of` caches on config identity and the config is a
+    mutable dict, so a value changed after the first route reaches the
+    dispatcher unvalidated. The dispatcher treated anything that was not
+    `terminal` or `require_human_confirmation` as `notify_human` — a control
+    failing OPEN, which is the one direction it must never fail."""
+    from route_task import ConfigError
+    cfg = load_config()
+    probe = _task(task_class="MECHANICAL", complexity=0, uncertainty=3,
+                  blast_radius=0, reversibility=0, flags=["auth_sensitive"])
+    assert route(probe, cfg)["requires_human_confirmation"], "probe drifted"
 
+    # Mutate the SAME object the Policy cache is keyed on, as a caller sharing
+    # a config dict across calls would.
+    cfg["human_in_the_loop"]["on_any_critical_review"] = "notify_the_human"
+    with pytest.raises(ConfigError):
+        route(probe, cfg)
+
+
+def test_d17_an_alias_in_prior_models_identifies_nothing_and_routes_nothing():
+    """Round 13. Deleting the reconstruction left the alias inference alive one
+    layer down: `Resolver` still read `prior_models` and turned an alias into
+    "the model it probably held", so a route whose whole premise was that
+    aliases identify nothing still excluded models on the strength of one — and
+    at `prior_failures=0` it did so on a route that was emitted at exit 0.
+
+    The history is now checked before anything resolves, so an alias reaches no
+    inference at all, and the field that reported the guess
+    (`excluded_as_ambiguous_alias`) is gone rather than left permanently empty.
+    """
+    for kw in (dict(prior_failures=1, prior_models=["senior_engineer"]),
+               dict(prior_failures=0, prior_models=["senior_engineer"]),
+               dict(prior_failures=2, prior_models=["senior_engineer", "gpt-5.6-sol"])):
+        out = r(task_class="REFACTORING", complexity=2, **kw)
+        assert out["terminal"] == "RETRY_HISTORY_REQUIRED", kw
+        assert out["excluded_prior_failures"] == [], (
+            f"an alias still produced an exclusion: {out['excluded_prior_failures']}")
+        assert "excluded_as_ambiguous_alias" not in out, "the guess field survived"
+        assert any("aliases do not identify" in n for n in out["notes"])
+
+    # Naming models while declaring no failures is a contradiction, not a hint.
+    contradiction = r(task_class="REFACTORING", complexity=2, prior_failures=0,
+                      prior_models=["gpt-5.6-luna"])
+    assert contradiction["terminal"] == "RETRY_HISTORY_REQUIRED"
+    assert contradiction["selected_model"] is None
 
 def test_d14_a_bonus_review_that_cannot_be_isolated_does_not_kill_the_task():
     """Round 9. The isolation terminal keyed off `review["independent"]`, which
