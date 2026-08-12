@@ -312,13 +312,10 @@ retry:
 human_in_the_loop:
   # Exhausting the retry budget is a normal terminal state, not an error —
   # but it must surface to a human rather than fail silently.
-  # `terminal`, not `notify_human`. Round 12 implemented every action for every
-  # key, and that turned this value into a real choice for the first time —
-  # which immediately showed it disagreeing with the behaviour SKILL.md
-  # documents ("exhausting the retry budget is a normal terminal state") and
-  # with what the router had always hardcoded. When a config value becomes
-  # load-bearing, the first thing it reveals is whether it was ever right.
-  on_retry_exhaustion:          terminal
+  # `on_retry_exhaustion` was here until round 17, which measured all three of
+  # its actions producing the same route: the cap is a safety limit, not a
+  # policy choice, so a key offering to vary it was a constant wearing a config
+  # file. The gate is unconditional in `route()`.
   # Every CRITICAL review, not only degraded ones: the router cannot verify
   # where an isolation receipt came from, so it never treats one as proof.
   on_any_critical_review:       require_human_confirmation

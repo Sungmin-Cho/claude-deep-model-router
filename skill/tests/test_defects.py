@@ -1187,8 +1187,11 @@ def test_d15_every_human_control_action_is_validated_and_load_bearing():
     # validating against the UNION let the strictest-sounding word disable four
     # of the five controls — `on_any_critical_review: terminal` passed and
     # removed the CRITICAL gate outright.
-    keys = ("on_independence_unachievable", "on_retry_exhaustion",
-            "on_any_critical_review", "on_judge_unavailable", "on_review_depth_reduced")
+    # `on_retry_exhaustion` is gone: round 17 measured all three of its actions
+    # producing the same route, because the cap is a safety limit rather than a
+    # policy choice. A key whose values cannot differ is not configuration.
+    keys = ("on_independence_unachievable", "on_any_critical_review",
+            "on_judge_unavailable", "on_review_depth_reduced")
     for key in keys:
         for bad in ("require_human_confirmaton", "", None, 1, "TERMINAL", "gate"):
             altered = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"], key: bad}}
@@ -1215,9 +1218,6 @@ def test_d15_every_human_control_action_is_validated_and_load_bearing():
         "on_independence_unachievable": dict(task_class="IMPLEMENTATION", complexity=2,
                                              uncertainty=2, blast_radius=2,
                                              reversibility=0, isolation_available=False),
-        "on_retry_exhaustion": dict(task_class="MECHANICAL", complexity=0, uncertainty=0,
-                                    blast_radius=0, reversibility=0, prior_failures=4,
-                                    prior_models=["gpt-5.6-luna"] * 4),
     }
     for key, probe in probes.items():
         seen = {}
@@ -1382,11 +1382,57 @@ def test_d20_a_shortage_never_buries_a_reason_the_caller_can_act_on():
         f"the actionable reason was replaced by {out['terminal']}")
     assert any("one model id per failure" in n for n in out["notes"])
 
-    # And it still outranks what it does produce.
-    produced = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
-                 unavailable_models=everything[:6])
-    if produced["terminal"] == "SUPPLY_EXHAUSTED":
-        assert produced["review"]["independence_compromised"], "probe drifted"
+    # And it still outranks what it does produce. Round 17: this was wrapped in
+    # `if produced["terminal"] == "SUPPLY_EXHAUSTED"`, so deleting the very
+    # precedence it names skipped the assertion instead of failing it — the
+    # subject of a test must never be its own precondition. It is also the only
+    # positive coverage `SUPPLY_EXHAUSTED` has, so it asserts the terminal.
+    produced = r(task_class="MECHANICAL", flags=["auth_sensitive"],
+                 unavailable_models=["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+                                     "gpt-5.6-luna", "gpt-5.6-sol"])
+    assert produced["terminal"] == "SUPPLY_EXHAUSTED", (
+        f"a route with one model left emitted {produced['terminal']}")
+    assert produced["review"]["independence_compromised"], (
+        "the symptom this outranks is not present — the probe proves nothing")
+    assert produced["selected_model"] is None and produced["requires_human_confirmation"]
+    assert any("supply exhausted" in n for n in produced["notes"])
+
+
+def test_d21_the_promotion_decision_sees_the_confidence_that_ships():
+    """Round 17. Round 16 recomputed confidence from the emitted fallbacks so
+    the two would stop contradicting each other — and left the decision that
+    CONSUMES it standing on the discarded plan's value. A route shipping 0.75
+    kept the LOW review band that 0.95 had justified, so the policy "0.60-0.79
+    raises the review band one level" quietly did not apply. The fixed point
+    exists precisely so the promotion sees the final number."""
+    threshold = CFG["router"]["confidence"]["extra_review_below"]
+    out = r(task_class="MECHANICAL", flags=["review_disagreement", "unknown_root_cause"],
+            unavailable_models=["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+                                "gpt-5.6-luna", "gpt-5.6-sol"])
+    assert out["routing_confidence"] < threshold, "probe drifted"
+    assert any("low_routing_confidence" in o for o in out["band_overrides_applied"]), (
+        f"confidence {out['routing_confidence']} is below {threshold} and the review "
+        f"band was never promoted: {out['band_overrides_applied']}")
+    assert out["review"]["band"] != "LOW"
+
+    # And the invariant over the sweep, both directions.
+    checked = 0
+    for task_class in ("MECHANICAL", "IMPLEMENTATION", "DEBUGGING"):
+        for flags in ([], ["review_disagreement"], ["review_disagreement", "unknown_root_cause"]):
+            for scarce in ([], ["claude-fable-5"],
+                           ["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+                            "gpt-5.6-luna", "gpt-5.6-sol"]):
+                o = r(task_class=task_class, flags=list(flags), unavailable_models=list(scarce))
+                if o["terminal"]:
+                    continue
+                promoted = any("low_routing_confidence" in x
+                               for x in o["band_overrides_applied"])
+                if o["routing_confidence"] < threshold and o["review"]["band"] != "CRITICAL":
+                    assert promoted, (
+                        f"{task_class}/{flags}/{scarce}: {o['routing_confidence']} < "
+                        f"{threshold} without promotion")
+                checked += 1
+    assert checked > 15
 
 
 def test_d20_the_emitted_confidence_matches_the_emitted_fallbacks():
@@ -1459,7 +1505,23 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
     logically equivalent while its reason string claimed a narrower cause —
     fails this immediately.
     """
+    # An INDEPENDENT copy of the wording. Round 17: this looked the phrases up
+    # in the same `CAUSE_REASONS` the router uses to write them, so a reason
+    # that was wrong but consistently wrong passed — the "oracle computed by the
+    # formula under test" shape this suite has removed twice. Changing a reason
+    # now requires changing it here too, which is the point: the wording is a
+    # contract with the operator, not an implementation detail.
+    EXPECTED_WORDING = {
+        "caller_declared_isolation_gap":
+            "the caller reported that isolation cannot be achieved here",
+        "critical_review_band": "a CRITICAL review cannot be accepted automatically",
+        "no_adjudicator": "no adjudicator is available",
+        "review_below_band": "the review is staffed below its band",
+    }
     from route_task import CAUSE_REASONS
+    assert CAUSE_REASONS == EXPECTED_WORDING, (
+        f"the router's wording drifted from the contract: "
+        f"{set(CAUSE_REASONS.items()) ^ set(EXPECTED_WORDING.items())}")
     tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
     cap = CFG["retry"]["max_total_implementation_attempts"]
     ids = sorted(tier)
@@ -1472,7 +1534,6 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
             "caller_declared_isolation_gap":
                 bool(CFG["review"][rv["band"]].get("independent"))
                 and task.isolation_available is False,
-            "retry_budget_spent": task.prior_failures >= cap,
             "critical_review_band": rv["band"] == "CRITICAL",
             "no_adjudicator": bool(rv["judge_unavailable"]),
             "review_below_band": bool(rv["review_depth_reduced"]),
@@ -1485,9 +1546,9 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
     # detectable — a weakened threshold only shows up once something is
     # already missing, which is too late to be a guard.
     probe_out = route(_task(task_class="MECHANICAL"), CFG)
-    assert set(expected(_task(task_class="MECHANICAL"), probe_out)) == set(CAUSE_REASONS), (
+    assert set(expected(_task(task_class="MECHANICAL"), probe_out)) == set(EXPECTED_WORDING), (
         f"the oracle covers {sorted(set(expected(_task(task_class='MECHANICAL'), probe_out)))} "
-        f"but the router declares {sorted(CAUSE_REASONS)}")
+        f"but the contract declares {sorted(EXPECTED_WORDING)}")
 
     checked = 0
     seen_causes: set = set()
@@ -1517,8 +1578,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
                             # what round 14's Critical actually falsified. The
                             # rationale must carry each fired cause's declared
                             # wording, and must not carry any other cause's.
-                            for cause in CAUSE_REASONS:
-                                present = CAUSE_REASONS[cause] in out["rationale"]
+                            for cause in EXPECTED_WORDING:
+                                present = EXPECTED_WORDING[cause] in out["rationale"]
                                 assert present == (cause in want), (
                                     f"{task_class}/{dims}: rationale "
                                     f"{'claims' if present else 'omits'} "
@@ -1530,8 +1591,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
     # task-class-dependent predicate drift out of the sweep unnoticed, and the
     # docstring meanwhile claimed whole-input-space equivalence over three
     # classes. It sweeps every class now and demands every cause.
-    assert seen_causes == set(CAUSE_REASONS), (
-        f"never exercised: {sorted(set(CAUSE_REASONS) - seen_causes)}; a cause no "
+    assert seen_causes == set(EXPECTED_WORDING), (
+        f"never exercised: {sorted(set(EXPECTED_WORDING) - seen_causes)}; a cause no "
         f"route triggers is a control this test cannot hold to anything")
 
 

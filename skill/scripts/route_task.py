@@ -80,7 +80,6 @@ class UnknownCompensationError(ConfigError):
 CAUSE_REASONS = {
     "caller_declared_isolation_gap":
         "the caller reported that isolation cannot be achieved here",
-    "retry_budget_spent": "the retry budget is spent",
     "critical_review_band": "a CRITICAL review cannot be accepted automatically",
     "no_adjudicator": "no adjudicator is available",
     "review_below_band": "the review is staffed below its band",
@@ -208,9 +207,8 @@ class Policy:
         # The error message promised the opposite of what the check did.
         implemented = {"terminal", "require_human_confirmation", "notify_human"}
         for key, allowed in ((k, implemented) for k in (
-                "on_independence_unachievable", "on_retry_exhaustion",
-                "on_any_critical_review", "on_judge_unavailable",
-                "on_review_depth_reduced")):
+                "on_independence_unachievable", "on_any_critical_review",
+                "on_judge_unavailable", "on_review_depth_reduced")):
             if key not in cfg["human_in_the_loop"]:
                 raise ConfigError(f"human_in_the_loop is missing {key!r}")
             value = cfg["human_in_the_loop"][key]
@@ -1438,13 +1436,34 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         and fams[review["reviewers"][0]] != fams[worker]
     )
 
-    # Recomputed from the fallbacks actually emitted. The fixed point above
-    # computes confidence per candidate plan, and round 16 found a route
-    # carrying the confidence of a plan that was discarded — two emitted facts
-    # contradicting each other, with `routing_confidence` 0.95 beside two
-    # recorded fallbacks whose own formula gives 0.85. Whatever the loop
-    # explored, what ships is what the route says it is.
+    # Recomputed from the fallbacks actually emitted, and the decision that
+    # consumes it is re-run once. Round 16 fixed the reported number and left
+    # the decision on the discarded plan's value, so a route shipping
+    # confidence 0.75 kept the LOW review band that 0.95 had justified — the
+    # fixed point exists precisely so the promotion sees the final number, and
+    # recomputing after it had stepped outside that guarantee.
     confidence = routing_confidence(task, fallbacks)
+    threshold = cfg["router"]["confidence"]["extra_review_below"]
+    if confidence < threshold and review_band != "CRITICAL" and not promoted_once:
+        review_band = policy.bands[policy.bands.index(review_band) + 1]
+        overrides.append(f"low_routing_confidence_raised_review_to_{review_band}")
+        promoted_once = True
+        review = select_review(review_band, worker, policy, resolver)
+        judge_role = disagreement["default_judge"] if (
+            review["band"] == "CRITICAL" or route_path == "disagreement") else None
+        if review["independent"]:
+            review = _deconflict(review, worker, policy, resolver)
+        if judge_role:
+            review, judge_role = _seat_judge(review, worker, judge_role, policy, resolver)
+        try:
+            resolved, fallbacks, _ = resolver.resolve(
+                list(dict.fromkeys([worker] + list(review["reviewers"])
+                                   + ([judge_role] if judge_role else []))))
+            supply_exhausted = None
+        except SupplyExhausted as exc:
+            resolved, fallbacks = {}, []
+            supply_exhausted = str(exc)
+        confidence = routing_confidence(task, fallbacks)
 
     review_independence = independence(review, task)
     judge = judge_role
@@ -1475,14 +1494,6 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         Control("on_independence_unachievable", "caller_declared_isolation_gap",
                 band_requires_independence and task.isolation_available is False,
                 "INDEPENDENCE_UNAVAILABLE"),
-        # The action selects how loudly, never whether. Round 16: with a
-        # complete history and `notify_human` the cap+1th attempt shipped at
-        # exit 0 — a budget that any config value can opt out of is not a
-        # budget. The unconditional half lives below with the other
-        # non-negotiable gates; this control chooses terminal vs confirmation.
-        Control("on_retry_exhaustion", "retry_budget_spent",
-                task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"],
-                "HUMAN_REQUIRED"),
         Control("on_any_critical_review", "critical_review_band",
                 review["band"] == "CRITICAL",
                 "HUMAN_REQUIRED"),
@@ -1525,6 +1536,21 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # distinct models either — so `independence_compromised` is true, and round
     # 15 found it claiming the terminal while the actual cause sat in a note.
     # A report that names a symptom sends the operator to the wrong problem.
+    if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
+        # Ahead of the shortage, for the reason the shortage was put ahead of
+        # the seat collision: name the fact the caller has to act on. Round 17
+        # found the mirror of the case round 16 fixed — a spent budget with a
+        # complete history reported as `SUPPLY_EXHAUSTED`, which is true and is
+        # not what stops the next attempt.
+        #
+        # And unconditional, with no `on_retry_exhaustion` key above it. Round
+        # 16 made that key a control and round 17 measured all three of its
+        # actions producing the same route: the cap cannot legitimately vary, so
+        # a key offering to vary it is a constant wearing a config file — the
+        # shape this artifact has removed three times already.
+        terminal = terminal or "HUMAN_REQUIRED"
+        requires_human = True
+
     if supply_exhausted:
         worker_notes.append(f"supply exhausted: {supply_exhausted}")
         # `terminal or`, not `=`. The stated design is that this outranks the
@@ -1536,7 +1562,6 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         # ahead of the `terminal or` gate below is all the precedence the
         # reasoning ever asked for.
         terminal = terminal or "SUPPLY_EXHAUSTED"
-        requires_human = True
 
     if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
         # Unconditional: no config value may dispatch an attempt past the cap.
