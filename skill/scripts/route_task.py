@@ -46,7 +46,7 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "model-routing
 # assert the set rather than a sample of it.
 TERMINAL_STATES = (
     "HUMAN_REQUIRED", "ESCALATE_ROUTING", "INDEPENDENCE_UNAVAILABLE",
-    "RETRY_HISTORY_REQUIRED",
+    "RETRY_HISTORY_REQUIRED", "SUPPLY_EXHAUSTED",
 )
 
 MAX_PROMOTION_PASSES = 4   # bounded fixed point; the band ladder is only 4 deep
@@ -69,6 +69,23 @@ class UnknownCompensationError(ConfigError):
     KEYS — stayed green. Inert policy reading as active is the thing this
     module keeps having to remove, so an unimplemented effect stops the route.
     """
+
+
+@dataclass(frozen=True)
+class Control:
+    """One configurable human-in-the-loop control.
+
+    `cause` is the machine-readable name of the condition `fired` tests, and it
+    is emitted on the route. It exists because six rounds of this artifact's
+    defects were a comment claiming a predicate did one thing while it did
+    another — unmeasurable as prose, measurable as a code paired with a
+    predicate and asserted over the whole input space.
+    """
+    key: str
+    cause: str
+    fired: bool
+    terminal: str
+    reason: str
 
 
 class SupplyExhausted(Exception):
@@ -1155,12 +1172,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # Before anything resolves: a route whose retry history cannot be used will
     # not run, so nothing may be inferred from that history on the way there.
     history_note = history_gap(task, policy)
-    if task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]:
-        # The budget is spent, so there is no next attempt for a history to
-        # place. Asking for one sends the caller on an errand whose result it
-        # cannot use, and hides the fact it has to act on until the second call.
-        history_note = None
+    budget_spent = task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"]
     if history_note:
+        if budget_spent:
+            history_note = ("retry budget spent; no further attempt is available, so "
+                            "the prior-model history is moot — surface this to a human")
         task = replace(task, prior_models=[])
 
     resolver = Resolver(task, policy)
@@ -1303,9 +1319,15 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         resolved, fallbacks, _ = resolver.resolve(
             list(dict.fromkeys([worker] + list(review["reviewers"])
                                + ([judge_role] if judge_role else []))))
+        # The final seat plan resolved, so any shortage seen while exploring a
+        # preliminary one is not a fact about this route. Round 15: it was
+        # sticky, and a LOW disagreement route whose provisional
+        # `principal_architect` could not resolve stayed terminal even though
+        # `_seat_judge` had found a complete assignment.
+        supply_exhausted = None
     except SupplyExhausted as exc:
         resolved, fallbacks = {}, []
-        supply_exhausted = supply_exhausted or str(exc)
+        supply_exhausted = str(exc)
 
     # Post-condition, asserted rather than assumed. Reviewer duplication is
     # only a defect where independence was requested; a judge sharing any seat
@@ -1414,36 +1436,37 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # `band_requires_independence` is the BAND's spec, not `review`'s flag: the
     # architect compensation sets that flag at any band, and keying off it let a
     # *bonus* reviewer's isolation gap terminate a LOW route.
+    # Each control carries a machine-readable CAUSE alongside its prose reason,
+    # and the cause is emitted. Round 15's reviewers converged on this after the
+    # seventh instance of the class that has cost this loop six rounds: an edit
+    # whose comment claims one thing while the predicate does another. A comment
+    # cannot be checked; a cause code can, and
+    # `test_d19_every_control_fires_exactly_on_its_declared_cause` asserts that
+    # each control's predicate partitions the sweep exactly as its cause says.
     hitl = cfg["human_in_the_loop"]
     controls = [
-        # Only the caller-declared gap is a policy question, and the predicate
-        # now says so. Round 14: narrowing it to `review_independence ==
-        # "unavailable"` was logically INERT — `independence()` returns exactly
-        # that whenever `independence_compromised` is set, so the disjunct
-        # removed was always redundant and not one route changed. The comment
-        # claimed a separation the code had not made, and the reason string
-        # changed to one that is false for the router's own seat collisions,
-        # which then appeared on terminal routes saying the caller had reported
-        # something it never reported. The caller's declaration is a field; it
-        # is read directly.
-        ("on_independence_unachievable",
-         band_requires_independence and task.isolation_available is False,
-         "INDEPENDENCE_UNAVAILABLE",
-         "the caller reported that isolation cannot be achieved here"),
-        ("on_retry_exhaustion",
-         task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"],
-         "HUMAN_REQUIRED", "the retry budget is spent"),
-        ("on_any_critical_review", review["band"] == "CRITICAL",
-         "HUMAN_REQUIRED", "a CRITICAL review cannot be accepted automatically"),
-        ("on_judge_unavailable", bool(review.get("judge_unavailable")),
-         "HUMAN_REQUIRED", "no adjudicator is available"),
-        ("on_review_depth_reduced", bool(review.get("review_depth_reduced")),
-         "HUMAN_REQUIRED", "the review is staffed below its band"),
+        Control("on_independence_unachievable", "caller_declared_isolation_gap",
+                band_requires_independence and task.isolation_available is False,
+                "INDEPENDENCE_UNAVAILABLE",
+                "the caller reported that isolation cannot be achieved here"),
+        Control("on_retry_exhaustion", "retry_budget_spent",
+                task.prior_failures >= cfg["retry"]["max_total_implementation_attempts"],
+                "HUMAN_REQUIRED", "the retry budget is spent"),
+        Control("on_any_critical_review", "critical_review_band",
+                review["band"] == "CRITICAL",
+                "HUMAN_REQUIRED", "a CRITICAL review cannot be accepted automatically"),
+        Control("on_judge_unavailable", "no_adjudicator",
+                bool(review.get("judge_unavailable")),
+                "HUMAN_REQUIRED", "no adjudicator is available"),
+        Control("on_review_depth_reduced", "review_below_band",
+                bool(review.get("review_depth_reduced")),
+                "HUMAN_REQUIRED", "the review is staffed below its band"),
     ]
 
     terminal = None
     requires_human = False
     notified: list[tuple[str, str]] = []
+    fired_causes: list[str] = []
     # First, and outside the configurable set: a route whose history cannot be
     # used is not a policy choice, and it must not be masked by a control that
     # happens to fire on the same input. Round 13 found `prior_failures=4` with
@@ -1451,7 +1474,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # isolation gap reported as `INDEPENDENCE_UNAVAILABLE` — both true, neither
     # the reason the caller has to act on.
     if history_note:
-        terminal = "RETRY_HISTORY_REQUIRED"
+        # Unconditional, and that matters twice over. Round 14 suppressed this
+        # branch when the budget was spent — to stop sending the caller after a
+        # history it could not use — and round 15 found that had moved an
+        # unconditional gate under a configurable control, so
+        # `on_retry_exhaustion: notify_human` routed a task with no history at
+        # all, at exit 0. The gate stays; what changes is which terminal it
+        # names, because with the budget gone the actionable fact is the budget.
+        terminal = "HUMAN_REQUIRED" if budget_spent else "RETRY_HISTORY_REQUIRED"
 
     # Likewise not configurable: a review whose seats could not be given
     # distinct models is the implementer reviewing itself. It was an
@@ -1460,6 +1490,15 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # identical reviewers, `independence_required: true`, at exit 0. Making a
     # key a real choice must not include the choice to delete a protection that
     # was never optional.
+    # Before the derived gates. When nothing resolves, the seats cannot be given
+    # distinct models either — so `independence_compromised` is true, and round
+    # 15 found it claiming the terminal while the actual cause sat in a note.
+    # A report that names a symptom sends the operator to the wrong problem.
+    if supply_exhausted:
+        worker_notes.append(f"supply exhausted: {supply_exhausted}")
+        terminal = "SUPPLY_EXHAUSTED"
+        requires_human = True
+
     if review.get("independence_compromised"):
         # No inner `if band_requires_independence`: it cannot be false here.
         # `independence_compromised` is only ever set behind `review["independent"]`,
@@ -1469,10 +1508,12 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         requires_human = True
         terminal = terminal or "INDEPENDENCE_UNAVAILABLE"
 
-    for key, fired, terminal_name, why in controls:
-        if not fired:
+    for control in controls:
+        if not control.fired:
             continue
-        action = hitl[key]
+        key, action = control.key, hitl[control.key]
+        terminal_name, why = control.terminal, control.reason
+        fired_causes.append(control.cause)
         if action == "terminal":
             terminal = terminal or terminal_name
         elif action == "require_human_confirmation":
@@ -1495,11 +1536,6 @@ def route(task: Task, cfg: dict | None = None) -> dict:
 
     # Outcomes the config does not govern: these are properties of the route,
     # not policy choices.
-    if supply_exhausted:
-        worker_notes.append(f"supply exhausted: {supply_exhausted}")
-        terminal = terminal or "HUMAN_REQUIRED"
-        requires_human = True
-
     if terminal is None:
         if ceiling_exhausted:
             terminal = "HUMAN_REQUIRED"
@@ -1511,10 +1547,15 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     requires_human = bool(terminal) or requires_human
 
     for key, why in notified:
-        effort_notes.append(
-            f"notify_human/{key}: {why} — "
-            + ("recorded; the route is terminal for another reason"
-               if terminal else "proceeding without a gate, per policy"))
+        if terminal:
+            outcome = "recorded; the route is terminal for another reason"
+        elif requires_human:
+            # Round 15: this said "proceeding without a gate" whenever the route
+            # was not terminal, which is false when a DIFFERENT control gated it.
+            outcome = "recorded; another control requires confirmation"
+        else:
+            outcome = "proceeding without a gate, per policy"
+        effort_notes.append(f"notify_human/{key}: {why} — {outcome}")
 
     # The router cannot verify where an isolation receipt came from: it is a
     # caller-supplied string bound to no dispatch, so `enforced` reports what
@@ -1585,6 +1626,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "retry_count": task.prior_failures,
         "routing_confidence": confidence,
         "requires_human_confirmation": requires_human,
+        # Which configurable controls fired, by cause rather than by prose. The
+        # reason strings are for people; these are what a test can hold the
+        # predicate to.
+        "human_control_causes": sorted(fired_causes),
         "notes": worker_notes + effort_notes,
     }
     result["rationale"] = explain(task, result)

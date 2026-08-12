@@ -157,6 +157,7 @@ execute:
 | `ESCALATE_ROUTING` | routing confidence fell below 0.60 — re-classify at higher effort or ask a human |
 | `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and it cannot be had — no distinct-model assignment exists, or the caller reported isolation unavailable |
 | `RETRY_HISTORY_REQUIRED` | `--prior-failures N` without one concrete model id per failure. The router does not guess what ran |
+| `SUPPLY_EXHAUSTED` | no usable model remains for a role the route needs — an operational shortage, not a bad request |
 
 `judge_unavailable` is deliberately **not** terminal: independence failing means
 the review cannot happen as specified, so nothing is safe to dispatch, whereas a
@@ -441,6 +442,9 @@ excluded_prior_failures: []    # models withheld because they already failed
 escalation_count:  retry_count:
 routing_confidence:
 requires_human_confirmation:
+human_control_causes: []       # which human_in_the_loop controls fired, by
+                               # cause code — the machine-checkable half of the
+                               # reason strings in the rationale
 notes: []                      # every promotion, floor, compensation and
                                # policy decision the route actually made
 rationale:   # names the band, the triggering flags, and every fallback

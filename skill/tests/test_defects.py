@@ -1269,6 +1269,18 @@ def test_d18_terminal_precedence_is_pinned_where_two_reasons_are_true():
     # because there is no next attempt for a history to place.
     spent = r(task_class="MECHANICAL", prior_failures=cap)
     assert spent["terminal"] == "HUMAN_REQUIRED", spent["notes"]
+    # And the gate does not depend on the config. Round 15: suppressing the
+    # history branch when the budget was spent put an unconditional gate under
+    # `on_retry_exhaustion`, so `notify_human` routed a task with no history at
+    # all, at exit 0. The shipped value hid it; only a different value shows it.
+    for action in ("notify_human", "require_human_confirmation", "terminal"):
+        cfg = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
+                                            "on_retry_exhaustion": action}}
+        out = route(_task(task_class="MECHANICAL", prior_failures=cap), cfg)
+        assert out["terminal"], (
+            f"on_retry_exhaustion={action}: a task with no usable history routed "
+            f"anyway — {out['selected_model']}")
+        assert out["selected_model"] is None
     assert not any("retry history required" in n for n in spent["notes"]), (
         "told to collect a history that cannot be used")
 
@@ -1357,17 +1369,121 @@ def test_d18_an_operational_shortage_is_a_terminal_not_invalid_input():
     assert out["selected_model"] is None and out["requires_human_confirmation"]
 
 
+def test_d19_a_recovered_seat_plan_is_not_reported_as_exhausted():
+    """Round 15. `supply_exhausted` was set while exploring a PRELIMINARY seat
+    set and never cleared, so a route whose final assignment resolved
+    completely was still reported terminal. The fixed point exists to try
+    several plans; a shortage seen in one it discarded is not a fact about the
+    one it emitted."""
+    out = r(task_class="MECHANICAL", flags=["review_disagreement"],
+            unavailable_models=["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+                                "gpt-5.6-luna", "gpt-5.6-sol"])
+    assert out["terminal"] is None, (
+        f"a complete seat plan was reported as {out['terminal']}: {out['notes']}")
+    assert out["selected_model"] == "claude-haiku-4-5-20251001"
+    assert not any("supply exhausted" in n for n in out["notes"])
+
+
+def test_d19_every_control_fires_exactly_on_its_declared_cause():
+    """The answer round 15's reviewers converged on for the class that has cost
+    this loop seven rounds.
+
+    Six of those seven were the same shape: a comment claiming a predicate does
+    one thing while it does another. Prose cannot be checked. A CAUSE CODE
+    paired with the predicate can be — each control now declares one, the route
+    emits which fired, and this asserts that the set of routes where a control
+    fired is exactly the set where its cause holds, computed independently from
+    the inputs. Round 14's Critical — a predicate narrowed to something
+    logically equivalent while its reason string claimed a narrower cause —
+    fails this immediately.
+    """
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    cap = CFG["retry"]["max_total_implementation_attempts"]
+    ids = sorted(tier)
+
+    # Causes computed from the INPUTS and the emitted facts, never from the
+    # control table those inputs feed.
+    def expected(task, out):
+        rv = out["review"]
+        return {
+            "caller_declared_isolation_gap":
+                bool(CFG["review"][rv["band"]].get("independent"))
+                and task.isolation_available is False,
+            "retry_budget_spent": task.prior_failures >= cap,
+            "critical_review_band": rv["band"] == "CRITICAL",
+            "no_adjudicator": bool(rv["judge_unavailable"]),
+            "review_below_band": bool(rv["review_depth_reduced"]),
+        }
+
+    checked = 0
+    seen_causes: set = set()
+    for task_class in ("MECHANICAL", "IMPLEMENTATION", "ARCHITECTURE"):
+        for dims in ((0, 0, 0, 0), (2, 2, 2, 0), (3, 3, 3, 3)):
+            for flags in ([], ["auth_sensitive"], ["review_disagreement"],
+                          ["auth_sensitive", "bridge_down"]):
+                for iso in (None, True, False):
+                    for pf, pm in ((0, []), (1, [ids[4]]), (cap, [ids[4]] * cap)):
+                        for scarce in ([], [ids[0]], ids[:3]):
+                            task = _task(task_class=task_class, complexity=dims[0],
+                                         uncertainty=dims[1], blast_radius=dims[2],
+                                         reversibility=dims[3], flags=list(flags),
+                                         isolation_available=iso, prior_failures=pf,
+                                         prior_models=list(pm),
+                                         unavailable_models=list(scarce))
+                            out = route(task, CFG)
+                            want = {c for c, holds in expected(task, out).items() if holds}
+                            got = set(out["human_control_causes"])
+                            assert got == want, (
+                                f"{task_class}/{dims}/{flags}/iso={iso}/pf={pf}: "
+                                f"controls fired for {sorted(got)}, the inputs say "
+                                f"{sorted(want)}")
+                            seen_causes |= want
+                            checked += 1
+    assert checked > 500, f"only {checked} routes reached the assertion"
+    assert len(seen_causes) >= 4, (
+        f"only {sorted(seen_causes)} were ever exercised; a cause no route "
+        f"triggers is a control this test cannot hold to anything")
+
+
 def test_d18_every_terminal_the_router_assigns_is_declared():
     """Round 14. `TERMINAL_STATES` was a hand-maintained tuple beside the code
     that assigns terminals — a second source of truth, which is what the config
     header forbids and what this artifact has removed twice already. Adding a
     fifth terminal without listing it would leave the documentation guard
     passing while SKILL.md omitted it."""
+    # AST, not regexes. Round 15: the previous version ran its second pattern
+    # against the literal empty string — the seventh instance of the class this
+    # very guard exists to end — and its first pattern saw only the first branch
+    # of a ternary, so a terminal reachable only through the control table or
+    # the false arm of a conditional was invisible.
+    import ast
     src = (SKILL / "scripts" / "route_task.py").read_text()
-    assigned = set(re.findall(r'terminal\s*=\s*(?:terminal or )?"([A-Z_]+)"', src))
-    assigned |= set(re.findall(r'"([A-Z_]+)",\s*$', ""))
+    tree = ast.parse(src)
+    assigned: set = set()
+
+    def literals(node):
+        """Every string constant a value expression can evaluate to."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, ast.IfExp):
+            return literals(node.body) | literals(node.orelse)
+        if isinstance(node, ast.BoolOp):
+            return set().union(*(literals(v) for v in node.values))
+        return set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "terminal":
+                    assigned |= literals(node.value)
+        # `Control(key, cause, fired, TERMINAL, reason)` — the table is the other
+        # place a terminal name enters the router.
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Control":
+            if len(node.args) >= 4:
+                assigned |= literals(node.args[3])
+    assigned.discard("")
     from route_task import TERMINAL_STATES
-    assert assigned, "no terminal assignment found — the pattern drifted"
+    assert len(assigned) >= 4, f"terminal extraction found only {sorted(assigned)}"
     assert assigned <= set(TERMINAL_STATES), (
         f"route() assigns {sorted(assigned - set(TERMINAL_STATES))}, which "
         f"TERMINAL_STATES does not declare")
