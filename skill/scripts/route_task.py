@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -137,6 +137,25 @@ class Policy:
             role: self.tier_of[cfg["models"][key]["id"]]
             for role, key in cfg["role_bindings"]["default"].items()
         }
+        # Every action, not just the exit status. Round 11: the five action
+        # keys were compared against string literals with no validation, so a
+        # one-character typo in `on_any_critical_review` silently deleted the
+        # strongest gate in the policy — no terminal, no exception, no note.
+        # `apply_overrides` in this same file already refuses an unknown effect
+        # key for exactly this reason; being strict there and lax here is the
+        # asymmetry that turns a safety rule into decoration.
+        actions = {"terminal", "require_human_confirmation", "notify_human"}
+        for key in ("on_retry_exhaustion", "on_any_critical_review",
+                    "on_independence_unachievable", "on_judge_unavailable",
+                    "on_review_depth_reduced"):
+            if key not in cfg["human_in_the_loop"]:
+                raise ConfigError(f"human_in_the_loop is missing {key!r}")
+            value = cfg["human_in_the_loop"][key]
+            if value not in actions:
+                raise ConfigError(
+                    f"human_in_the_loop.{key} = {value!r} is not one of {sorted(actions)}; "
+                    f"an unrecognised action would silently disable the control it names")
+
         gate = cfg["human_in_the_loop"]["human_gate_exit_status"]
         # Process exit status is truncated to eight bits, so 256 is 0 — a
         # human-gated route reporting success, which is the single hazard this
@@ -486,8 +505,6 @@ def _failed_tier(task: Task, policy: Policy, resolver: "Resolver") -> int | None
         if item in policy.model_ids:
             tiers.append(policy.tier_of[item])
             continue
-        if item not in resolver.binding:
-            continue
         if (held := resolver.held_by(item)):
             tiers.append(policy.tier_of[held])
     return max(tiers) if tiers else None
@@ -520,7 +537,33 @@ def _promote_above(floor: int, policy: Policy, resolver: "Resolver") -> str | No
     return min(stronger, key=lambda r: (tier(r), policy.roles.index(r)), default=None)
 
 
-def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -> tuple[str, list[str], bool]:
+def _base_worker(task: Task, band: str, policy: Policy,
+                 resolver: "Resolver") -> tuple[str, "Resolver"]:
+    """The worker this task would get with no prior failures, and the resolver
+    that would have bound it.
+
+    Computed by running selection again at `prior_failures = 0`, not by
+    capturing a variable partway down the promotion chain. Round 11 found the
+    capture placed above two promotions that are NOT keyed on `prior_failures`
+    (INVESTIGATION's, and the critical-domain floor), so the reconstruction's
+    base was a role the task never actually started from and a `pf=1` retry
+    re-dispatched the model `pf=0` had just run. The comment claiming "the
+    lines above are pf-independent" was false when it was written; a position
+    in a function is not a property, and it cannot be asserted. This can:
+    `test_d15_the_reconstruction_base_is_the_pf_zero_route` checks it over the
+    whole class x band x flag space.
+    """
+    # A clean resolver as well as a clean task: the caller's resolver already
+    # has the prior failures in `unusable`, so asking it what attempt 1 held
+    # returns attempt 1's REPLACEMENT. That is the same confusion, one level
+    # up, that `held_by` exists to prevent — and it inflated the reconstructed
+    # base by a tier, turning a valid retry into a false exhaustion.
+    clean = replace(task, prior_failures=0, prior_models=[])
+    return select_worker(clean, band, policy, Resolver(clean, policy))[0], Resolver(clean, policy)
+
+
+def select_worker(task: Task, band: str, policy: Policy,
+                  resolver: "Resolver") -> tuple[str, list[str], bool, bool]:
     """Returns (worker, notes, ceiling_exhausted, retry_history_inferred)."""
     binding = resolver.binding
     cfg = policy.cfg
@@ -536,13 +579,6 @@ def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -
         if worker != "principal_architect":
             worker = "principal_architect"
             notes.append("architecture promotion: uncertainty==3 or long_horizon")
-
-    # Everything above this line is independent of `prior_failures`; everything
-    # below depends on it. The reconstruction in the retry block needs the
-    # former, and taking it from here rather than from the finished worker is
-    # what stops the two pf-dependent steps from counting the same promotion
-    # twice.
-    pf_independent = worker
 
     if task.task_class == "DEBUGGING" and task.has("unknown_root_cause") and task.prior_failures >= 2:
         target = "reasoning_specialist" if task.reasoning_centric else "senior_engineer"
@@ -602,11 +638,19 @@ def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -
         # the previous attempt ran. The unnamed branch used to climb the role
         # ladder blindly and, under scarcity, landed a tier BELOW where it
         # started while recording an escalation.
-        current = policy.tier_of[resolver.peek(worker)] if resolver.peek(worker) else -1
-        floor = _failed_tier(task, policy, resolver)
-        named = floor is not None
-        inferred = not named or any(m not in policy.model_ids for m in task.prior_models)
-        if floor is None:
+        named_floor = _failed_tier(task, policy, resolver)
+        # History is COMPLETE only when every failure is accounted for by a
+        # concrete model id. Round 11: `prior_models=["luna"]` with
+        # `prior_failures=2` was read as exact because its one entry was
+        # concrete, so the floor stayed at luna's tier and the retry re-emitted
+        # the model attempt 2 had just run — ungated, at exit 0. Both numbers
+        # are inputs; comparing them is all it takes to notice.
+        complete = (named_floor is not None
+                    and len(task.prior_models) >= task.prior_failures
+                    and all(m in policy.model_ids for m in task.prior_models))
+        inferred = not complete
+        floor = named_floor if named_floor is not None else -1
+        if not complete:
             # Nothing was named. The previous attempt ran wherever this task
             # routes to — and, since this function produced that route too, the
             # attempt before it ran one promotion lower, and so on. Round 9
@@ -616,21 +660,25 @@ def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -
             # escalation and the route stayed dispatchable at exit 0. The
             # magnitude has to be walked back, because `route()` is stateless
             # and `prior_failures` is the only record of it that exists.
-            base = resolver.peek(pf_independent)
-            floor = policy.tier_of[base] if base else current
+            # Whatever the caller told us, reconstruct the ladder the router
+            # itself would have walked and take the stronger of the two floors.
+            # A partial history is a lower bound, not a fact.
+            base_role, base_resolver = _base_worker(task, band, policy, resolver)
+            base = base_resolver.peek(base_role)
+            recon = policy.tier_of[base] if base else -1
             for _ in range(task.prior_failures - 1):
-                step = _promote_above(floor, policy, resolver)
+                step = _promote_above(recon, policy, base_resolver)
                 if step is None:
                     break
-                floor = policy.tier_of[resolver.peek(step)]
+                recon = policy.tier_of[base_resolver.peek(step)]
+            floor = max(floor, recon)
 
-        if current > floor:
-            # Excluding the failed model has already moved the worker above it.
-            # Demanding a further promotion here declared exhaustion while the
-            # route in hand was a correct, stronger retry.
-            notes.append(f"retry resolves above the failed capability tier {floor} "
-                         f"without promotion")
-        else:
+        # No "the worker already resolves above the floor, keep it" shortcut.
+        # It looked like a saving and was the hole both round-11 Criticals came
+        # through: `current` is often exactly the model the previous attempt
+        # ran, so accepting it re-dispatched a known failure while the note
+        # reported an escalation past a tier nothing had run at.
+        if True:
             promoted = _promote_above(floor, policy, resolver)
             if promoted is None:
                 # Exhaustion is terminal in both spellings, but it says which
@@ -650,11 +698,12 @@ def select_worker(task: Task, band: str, policy: Policy, resolver: "Resolver") -
                 notes.append(
                     f"retry ladder exhausted: no usable model is stronger than "
                     f"capability tier {floor}"
-                    + ("" if named else " (reconstructed from prior_failures; no "
-                                        "prior model was named)"))
+                    + ("" if complete else " (reconstructed: the caller did not "
+                                           "account for every prior failure)"))
             else:
                 notes.append(f"escalated above capability tier {floor}"
-                             + (f" after {task.prior_failures} failure(s)" if not named else ""))
+                             + ("" if complete else
+                                f" (reconstructed from {task.prior_failures} failure(s))"))
                 worker = promoted
 
     return worker, notes, ceiling_exhausted, inferred
@@ -1499,7 +1548,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                 for s in (review.get("review_depth_reduced") or [])
             ],
             "band_floor_unsatisfiable": bool(review.get("band_floor_unsatisfiable")),
-            "compensating_reviewers": review.get("compensating_reviewers", 0) if executable else 0,
+            # Not gated on `executable`: that rule exists to withhold concrete
+            # MODELS from a terminal route, and a count is not a model. Zeroing
+            # it produced a terminal route reporting the compensation applied,
+            # two reviewers seated, and zero compensating reviewers.
+            "compensating_reviewers": review.get("compensating_reviewers", 0),
         },
         "cross_family_review": cross_family,
         "fallbacks_applied": (
@@ -1725,6 +1778,9 @@ def _print_text(r: dict) -> None:
     if r["excluded_prior_failures"]:
         print(f"excluded:    {r['excluded_prior_failures']} (already failed)")
     print(f"confidence:  {r['routing_confidence']}")
+    if r["retry_history_inferred"]:
+        print("retry history: RECONSTRUCTED — pass --prior-models <model-id> for every "
+              "prior failure to route this automatically")
     if r["requires_human_confirmation"]:
         print("human:       CONFIRMATION REQUIRED")
     if r["notes"]:

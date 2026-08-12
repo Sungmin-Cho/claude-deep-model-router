@@ -481,17 +481,17 @@ A model that does not resolve is unavailable — fall back per
 
 Read these when the situation calls for them; not needed for a routine route.
 
-- **`routing-policy.md`** — dimensions, bands, overrides, worker and effort
+- **`references/routing-policy.md`** — dimensions, bands, overrides, worker and effort
   selection in full, with the reasoning behind each weight.
-- **`model-profiles.md`** — the five roles, what each is for, what each must not
+- **`references/model-profiles.md`** — the five roles, what each is for, what each must not
   be the sole authority on, and the current bindings.
-- **`review-policy.md`** — review by band, independence mechanics per runtime,
+- **`references/review-policy.md`** — review by band, independence mechanics per runtime,
   who may hold the judge seat, the reviewer output contract, disagreements.
-- **`control-loop.md`** — escalation triggers, retry limits, which model "ran"
+- **`references/control-loop.md`** — escalation triggers, retry limits, which model "ran"
   and how that inference has gone wrong, routing confidence, observability.
-- **`adapters.md`** — runtime differences, effort mapping, transports, and the
+- **`references/adapters.md`** — runtime differences, effort mapping, transports, and the
   fallback matrices. Read when a model is unavailable or you cross the bridge.
-- **`examples.md`** — worked routing decisions, including the four cases an
+- **`references/examples.md`** — worked routing decisions, including the four cases an
   earlier version of this policy got wrong.
 
 Configuration lives in `config/model-routing.yaml`. Model identifiers appear

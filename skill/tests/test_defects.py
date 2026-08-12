@@ -14,6 +14,7 @@ Run:  python3 -m pytest skill/tests/ -q
 
 import itertools
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -190,8 +191,16 @@ def test_d2_retry_exhaustion_is_terminal_not_a_route():
 
 
 def test_d2_low_routing_confidence_is_terminal_not_a_route():
-    out = r(task_class="DEBUGGING", complexity=3, uncertainty=3, blast_radius=1,
-            flags=["unknown_root_cause"], prior_failures=2, prior_models=["worker_fast"])
+    # Round 11 moved this probe. The original (`DEBUGGING 3/3/1`, two failures,
+    # one named alias) now hits the retry ceiling FIRST — the reconstruction
+    # correctly places attempt 2 at the top tier, so `HUMAN_REQUIRED` fires
+    # before confidence is consulted. That is the right answer for that input
+    # and not what this test is about, so the probe was moved to one where
+    # confidence is the binding constraint. The subject is unchanged: a route
+    # below the escalation floor is terminal, not an executable route.
+    out = r(task_class="MECHANICAL", complexity=0, uncertainty=2, blast_radius=0,
+            flags=["unknown_root_cause", "bridge_down"], prior_failures=2,
+            prior_models=["gpt-5.6-luna", "claude-sonnet-5"])
     assert out["routing_confidence"] < CFG["router"]["confidence"]["escalate_below"]
     assert out["terminal"] == "ESCALATE_ROUTING"
     assert out["selected_model"] is None
@@ -1162,6 +1171,118 @@ def test_d14_a_role_alias_that_ran_a_fallback_is_not_read_as_its_nominal_model()
     assert second["selected_model"] != first["selected_model"], (
         f"re-ran {first['selected_model']} after it failed: {second['notes']}")
     assert tier[second["selected_model"]] > tier[first["selected_model"]]
+
+
+def test_d15_the_reconstruction_base_is_the_pf_zero_route():
+    """Round 11. The base used to be captured by POSITION — a variable assigned
+    partway down the promotion chain, with a comment claiming everything above
+    it was independent of `prior_failures`. Two promotions below it were also
+    independent, so the base was a role the task never started from and a pf=1
+    retry re-dispatched what pf=0 had just run. A position in a function is not
+    a property and cannot be asserted; this can."""
+    from route_task import _base_worker
+    checked = 0
+    for task_class in TASK_CLASSES:
+        for dims in ((0, 0, 0, 0), (1, 1, 1, 1), (2, 2, 2, 0), (3, 3, 3, 3)):
+            for flags in ([], ["unknown_root_cause"], ["auth_sensitive"], ["long_horizon"]):
+                for pf in (1, 2, 3):
+                    kw = dict(task_class=task_class, complexity=dims[0], uncertainty=dims[1],
+                              blast_radius=dims[2], reversibility=dims[3], flags=list(flags))
+                    zero = r(**kw)
+                    if not zero["selected_role"]:
+                        continue
+                    task = _task(**kw, prior_failures=pf)
+                    band = zero["review"]["band"] if False else None
+                    from route_task import Policy, Resolver, score, band_from_score, apply_overrides
+                    policy = Policy.of(CFG)
+                    b = band_from_score(score(task, CFG), policy)
+                    b = apply_overrides(task, b, policy)[0]
+                    base, _ = _base_worker(task, b, policy, Resolver(task, policy))
+                    assert base == zero["selected_role"], (
+                        f"{task_class}/{dims}/{flags}/pf={pf}: reconstruction starts from "
+                        f"{base}, but the pf=0 route runs {zero['selected_role']}")
+                    checked += 1
+                    del band
+    assert checked > 100, f"only {checked} combinations reached the assertion"
+
+
+def test_d15_a_partial_history_is_not_treated_as_a_complete_one():
+    """Round 11. `prior_models` was read as exact whenever its entries were
+    concrete ids, without checking that they account for every failure. Two
+    failures with one named model kept the floor at that one model's tier, so
+    the retry re-emitted the model attempt 2 had just run — ungated, exit 0."""
+    tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+    first = r(task_class="MECHANICAL")
+    second = r(task_class="MECHANICAL", prior_failures=1,
+               prior_models=[first["selected_model"]])
+    assert not second["retry_history_inferred"], "complete history must not be gated"
+    stale = r(task_class="MECHANICAL", prior_failures=2,
+              prior_models=[first["selected_model"]])
+    assert stale["selected_model"] != second["selected_model"], (
+        f"re-emitted {second['selected_model']} after it failed: {stale['notes']}")
+    assert tier[stale["selected_model"]] > tier[second["selected_model"]]
+    assert stale["retry_history_inferred"] and stale["requires_human_confirmation"], (
+        "an incomplete history was presented as verified")
+    # And the other direction: more models than failures is a contradiction the
+    # router should not silently absorb.
+    complete = r(task_class="MECHANICAL", prior_failures=2,
+                 prior_models=[first["selected_model"], second["selected_model"]])
+    assert not complete["retry_history_inferred"], "complete history was gated anyway"
+
+
+def test_d15_every_human_control_action_is_validated_and_load_bearing():
+    """Round 11. The five action keys were compared against string literals with
+    no vocabulary check, so a one-character typo deleted the control silently.
+    Each is checked twice here: an unknown value must fail at construction, and
+    a DIFFERENT valid value must actually change behaviour — otherwise the key
+    is read but inert, which is the shape that has cost three rounds."""
+    from route_task import Policy, ConfigError
+    keys = ("on_retry_exhaustion", "on_any_critical_review",
+            "on_independence_unachievable", "on_judge_unavailable",
+            "on_review_depth_reduced")
+    for key in keys:
+        for bad in ("require_human_confirmaton", "", None, 1, "TERMINAL"):
+            altered = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"], key: bad}}
+            with pytest.raises(ConfigError):
+                Policy(altered)
+
+    # Load-bearing: flip the CRITICAL gate to notify-only and the route must
+    # stop requiring confirmation.
+    # A route where the CRITICAL gate is the ONLY trigger — otherwise flipping
+    # it changes nothing and the test would pass on an inert control.
+    critical = dict(task_class="MECHANICAL", complexity=0, uncertainty=3,
+                    blast_radius=0, reversibility=0, flags=["auth_sensitive"])
+    assert r(**critical)["requires_human_confirmation"]
+    relaxed = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
+                                            "on_any_critical_review": "notify_human"}}
+    out = route(_task(**critical), relaxed)
+    assert not out["requires_human_confirmation"], (
+        "on_any_critical_review is read but changes nothing — an inert control")
+
+
+def test_d15_every_reference_skill_md_names_actually_exists():
+    """Round 11, and self-inflicted: chasing the 500-line budget I stripped the
+    `references/` prefix from all six links in SKILL.md, so every path an agent
+    is told to open resolved to nothing. A line budget is not worth a broken
+    artifact, and nothing was checking."""
+    text = (SKILL / "SKILL.md").read_text()
+    # EVERY backticked .md token, not just the ones already carrying the
+    # prefix: the defect was a prefix being dropped, so a pattern that only
+    # matches prefixed paths cannot see it.
+    named = set(re.findall(r"`([A-Za-z0-9_./-]+\.md)`", text))
+    assert len(named) >= 6, f"SKILL.md names only {sorted(named)}"
+    broken = sorted(n for n in named if n != "SKILL.md" and not (SKILL / n).is_file())
+    assert not broken, (
+        f"SKILL.md tells an agent to open {broken}, which do not resolve relative "
+        f"to it; the files live under references/")
+    for doc in sorted((SKILL / "references").glob("*.md")):
+        assert f"references/{doc.name}" in text, f"{doc.name} is never pointed at"
+
+    # Fences must balance, or a section renders as literal code — this round's
+    # new control-loop.md text was swallowed by an unclosed ```yaml block.
+    for doc in sorted((SKILL / "references").glob("*.md")) + [SKILL / "SKILL.md"]:
+        fences = sum(1 for line in doc.read_text().splitlines() if line.startswith("```"))
+        assert fences % 2 == 0, f"{doc.name} has {fences} code fences — one is unclosed"
 
 
 def test_d14_an_alias_is_resolved_through_both_withholding_channels():

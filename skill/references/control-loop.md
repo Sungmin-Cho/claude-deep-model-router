@@ -45,6 +45,8 @@ max_review_rounds:                 3
 max_judge_invocations:             1
 require_new_evidence_on_same_tier: true    # "tier" = capability_tier of the
                                           # model that RAN
+```
+
 
 ### Which model "ran"
 
@@ -80,7 +82,6 @@ changed between attempts**, so a model the reconstruction places at tier 1 may
 in fact have been tier 2. Neither is recoverable statelessly. The gate is the
 honest response: the route is still emitted, and a person decides whether the
 reconstruction is good enough for this change.
-```
 
 **A second attempt at the same tier must carry a changed hypothesis or new
 evidence.** Without one, the attempt is not permitted and the router must
