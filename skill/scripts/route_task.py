@@ -91,6 +91,29 @@ class Policy:
         self.model_ids: frozenset[str] = frozenset(m["id"] for m in cfg["models"].values())
         self.id_to_key: dict[str, str] = {m["id"]: k for k, m in cfg["models"].items()}
         self.family_of: dict[str, str] = {m["id"]: m["family"] for m in cfg["models"].values()}
+
+        # Strength, measured on the model rather than on the role holding it.
+        # Every comparison that used `roles.index(...)` as a proxy for capability
+        # was wrong the moment scarcity made a role resolve to something other
+        # than its nominal binding, which is the whole reason a fallback exists.
+        self.tier_of: dict[str, int] = {
+            m["id"]: m["capability_tier"] for m in cfg["models"].values()
+        }
+
+        # What each band demands of a reviewer, expressed as a model tier and
+        # derived from the band's own configured reviewer roles under the
+        # canonical binding. Computed, never written down twice: a floor kept
+        # in a second place is a floor that drifts from the policy it guards.
+        nominal = {
+            role: self.tier_of[cfg["models"][key]["id"]]
+            for role, key in cfg["role_bindings"]["default"].items()
+        }
+        self.band_reviewer_floor: dict[str, int] = {}
+        for band, spec in cfg["review"].items():
+            roles = spec.get("reviewers") or spec.get("candidates") or []
+            roles = [r for r in roles if r in nominal]
+            self.band_reviewer_floor[band] = min((nominal[r] for r in roles), default=0)
+
         # Which family survives when the cross-provider bridge is down.
         self.local_family: dict[str, str] = {
             runtime: cfg["models"][cfg["role_bindings"][binding]["worker_fast"]]["family"]
@@ -610,57 +633,100 @@ def _deconflict(spec: dict, worker: str, policy: Policy, resolver: "Resolver") -
 
 def _seat_judge(review: dict, worker: str, judge_role: str, policy: "Policy",
                 resolver: "Resolver") -> tuple[dict, str | None]:
-    """Give the judge a model no other seat holds, at or above the reviewers'
-    tier.
+    """Give the judge a model no other seat holds, no weaker than any model it
+    will adjudicate.
+
+    Every comparison here is on the resolved model's `capability_tier`, not on
+    the role's position in the ladder. Round 6 found why that distinction is
+    not pedantry: under scarcity `worker_fast` can resolve to the frontier
+    model and `worker_balanced` to a mid one, and ranking those by role ordinal
+    seats the weaker model as the judge of the stronger — an adjudicator that
+    the parties outrank, reported as a clean route.
 
     Allocation is greedy — worker, then reviewers, then judge — and the
-    reviewer step maximises tier, so the judge could be told no adequate model
-    was free while one sat unused behind a reviewer that did not need it. When
-    that happens, one reviewer is re-seated lower (never below the implementer)
-    to release the top tier, and the judge is tried again. Reporting
-    `judge_unavailable` while a valid full assignment exists is a false stop,
-    and a stop nobody can act on is as unhelpful as a missing one.
+    reviewer step maximises tier, so the judge can be told no adequate model
+    was free while one sits unused behind a reviewer that did not need it.
+    When that happens one reviewer is re-seated lower and the judge is tried
+    again, but never below what the *band* asks of a reviewer. The floor used
+    to be the implementer's tier, which is not a review requirement at all:
+    with a `worker_fast` implementer it let a HIGH band be reviewed two tiers
+    below its own policy, silently, to buy a judge seat. Review depth is not
+    currency. If the judge cannot be seated without spending it, the judge is
+    unavailable and a human is asked — a shortage the caller can act on.
     """
+    def tier(role: str) -> int:
+        model = resolver.peek(role)
+        return policy.tier_of[model] if model else -1
+
     def taken(reviewers):
         return {resolver.peek(worker)} | {resolver.peek(x) for x in reviewers}
 
     def pick(reviewers):
-        floor = max((policy.roles.index(x) for x in reviewers), default=0)
+        # No party may outrank its adjudicator — including the implementer,
+        # who is a party to any dispute about its own work.
+        floor = max((tier(x) for x in [worker, *reviewers]), default=0)
         used = taken(reviewers)
         pool = [x for x in policy.roles
-                if policy.roles.index(x) >= floor and resolver.peek(x)
-                and resolver.peek(x) not in used]
-        return max(pool, key=policy.roles.index, default=None)
+                if resolver.peek(x) and resolver.peek(x) not in used and tier(x) >= floor]
+        return max(pool, key=tier, default=None)
 
     reviewers = list(review["reviewers"])
-    if resolver.peek(judge_role) not in taken(reviewers):
+    if resolver.peek(judge_role) not in taken(reviewers) and tier(judge_role) >= max(
+            (tier(x) for x in [worker, *reviewers]), default=0):
         return review, judge_role
 
     if (found := pick(reviewers)):
         review = dict(review)
         return review, found
 
-    # Retry once, freeing the highest reviewer seat if a distinct lower one
-    # (still at or above the implementer) can take its place.
-    worker_tier = policy.roles.index(worker)
-    highest = max(range(len(reviewers)), key=lambda i: policy.roles.index(reviewers[i]), default=None)
+    # Retry once, freeing the strongest reviewer seat if another model that
+    # still satisfies the band can take its place.
+    floor = policy.band_reviewer_floor.get(review["band"], 0)
+    # The implementer's model is off-limits to a replacement reviewer only
+    # where the band asked for independence. At LOW the implementer reviewing
+    # itself is the documented design, so treating its model as taken invents
+    # a shortage and reports `judge_unavailable` for a judge that was free.
+    barred = taken(reviewers) if review["independent"] else {
+        resolver.peek(x) for x in reviewers}
+    highest = max(range(len(reviewers)), key=lambda i: tier(reviewers[i]), default=None)
     if highest is not None:
-        used = taken([x for i, x in enumerate(reviewers) if i != highest])
+        used = barred - {resolver.peek(reviewers[highest])} | {
+            resolver.peek(x) for i, x in enumerate(reviewers) if i != highest}
         alternatives = [x for x in policy.roles
-                        if x not in reviewers and policy.roles.index(x) >= worker_tier
-                        and resolver.peek(x) and resolver.peek(x) not in used]
-        for alt in sorted(alternatives, key=policy.roles.index):
+                        if x not in reviewers and resolver.peek(x)
+                        and resolver.peek(x) not in used and tier(x) >= floor]
+        for alt in sorted(alternatives, key=tier):
             trial = list(reviewers)
             trial[highest] = alt
             if (found := pick(trial)) and resolver.peek(found) not in taken(trial):
                 review = dict(review)
                 review["reviewers"] = trial
-                review.setdefault("self_review_avoided", [])
+                # The seat that a substitution record pointed at has just been
+                # re-seated. Leaving the record as written makes the rationale
+                # name a reviewer who is not there — the module's own rule is
+                # that a recorded change must be a real change, and it applies
+                # to the record as much as to the change.
+                review["self_review_avoided"] = _restate(
+                    review.get("self_review_avoided"), reviewers[highest], alt)
                 return review, found
 
     review = dict(review)
     review["judge_unavailable"] = True
     return review, None
+
+
+def _restate(records: list[dict] | None, old: str, new: str) -> list[dict]:
+    """Re-point substitution records whose landing seat was re-seated."""
+    out = []
+    for record in records or []:
+        if record.get("with") != old:
+            out.append(record)
+        elif record.get("replaced") != new:
+            out.append({**record, "with": new})
+        # else: the displaced role is back in the seat, so nothing was
+        # substituted after all and the record describes an event that did
+        # not survive. It is dropped rather than corrected.
+    return out
 
 
 def _extra_reviewer(review: dict, worker: str, policy: "Policy", resolver: "Resolver") -> str | None:
@@ -976,10 +1042,39 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             review["independence_compromised"] = True
     if judge_role:
         judge_model = resolved.get(judge_role)
-        if judge_model and judge_model in [m for m in seat_models.values() if m]:
+        parties = [m for m in seat_models.values() if m]
+        outranked = judge_model and parties and (
+            policy.tier_of[judge_model] < max(policy.tier_of[m] for m in parties))
+        if judge_model and (judge_model in parties or outranked):
             review = dict(review)
             review["judge_unavailable"] = True
             judge_role = None
+
+    # Post-conditions on the emitted review, both unconditional.
+    #
+    # The first asks whether the reviewers who ended up in the seats still meet
+    # the depth the band asked for. Fallbacks and de-confliction both re-seat
+    # reviewers under scarcity, and neither consults the band while doing it,
+    # so a HIGH review can be staffed at tier 0. That may be the best available
+    # assignment — it is not one to emit as if the band were satisfied.
+    #
+    # The second asks whether every recorded substitution still describes the
+    # final roster. A record that names a reviewer who is not there is worse
+    # than no record: it is the rationale asserting a fact about the route that
+    # the route contradicts.
+    floor = policy.band_reviewer_floor.get(review["band"], 0)
+    shortfall = [
+        {"reviewer": role, "model": resolved[role],
+         "capability_tier": policy.tier_of[resolved[role]], "band_requires": floor}
+        for role in review["reviewers"] if resolved.get(role)
+        and policy.tier_of[resolved[role]] < floor
+    ]
+    recorded = review.get("self_review_avoided") or []
+    reconciled = [s for s in recorded if s.get("with") in review["reviewers"]]
+    if shortfall or len(reconciled) != len(recorded):
+        review = dict(review)
+        review["review_depth_reduced"] = shortfall
+        review["self_review_avoided"] = reconciled
 
     fams = {r: policy.family_of[m] for r, m in resolved.items()}
     reviewer_families = {fams[r] for r in review["reviewers"] if r in fams}
@@ -1021,6 +1116,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         # is exactly the false-assurance shape this policy exists to avoid.
         or review.get("independence_compromised")
         or review.get("judge_unavailable")
+        # A review staffed below its band is a weaker review than the risk
+        # score asked for. The router cannot restore the depth, so it stops
+        # pretending the band was met and hands the trade-off to a human.
+        or review.get("review_depth_reduced")
     )
 
     # A terminal route emits no execution bindings at all. Nulling only the
@@ -1058,6 +1157,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             "self_review_avoided": review.get("self_review_avoided") or [],
             "independence_compromised": bool(review.get("independence_compromised")),
             "judge_unavailable": bool(review.get("judge_unavailable")),
+            "review_depth_reduced": review.get("review_depth_reduced") or [],
         },
         "cross_family_review": cross_family,
         "fallbacks_applied": (
@@ -1111,6 +1211,10 @@ def explain(task: Task, r: dict) -> str:
     if rv.get("judge_unavailable"):
         parts.append("No independent adjudicator is available at or above the reviewers' tier; "
                      "a human must resolve any disagreement.")
+    for short in (rv.get("review_depth_reduced") or []):
+        parts.append(f"Review depth reduced: {short['reviewer']} resolves to {short['model']} "
+                     f"(tier {short['capability_tier']}), below the tier "
+                     f"{short['band_requires']} this band asks of a reviewer.")
     if rv["judge"]:
         parts.append(f"Judge: {rv['judge']}.")
     if rv["required_checks"]:
@@ -1252,6 +1356,11 @@ def _print_text(r: dict) -> None:
         print(f"  checks:          {', '.join(rv['required_checks'])}")
     if rv["judge"]:
         print(f"  judge:           {rv['judge']}" + (f" -> {rv['judge_model']}" if rv["judge_model"] else ""))
+    elif rv["judge_unavailable"]:
+        print("  judge:           UNAVAILABLE — a human settles any disagreement")
+    for short in rv["review_depth_reduced"]:
+        print(f"  depth reduced:   {short['reviewer']} -> {short['model']} "
+              f"(tier {short['capability_tier']} < {short['band_requires']} required by band)")
     print(f"cross_family_review: {r['cross_family_review']}")
     print(f"fallbacks:   {r['fallbacks_applied'] or '(none)'}")
     if r["fallback_compensations_applied"]:

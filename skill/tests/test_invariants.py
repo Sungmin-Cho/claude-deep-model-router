@@ -41,6 +41,14 @@ CFG = load_config()
 MODEL_IDS = sorted(m["id"] for m in CFG["models"].values())
 FAMILY_OF = {m["id"]: m["family"] for m in CFG["models"].values()}
 LOCAL_FAMILY = {"claude_code": "claude", "codex": "openai"}
+TIER_OF = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+NOMINAL_TIER = {role: TIER_OF[CFG["models"][key]["id"]]
+                for role, key in CFG["role_bindings"]["default"].items()}
+BAND_FLOOR = {
+    band: min((NOMINAL_TIER[r] for r in (spec.get("reviewers") or spec.get("candidates") or [])
+               if r in NOMINAL_TIER), default=0)
+    for band, spec in CFG["review"].items()
+}
 
 # Dimension corners plus a midpoint. Bands are determined by the weighted sum,
 # so the corners cover every band and the midpoint catches boundary handling.
@@ -76,12 +84,29 @@ SCARCITY = [
 
 RUNTIMES = ["claude_code", "codex"]
 
+# Round 6: without this dimension `excluded_prior_failures` was empty on all
+# 8,712 routes, so the invariant that a failed model is never re-emitted
+# intersected with the empty set every single time. Reverting round 2's fix
+# left all twenty invariants green. Both spellings are swept — a role alias,
+# which the router resolves through the *current* binding, and a concrete id,
+# which it does not — because they take different paths through the exclusion.
+PRIOR = [
+    [],
+    ["senior_engineer"],
+    ["worker_fast", "worker_balanced"],
+    [MODEL_IDS[2]],
+    [MODEL_IDS[0], MODEL_IDS[4]],
+]
+
+
+_WITHHELD = 0
+
 
 def _routes():
     """Every reachable route. Terminal ones are yielded too — several
     invariants are specifically about what a terminal route must withhold."""
-    for task_class, dims, flags, runtime, scarce in itertools.product(
-        TASK_CLASSES, DIMENSIONS, FLAG_SETS, RUNTIMES, SCARCITY
+    for task_class, dims, flags, runtime, scarce, prior in itertools.product(
+        TASK_CLASSES, DIMENSIONS, FLAG_SETS, RUNTIMES, SCARCITY, PRIOR
     ):
         c, u, b, rev = dims
         try:
@@ -89,9 +114,12 @@ def _routes():
                 task_class=task_class, complexity=c, uncertainty=u,
                 blast_radius=b, reversibility=rev, flags=list(flags),
                 runtime=runtime, unavailable_models=list(scarce),
+                prior_models=list(prior),
             ), CFG)
         except ValidationError:
             # Every candidate withheld: failing closed is a correct outcome.
+            global _WITHHELD
+            _WITHHELD += 1
             continue
 
 
@@ -126,9 +154,41 @@ def test_the_sweep_is_large_and_reaches_the_interesting_states():
         "fallback": sum(1 for o in all_routes if o["fallbacks_applied"]),
         "compensation": sum(1 for o in all_routes if o["fallback_compensations_applied"]),
         "bridge_down": sum(1 for o in all_routes if "bridge down" in o["rationale"]),
+        # Round 6 added the three below. Each names the precondition of an
+        # invariant that was passing on zero routes.
+        "prior_exclusion": sum(1 for o in all_routes if o["excluded_prior_failures"]),
+        "depth_reduced": sum(1 for o in all_routes if o["review"]["review_depth_reduced"]),
+        "fallback_note": sum(1 for o in all_routes
+                             if any("->" in n for n in o["fallbacks_applied"])),
     }
     missing = [k for k, v in reached.items() if v == 0]
     assert not missing, f"the sweep never reached: {missing}"
+
+
+def test_every_swept_dimension_actually_varies():
+    """The generalisation of the round-6 failure.
+
+    Counting reached *output* states was not enough: the prior-failure
+    dimension existed in the invariant's filter but never in the sweep's
+    input, so the state it guarded was unreachable by construction and the
+    guard above had nothing to notice. A dimension that contributes one
+    distinct value is a dimension that is not being tested, whatever the
+    output counts say — so the sweep asserts its own inputs vary."""
+    dimensions = {
+        "TASK_CLASSES": TASK_CLASSES, "DIMENSIONS": DIMENSIONS,
+        "FLAG_SETS": FLAG_SETS, "RUNTIMES": RUNTIMES,
+        "SCARCITY": SCARCITY, "PRIOR": PRIOR,
+    }
+    flat = [(k, len({tuple(v) if isinstance(v, (list, tuple)) else v for v in vals}))
+            for k, vals in dimensions.items()]
+    collapsed = [k for k, n in flat if n < 2]
+    assert not collapsed, f"swept dimension(s) contribute a single value: {collapsed}"
+
+    # And each must reach the router: a dimension varied in the list but
+    # dropped on the way into Task() is the same defect one layer down.
+    assert len(routes()) == len(list(itertools.product(
+        TASK_CLASSES, DIMENSIONS, FLAG_SETS, RUNTIMES, SCARCITY, PRIOR
+    ))) - _WITHHELD, "sweep size does not match the product of its dimensions"
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +235,43 @@ def test_the_judge_is_never_a_party_at_any_band():
         )
 
 
-def test_a_seated_judge_is_never_weaker_than_the_reviewers_it_adjudicates():
+def test_a_seated_judge_is_never_weaker_than_any_party_it_adjudicates():
+    """Round 6. The previous spelling compared ROLE ORDINALS, and under
+    scarcity a role holds whatever model is left: `worker_fast` on the frontier
+    model, `worker_balanced` on a mid one. Twenty-seven routes seated a tier-1
+    judge over a tier-3 implementer and its reviewer, and the role comparison
+    called it well ordered. The implementer counts as a party — it is one side
+    of any dispute about its own work."""
     for out in routes():
         rv = out["review"]
-        if out["terminal"] or not rv["judge"]:
+        if out["terminal"] or not rv["judge_model"]:
             continue
-        floor = max((ROLES.index(x) for x in rv["reviewers"]), default=0)
-        assert ROLES.index(rv["judge"]) >= floor
+        involved = parties(out)
+        assert involved, "a judge was seated with no party to adjudicate"
+        assert TIER_OF[rv["judge_model"]] >= max(TIER_OF[m] for m in involved), (
+            f"{out['task_class']}/{rv['band']}: judge {rv['judge_model']} "
+            f"(tier {TIER_OF[rv['judge_model']]}) is outranked by {involved}"
+        )
+
+
+def test_a_review_below_its_band_floor_is_disclosed_and_gated():
+    """Round 6. Fallbacks and de-confliction both re-seat reviewers without
+    consulting the band, so a HIGH review could be staffed at tier 0 and emitted
+    as if the band had been met. The router cannot restore the depth; what it
+    must not do is stay quiet about spending it."""
+    for out in routes():
+        rv = out["review"]
+        if out["terminal"]:
+            continue
+        floor = BAND_FLOOR[rv["band"]]
+        under = [m for m in rv["reviewer_models"] if m and TIER_OF[m] < floor]
+        if not under:
+            assert not rv["review_depth_reduced"], "reported a shortfall that is not there"
+            continue
+        assert rv["review_depth_reduced"], (
+            f"{rv['band']} staffed at {under} (floor tier {floor}) without disclosure")
+        assert out["requires_human_confirmation"], (
+            f"{rv['band']} staffed below its floor and still dispatchable")
 
 
 # ---------------------------------------------------------------------------
@@ -244,14 +334,34 @@ def test_every_recorded_fallback_actually_changed_the_model():
             if "->" not in note:
                 continue
             before, after = (s.strip() for s in note.split("->", 1))
-            assert before.split(":")[-1].strip() != after, f"no-op fallback recorded: {note}"
+            # Round 6: the previous spelling compared "X unavailable" against
+            # "X" and so could never fail. Ten paths emitting round 1's exact
+            # Critical — a fallback that lands on the model it replaced — stayed
+            # green. The marker word has to come off before the comparison.
+            before = before.split(":")[-1].strip().removesuffix(" unavailable").strip()
+            assert before and before != after, f"no-op fallback recorded: {note}"
 
 
 def test_every_recorded_substitution_changed_who_sits_in_the_seat():
+    """Round 6, twice over. The name promised seats and the body compared role
+    labels, so a substitution that landed on the same model read as a change;
+    and nothing checked the record against the final roster, so the judge retry
+    could re-seat the very reviewer a record named and leave the rationale
+    asserting a reviewer who is not on the route."""
     for out in routes():
         rv = out["review"]
+        if out["terminal"]:
+            continue
+        seated = dict(zip(rv["reviewers"], rv["reviewer_models"]))
         for sub in rv["self_review_avoided"]:
             assert sub["replaced"] != sub["with"]
+            assert sub["with"] in rv["reviewers"], (
+                f"rationale names reviewer {sub['with']} but the seats hold "
+                f"{rv['reviewers']}")
+            assert seated.get(sub["with"]) != out["selected_model"] or not rv[
+                "independence_required"], (
+                f"substitution landed back on the implementer model "
+                f"{out['selected_model']}")
 
 
 def test_a_compensation_is_recorded_only_when_it_was_applied():

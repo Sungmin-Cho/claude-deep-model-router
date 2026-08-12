@@ -124,6 +124,7 @@ routing_metrics:
   review_independence: enforced | planned | degraded | unavailable | not_applicable
   independence_compromised: true | false
   judge_unavailable: true | false
+  review_depth_reduced: []   # reviewers seated below the tier their band asks for
   cross_family_review: true | false
   fallbacks_applied: []
   escalation_count:

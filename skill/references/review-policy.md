@@ -266,3 +266,22 @@ disagreement or just picked a side.
 
 The judge's verdict is final for that round, and it counts against
 `max_review_rounds`.
+
+### Who may hold the judge seat
+
+The adjudicator must be a model that no party already holds, and no weaker than
+any of them — the implementer included, since it is one side of any dispute
+about its own work. Both conditions are checked on the **resolved model**, not
+on the role label. Under scarcity a role holds whatever model is left, so
+`worker_fast` can end up on the frontier model while `worker_balanced` holds a
+mid one; ranked by role label that assignment looks well ordered and seats the
+weaker model as judge of the stronger.
+
+When the seats cannot be arranged to satisfy both conditions, one reviewer may
+be re-seated to free a model — but never below the tier its band asks of a
+reviewer. Review depth is not currency for buying a judge seat. If the judge
+can only be seated by spending it, the judge is unavailable and a human settles
+any disagreement, which is a shortage the caller can act on. At `LOW` the
+implementer reviewing itself is the documented design, so its model is not
+treated as occupied when re-seating a reviewer — treating it as occupied
+invents a shortage and withholds a judge that was free.

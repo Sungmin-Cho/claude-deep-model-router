@@ -160,6 +160,20 @@ failing means the review itself cannot happen as specified, so there is nothing
 safe to dispatch. A missing adjudicator means the review can still run; what a
 human takes over is settling a disagreement, should one arise.
 
+Two things are compared on the **resolved model's `capability_tier`**, never on
+a role's position in the ladder: whether a judge outranks the parties it
+adjudicates, and whether a reviewer meets the tier its band asks for. Under
+scarcity a role holds whatever model is left — `worker_fast` can end up on the
+frontier model and `worker_balanced` on a weaker one — so ranking an assignment
+by role label ranks it backwards exactly when scarcity makes the ranking matter.
+
+`review_depth_reduced` is non-empty when the seats that could actually be filled
+are weaker than the band requires. The route stays executable and asks a human:
+the router cannot restore the depth, and whether a thinner review is acceptable
+for this change is a judgement about the change. It never trades review depth
+for a judge seat — if the adjudicator can only be seated by demoting a reviewer
+below the band, the adjudicator is unavailable instead.
+
 If you cannot run the script, compute it by hand from the tables below — the
 script reads `config/model-routing.yaml`, and this file describes the same
 policy, so the two must agree.
@@ -404,8 +418,11 @@ review:
   independence_required:       # what the band asks for
   review_independence:         # what was actually established
   independence_compromised:    # no distinct model was available for a seat
-  judge_unavailable:           # no adjudicator at or above the reviewers' tier
-  self_review_avoided: []      # [{replaced, with, reason}], only real changes
+  judge_unavailable:           # no adjudicator at or above every party's tier
+  review_depth_reduced: []     # [{reviewer, model, capability_tier, band_requires}]
+  self_review_avoided: []      # [{replaced, with, reason}]; `with` is always a
+                               # role in `reviewers` above — a record that names
+                               # someone not seated is a contradiction, not a note
   required_checks: []
   judge:  judge_model:         # null when judge_unavailable — a human adjudicates
 cross_family_review: true | false

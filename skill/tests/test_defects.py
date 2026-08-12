@@ -27,6 +27,8 @@ from route_task import (  # noqa: E402
     BANDS,
     ROLES,
     TASK_CLASSES,
+    Policy,
+    Resolver,
     Task,
     ValidationError,
     load_config,
@@ -36,12 +38,16 @@ from route_task import (  # noqa: E402
 CFG = load_config()
 
 
-def r(**kw):
+def _task(**kw):
     kw.setdefault("complexity", 0)
     kw.setdefault("uncertainty", 0)
     kw.setdefault("blast_radius", 0)
     kw.setdefault("reversibility", 0)
-    return route(Task(**kw), CFG)
+    return Task(**kw)
+
+
+def r(**kw):
+    return route(_task(**kw), CFG)
 
 
 def cli(*args):
@@ -584,17 +590,19 @@ SCARCITY_SWEEP = [
 ]
 
 
-def _sweep():
+def _sweep(with_task=False):
     for task_class in TASK_CLASSES:
         for c, u, b, rev in DIMENSION_SWEEP:
             for reasoning in (False, True):
                 for binding in BINDING_SWEEP:
                     for scarce in SCARCITY_SWEEP:
                         try:
-                            yield r(task_class=task_class, complexity=c, uncertainty=u,
-                                    blast_radius=b, reversibility=rev,
-                                    reasoning_centric=reasoning,
-                                    unavailable_models=list(scarce), **binding)
+                            kwargs = dict(task_class=task_class, complexity=c, uncertainty=u,
+                                          blast_radius=b, reversibility=rev,
+                                          reasoning_centric=reasoning,
+                                          unavailable_models=list(scarce), **binding)
+                            out = r(**kwargs)
+                            yield (_task(**kwargs), out) if with_task else out
                         except ValidationError:
                             # Every candidate withheld — failing closed is a
                             # correct outcome, not a route to inspect.
@@ -684,10 +692,17 @@ def test_d10_every_recorded_substitution_actually_changed_the_model():
     """The defect this whole file exists to prevent, applied to the newest
     code: a recorded avoidance that avoided nothing."""
     seen = 0
-    for out in _sweep():
+    # Both sweeps. `_sweep()` never sets a flag, so it never takes the
+    # disagreement route, so it never seats a judge — and the judge retry is
+    # exactly where round 6 found a substitution record outliving the seat it
+    # described. A regression test that cannot reach the path is the failure
+    # mode this whole file is named for.
+    for out in itertools.chain(_sweep(), _disagreement_sweep()):
         rv = out["review"]
         for sub in (rv.get("self_review_avoided") or []):
             seen += 1
+            assert sub["with"] in rv["reviewers"], (
+                f"record names reviewer {sub['with']}, seats hold {rv['reviewers']}")
             assert sub["replaced"] != sub["with"]
             assert sub["with"] in ROLES
             assert sub["reason"]
@@ -715,43 +730,63 @@ def test_d10_a_below_tier_substitute_is_only_taken_when_nothing_better_is_free()
     None` (always true, it is a bool) and that the rationale contains a string
     `explain()` emits unconditionally on that branch — the same shape as the
     `or True` tautology `test_d9` forbids, so the invariant in its own name was
-    never checked."""
-    checked = 0
-    for out in _sweep():
+    never checked.
+
+    Round 6 found the replacement still could not fail. It asked "was a
+    stronger role free?" through `_peek_model`, which only knows roles that
+    appear in the emitted route — so an *unseated* candidate, the only kind
+    that could have been free, returned `None` and was skipped. 1,829 of the
+    checks were skipped that way and the 1,512 that ran merely rediscovered
+    models already in `used`. The question is about roles the route did not
+    take, so it has to be asked of the resolver, not of the answer.
+    """
+    checked = free_seen = 0
+    for task, out in _sweep(with_task=True):
         rv = out["review"]
         if out["terminal"] or not out["selected_role"]:
             continue
-        worker_tier = ROLES.index(out["selected_role"])
-        weak = [x for x in rv["reviewers"] if ROLES.index(x) < worker_tier]
+        # Only substituted seats are in scope. A band that configures a
+        # cheaper reviewer than the implementer (LOW does, by design) is not a
+        # substitution and asserting over it tests the policy, not the code.
+        seated = dict(zip(rv["reviewers"], rv["reviewer_models"]))
+        tier = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
+        resolver = Resolver(task, Policy.of(CFG))
+        worker_tier = tier[out["selected_model"]]
+        weak = [seated[sub["with"]] for sub in rv["self_review_avoided"]
+                if seated.get(sub["with"]) and tier[seated[sub["with"]]] < worker_tier]
         if not weak:
             continue
         checked += 1
-        used = {out["selected_model"], *(m for m in rv["reviewer_models"] if m)}
-        stronger_free = [
-            role for role in ROLES
-            if ROLES.index(role) >= worker_tier and role not in rv["reviewers"]
-        ]
-        # A stronger role only counts as "free" if it would resolve to a model
-        # nobody holds; otherwise picking it would have created a collision.
-        assert all(
-            m in used
-            for role in stronger_free
-            for m in [_peek_model(out, role)]
-            if m is not None
-        ), f"{out['task_class']}/{rv['band']}: took {weak} while a stronger model was unused"
+        used = {out["selected_model"], *(m for m in rv["reviewer_models"] if m),
+                rv["judge_model"]} - {None}
+        for role in ROLES:
+            if role in rv["reviewers"]:
+                continue
+            model = resolver.peek(role)          # asks the resolver, not the route
+            if model is None:
+                continue
+            free_seen += 1
+            assert model in used or tier[model] < worker_tier, (
+                f"{out['task_class']}/{rv['band']}: reviewed at {weak} while "
+                f"{role} -> {model} (tier {tier[model]}) sat unused"
+            )
     assert checked, "no below-tier substitution in the sweep — the assertion was vacuous"
+    assert free_seen, "no unseated candidate was ever resolved — the check was skipped"
 
 
 def _peek_model(out, role):
-    """The model a role resolved to in this route, if it appears in it."""
-    if role == out["selected_role"]:
-        return out["selected_model"]
+    """The model a role holds *as a reviewer* in this route.
+
+    Round 6: the previous version fell through to the judge seat, so when the
+    judge retry re-seated a reviewer this returned the displaced role's model
+    from the judge and the stale substitution record looked consistent. A
+    substitution record is about a reviewer slot; reading it out of the judge
+    seat answers a different question than the one being asked.
+    """
     rv = out["review"]
     for name, model in zip(rv["reviewers"], rv["reviewer_models"]):
         if name == role:
             return model
-    if rv["judge"] == role:
-        return rv["judge_model"]
     return None
 
 

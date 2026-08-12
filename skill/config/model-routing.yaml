@@ -313,6 +313,12 @@ human_in_the_loop:
   on_any_critical_review:       require_human_confirmation
   on_independence_unachievable: terminal
   on_judge_unavailable:         require_human_confirmation
+  # Scarcity can leave a band's review staffed below the model tier the band
+  # asks for. The router cannot restore the depth; what it must not do is
+  # emit the route as though the band had been satisfied. Whether a weaker
+  # review is acceptable for this particular change is a judgement about the
+  # change, which is a human's to make and not the router's to assume.
+  on_review_depth_reduced:      require_human_confirmation
   on_routing_confidence_below:  0.60   # escalate the routing decision itself
 
 # ---------------------------------------------------------------------------
@@ -322,45 +328,64 @@ human_in_the_loop:
 # Every id below was probed in this environment. See verification_ledger.
 
 models:
+  # `capability_tier` is the model's strength as a *model*, independent of any
+  # role it happens to be bound to. Every strength comparison in the router —
+  # judge-vs-party, reviewer-vs-band-floor, substitution-vs-replaced — reads
+  # this, never a role's position in `role_tiers`.
+  #
+  # Rounds 3 through 6 of review each found the same defect wearing a new hat:
+  # a decision made on a ROLE LABEL while the RESOLVED MODEL was what mattered.
+  # Under scarcity a role resolves to whatever is left, so `worker_fast` can
+  # hold a frontier model and `worker_balanced` a weaker one — at which point
+  # role ordinals rank the assignment backwards. Peers share a tier: the two
+  # frontier models are interchangeable in strength and differ only in what
+  # they are good at, which `reasoning_centric` decides, not this number.
   claude_worker_fast:
     id: claude-haiku-4-5-20251001
     family: claude
+    capability_tier: 0
     verified: true
     price_per_mtok: { input: 1.00, output: 5.00, cached_input: 0.10 }
 
   claude_worker_balanced:
     id: claude-sonnet-5
     family: claude
+    capability_tier: 1
     verified: true
     price_per_mtok: { input: 3.00, output: 15.00 }
 
   claude_senior:
     id: claude-opus-5
     family: claude
+    capability_tier: 2
     verified: true
     price_per_mtok: { input: 5.00, output: 25.00 }
 
   claude_architect:
     id: claude-fable-5
     family: claude
+    capability_tier: 3
     verified: true
     price_per_mtok: { input: 10.00, output: 50.00 }
 
   openai_worker_fast:
     id: gpt-5.6-luna
     family: openai
+    capability_tier: 0
     verified: true
     price_per_mtok: { input: 0.20, output: 1.20, cached_input: 0.02 }
 
   openai_worker_balanced:
     id: gpt-5.6-terra
     family: openai
+    capability_tier: 1
     verified: true
     price_per_mtok: { input: 2.00, output: 12.00 }
 
   openai_reasoning:
     id: gpt-5.6-sol
     family: openai
+    capability_tier: 2
     verified: true
     price_per_mtok: { input: 5.00, output: 30.00 }
 
