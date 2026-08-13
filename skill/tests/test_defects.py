@@ -1369,6 +1369,53 @@ def test_d18_an_operational_shortage_is_a_terminal_not_invalid_input():
     assert out["selected_model"] is None and out["requires_human_confirmation"]
 
 
+def test_d22_a_production_hotfix_dispatches_now_and_owes_the_confirmation():
+    """Round 20, and the first finding that came from USING the skill rather
+    than reviewing it.
+
+    `production_hotfix` raises the band, so a live incident got the frontier
+    model, near-max effort, dual independent review AND a pre-dispatch human
+    gate — the slowest, most-blocked path the policy can produce, for the
+    situation with the least time. The four dimensions score what a change IS
+    and what it might COST; none of them represents the cost of DELAY.
+
+    The review is not the problem and does not move. What moves is when the
+    human is asked."""
+    probe = dict(task_class="DEBUGGING", complexity=1, uncertainty=2,
+                 blast_radius=3, reversibility=0, flags=["production_hotfix"])
+    out = r(**probe)
+    rv = out["review"]
+    assert rv["band"] == "CRITICAL" and len(rv["reviewers"]) == 2
+    assert rv["independence_required"], "the deferral cost the review its independence"
+    assert not out["requires_human_confirmation"], "a live incident is still blocked"
+    assert out["human_confirmation_deferred"]
+    assert any("owed AFTER" in n for n in out["notes"])
+
+    # A shell must be able to tell "run it" from "run it and then confirm".
+    proc = cli("--class", "DEBUGGING", "--complexity", "1", "--uncertainty", "2",
+               "--blast-radius", "3", "--reversibility", "0",
+               "--flags", "production_hotfix")
+    assert proc.returncode == 4, (
+        f"a deferred confirmation exited {proc.returncode}; 0 means nothing "
+        f"further is required, and something is")
+    assert "CONFIRMATION OWED" in proc.stdout
+
+    # It is a policy, and the other value has to work.
+    blocking = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"],
+                                             "on_production_hotfix": "require_human_confirmation"}}
+    strict = route(_task(**probe), blocking)
+    assert strict["requires_human_confirmation"] and not strict["human_confirmation_deferred"], (
+        "on_production_hotfix is read but changes nothing — an inert control")
+
+    # And a review that cannot be trusted still blocks, incident or not.
+    degraded = r(task_class="DEBUGGING", complexity=1, uncertainty=2, blast_radius=3,
+                 reversibility=0, flags=["production_hotfix", "auth_sensitive"],
+                 unavailable_models=["claude-opus-5", "gpt-5.6-sol"])
+    assert degraded["review"]["review_depth_reduced"], "probe drifted"
+    assert degraded["requires_human_confirmation"]
+    assert not degraded["human_confirmation_deferred"]
+
+
 def test_d20_a_shortage_never_buries_a_reason_the_caller_can_act_on():
     """Round 16. Round 15 gave `SUPPLY_EXHAUSTED` precedence so a symptom would
     stop masking the cause, and used a plain assignment — which overshot the

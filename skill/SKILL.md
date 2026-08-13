@@ -143,7 +143,9 @@ openable by typing would be the exact failure this skill is about.
 
 Exit status is the part of this contract a shell can act on, so every outcome
 needing a person is nonzero: **0** dispatchable, **1** terminal, **2** invalid
-input, and `human_in_the_loop.human_gate_exit_status` (**3** by default) for a
+input, **4** dispatchable with a confirmation owed afterwards (a production
+hotfix — the review runs at full depth, the human is asked after the fix
+ships), and `human_in_the_loop.human_gate_exit_status` (**3** by default) for a
 route executable only after a human confirms — `requires_human_confirmation` is
 a boolean in a JSON blob, and a caller reading success as authorisation walks
 straight through it.
@@ -442,6 +444,7 @@ excluded_prior_failures: []    # models withheld because they already failed
 escalation_count:  retry_count:
 routing_confidence:
 requires_human_confirmation:
+human_confirmation_deferred:   # a production hotfix: dispatch now, confirm after
 human_control_causes: []       # which human_in_the_loop controls fired, by
                                # cause code — the machine-checkable half of the
                                # reason strings in the rationale

@@ -727,12 +727,38 @@ def test_independence_is_never_reported_as_enforced_without_evidence():
 # Gates — a control that discloses but does not stop is not a control
 # ---------------------------------------------------------------------------
 
-def test_every_critical_review_requires_a_human():
-    """Round 4. The router cannot verify an isolation receipt's provenance, so
-    it never treats one as proof."""
+def test_every_critical_review_requires_a_human_before_or_after():
+    """Round 4, widened in round 20. The router cannot verify an isolation
+    receipt's provenance, so it never treats one as proof — a CRITICAL review
+    always involves a person.
+
+    What round 20 added is WHEN. A production hotfix may dispatch first and owe
+    the confirmation afterwards, because blocking a live incident before
+    dispatch costs more than it buys. The obligation does not disappear; it
+    moves. So the invariant is the disjunction, and the deferred half is held
+    to the conditions that make it safe."""
+    deferred_seen = 0
     for out in routes():
-        if out["review"]["band"] == "CRITICAL":
-            assert out["requires_human_confirmation"] is True
+        rv = out["review"]
+        if rv["band"] != "CRITICAL":
+            continue
+        assert out["requires_human_confirmation"] or out["human_confirmation_deferred"], (
+            f"{out['task_class']}: a CRITICAL review with no human, before or after")
+        if out["human_confirmation_deferred"]:
+            deferred_seen += 1
+            # Deferral is for a review that can be trusted to run properly. A
+            # review that cannot is not made acceptable by an incident.
+            assert "production_hotfix" in out["critical_flags"] or any(
+                "hotfix" in n for n in out["notes"]), "deferred without a hotfix"
+            assert not rv["independence_compromised"]
+            assert not rv["review_depth_reduced"]
+            # `judge_unavailable` is deliberately allowed: an adjudicator is
+            # needed only if the reviewers disagree, which happens after the
+            # review, which is where the deferred confirmation already is.
+            assert out["terminal"] is None
+            assert rv["independence_required"], "deferral weakened the review"
+            assert len(rv["reviewers"]) >= 2, "deferral cost the review a seat"
+    assert deferred_seen, "no deferred route in the sweep — the branch is untested"
 
 
 def test_compromised_independence_is_terminal():
@@ -743,9 +769,13 @@ def test_compromised_independence_is_terminal():
 
 
 def test_an_unavailable_judge_gates_even_though_it_does_not_stop():
+    """Round 20 widened this the same way as the CRITICAL gate: a deferred
+    hotfix answers the judge question after the review, not before it."""
     for out in routes():
         if out["review"]["judge_unavailable"] and not out["terminal"]:
-            assert out["requires_human_confirmation"] is True
+            assert (out["requires_human_confirmation"]
+                    or out["human_confirmation_deferred"]), (
+                "no adjudicator and no human asked, before or after")
             assert out["review"]["judge"] is None
 
 

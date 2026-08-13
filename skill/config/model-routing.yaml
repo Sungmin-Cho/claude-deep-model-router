@@ -326,6 +326,25 @@ human_in_the_loop:
   # emit the route as though the band had been satisfied. Whether a weaker
   # review is acceptable for this particular change is a judgement about the
   # change, which is a human's to make and not the router's to assume.
+  # A live incident is the one case where blocking BEFORE dispatch costs more
+  # than it buys. Round 20 measured it: `production_hotfix` raises the band, so
+  # a hotfix got the frontier model, MAX-adjacent effort, dual independent
+  # review AND a pre-dispatch human gate — the slowest, most-blocked path the
+  # policy can produce, for the situation with the least time.
+  #
+  # The review is not the problem and does not change: depth, independence and
+  # reviewer count stay exactly what the band asks. What moves is WHEN the human
+  # is asked. `defer_human_confirmation` lets the fix dispatch now and records
+  # that a confirmation is owed; `require_human_confirmation` blocks first, for
+  # teams that would rather wait. Both are real policies, which is what makes
+  # this a setting rather than a constant.
+  #
+  # Deferral is scoped to the band's own review gate. A route whose reviewers
+  # could not be made independent, or whose review is staffed below its band,
+  # still blocks — those say the review cannot be trusted, and a hotfix does
+  # not make an untrustworthy review acceptable.
+  on_production_hotfix:         defer_human_confirmation
+
   # Enforced through the CLI exit status (3), not only through a boolean in
   # the JSON: a caller that reads success as authorisation walks through a gate
   # it cannot see. Terminal states stay 1; invalid input stays 2.

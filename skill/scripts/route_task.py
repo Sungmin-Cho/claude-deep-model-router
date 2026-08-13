@@ -206,9 +206,16 @@ class Policy:
         # require_human_confirmation` removed both the terminal AND the gate.
         # The error message promised the opposite of what the check did.
         implemented = {"terminal", "require_human_confirmation", "notify_human"}
-        for key, allowed in ((k, implemented) for k in (
-                "on_independence_unachievable", "on_any_critical_review",
-                "on_judge_unavailable", "on_review_depth_reduced")):
+        # `on_production_hotfix` has its own vocabulary: deferring is not one of
+        # the three general actions, and the general three are not all
+        # meaningful for it (a hotfix policy that terminates would stop the
+        # incident response it exists to serve).
+        per_key = dict.fromkeys((
+            "on_independence_unachievable", "on_any_critical_review",
+            "on_judge_unavailable", "on_review_depth_reduced"), implemented)
+        per_key["on_production_hotfix"] = {
+            "require_human_confirmation", "defer_human_confirmation"}
+        for key, allowed in per_key.items():
             if key not in cfg["human_in_the_loop"]:
                 raise ConfigError(f"human_in_the_loop is missing {key!r}")
             value = cfg["human_in_the_loop"][key]
@@ -1634,6 +1641,32 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # decided — including the ones the config set to `notify_human`.
     requires_human = bool(terminal) or requires_human
 
+    # Deferral, decided last so it can see every gate that fired. Round 20:
+    # what moves is WHEN the human is asked, and only where the review itself
+    # can be trusted. `independence_compromised` and `review_depth_reduced` say
+    # it cannot be — the reviewers are the implementer under another label, or
+    # there are fewer of them than the band requires — and an incident does not
+    # make an untrustworthy review acceptable. Those keep blocking, as does any
+    # terminal.
+    #
+    # `judge_unavailable` deliberately does NOT block deferral. An adjudicator
+    # is needed only if the two reviewers disagree, which is an event AFTER the
+    # review runs, and the deferred confirmation is where that lands anyway.
+    # Excluding it looked prudent and was measured to be wrong: the canonical
+    # incident — a CRITICAL hotfix whose frontier models are all sitting in
+    # reviewer seats — has no free adjudicator almost by construction, so the
+    # exclusion turned the deferral off exactly where it was written for.
+    deferred = False
+    if (task.has("production_hotfix") and requires_human and not terminal
+            and hitl["on_production_hotfix"] == "defer_human_confirmation"
+            and not review.get("independence_compromised")
+            and not review.get("review_depth_reduced")):
+        deferred = True
+        requires_human = False
+        effort_notes.append(
+            "production hotfix: the review runs at full depth and the human "
+            "confirmation is owed AFTER the fix ships, not before it")
+
     for key, why in notified:
         if terminal:
             outcome = "recorded; the route is terminal for another reason"
@@ -1718,6 +1751,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         # reason strings are for people; these are what a test can hold the
         # predicate to.
         "human_control_causes": sorted(fired_causes),
+        # Dispatchable now, and a confirmation is owed once it has shipped. Not
+        # folded into `requires_human_confirmation`: a caller that blocks on
+        # that boolean would block on this too, which is the whole thing the
+        # deferral exists to avoid.
+        "human_confirmation_deferred": deferred,
         "notes": worker_notes + effort_notes,
     }
     result["rationale"] = explain(task, result)
@@ -1894,7 +1932,13 @@ def main(argv: list[str] | None = None) -> int:
     # 3 is executable-after-approval, distinct so a caller can tell them apart.
     if result["terminal"]:
         return 1
-    return policy.human_gate_exit_status if result["requires_human_confirmation"] else 0
+    if result["requires_human_confirmation"]:
+        return policy.human_gate_exit_status
+    # 4: run it, then get the confirmation. A shell that treats 0 as "nothing
+    # further is required" would drop the obligation, and an obligation nobody
+    # can read from the exit status is the disclosure-instead-of-control shape
+    # this module rejects everywhere else.
+    return 4 if result["human_confirmation_deferred"] else 0
 
 
 def _print_text(r: dict) -> None:
@@ -1938,6 +1982,8 @@ def _print_text(r: dict) -> None:
 
     if r["requires_human_confirmation"]:
         print("human:       CONFIRMATION REQUIRED")
+    elif r["human_confirmation_deferred"]:
+        print("human:       CONFIRMATION OWED AFTER THE FIX SHIPS (production hotfix)")
     if r["notes"]:
         print("notes:")
         for n in r["notes"]:

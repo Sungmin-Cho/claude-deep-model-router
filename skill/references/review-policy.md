@@ -103,6 +103,35 @@ reviewer's output, **including when the verdict is `PASS`** — recorded as
 "checked, no finding". A silent omission is indistinguishable from a check that
 never ran, so a `CRITICAL` review missing one is invalid and must be re-run.
 
+## A live incident
+
+`production_hotfix` raises the band, which is right: a bad change during an
+incident compounds. What it must not do is make the response slower than the
+incident. The four dimensions score what a change *is* (complexity,
+reversibility) and what it might *cost* (uncertainty, blast radius); none of
+them represents the cost of **delay**, so without this rule a hotfix and an
+unhurried architecture change get identical handling.
+
+So the review does not move — same band, same depth, same two independent
+reviewers, same required checks — and the **human confirmation does**:
+
+| | ordinary CRITICAL | `production_hotfix` |
+|---|---|---|
+| reviewers | 2, independent | 2, independent |
+| required checks | all five | all five |
+| human | before dispatch (exit 3) | after the fix ships (exit 4) |
+
+`human_in_the_loop.on_production_hotfix` chooses between the two, because a team
+that would rather wait is making a legitimate call and not a mistake.
+
+Deferral is scoped to the band's own review gate. A review that cannot be
+trusted still blocks: `independence_compromised` means the reviewers are the
+implementer under another label, and `review_depth_reduced` means there are
+fewer of them than the band asks. An incident does not make an untrustworthy
+review acceptable. `judge_unavailable` deliberately does not block deferral —
+an adjudicator is needed only if the two reviewers disagree, which is an event
+after the review, which is where the deferred confirmation already is.
+
 ## Reviewer independence
 
 Two reviews are independent if and only if reviewer B's input contains no token
