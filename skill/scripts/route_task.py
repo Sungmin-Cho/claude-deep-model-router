@@ -274,10 +274,18 @@ class Policy:
                     f"default binding; its reviewer floor is undefined")
             self.band_reviewer_floor[band] = min(nominal[r] for r in roles)
 
-        # Which family survives when the cross-provider bridge is down.
+        # Which family survives when the cross-provider bridge is down. Read
+        # from the config rather than a hardcoded pair: a third runtime used to
+        # mean editing three separate two-way branches, and the one that used an
+        # `else` silently sent an unknown runtime to the wrong binding.
+        # `degraded_binding` is validated single-family above, so any role in it
+        # names the same family.
+        self.degraded_binding: dict[str, str] = {
+            runtime: spec["degraded_binding"] for runtime, spec in cfg["runtimes"].items()
+        }
         self.local_family: dict[str, str] = {
-            runtime: cfg["models"][cfg["role_bindings"][binding]["worker_fast"]]["family"]
-            for runtime, binding in (("claude_code", "claude_only"), ("codex", "openai_only"))
+            runtime: cfg["models"][next(iter(cfg["role_bindings"][binding].values()))]["family"]
+            for runtime, binding in self.degraded_binding.items()
         }
 
     @classmethod
@@ -1044,7 +1052,7 @@ class Resolver:
         self.binding_name = "default"
         self.notes: list[str] = []
         if self.bridge_down:
-            self.binding_name = "claude_only" if task.runtime == "claude_code" else "openai_only"
+            self.binding_name = policy.degraded_binding[task.runtime]
             self.notes.append(f"binding degraded to {self.binding_name} (cross-provider bridge down)")
         self.binding = cfg["role_bindings"][self.binding_name]
 
@@ -1081,7 +1089,7 @@ class Resolver:
         if (primary := self.binding.get(role)):
             ordered.append(primary)
         ordered.extend(cfg["fallbacks"].get(self.task.runtime, {}).get(role, []))
-        degraded_name = "claude_only" if self.task.runtime == "claude_code" else "openai_only"
+        degraded_name = self.policy.degraded_binding[self.task.runtime]
         if (d := cfg["role_bindings"][degraded_name].get(role)):
             ordered.append(d)
         index = self.policy.roles.index(role)

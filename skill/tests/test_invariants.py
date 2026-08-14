@@ -41,7 +41,10 @@ from route_task import (  # noqa: E402
 CFG = load_config()
 MODEL_IDS = sorted(m["id"] for m in CFG["models"].values())
 FAMILY_OF = {m["id"]: m["family"] for m in CFG["models"].values()}
-LOCAL_FAMILY = {"claude_code": "claude", "codex": "openai"}
+LOCAL_FAMILY = {
+    rt: FAMILY_OF[CFG["models"][next(iter(CFG["role_bindings"][spec["degraded_binding"]].values()))]["id"]]
+    for rt, spec in CFG["runtimes"].items()
+}
 TIER_OF = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
 NOMINAL_TIER = {role: TIER_OF[CFG["models"][key]["id"]]
                 for role, key in CFG["role_bindings"]["default"].items()}
@@ -90,7 +93,7 @@ SCARCITY = [
     [MODEL_IDS[0], MODEL_IDS[1], MODEL_IDS[3], MODEL_IDS[5], MODEL_IDS[6]],
 ]
 
-RUNTIMES = ["claude_code", "codex"]
+RUNTIMES = sorted(CFG["runtimes"])
 
 # Round 6: without this dimension `excluded_prior_failures` was empty on all
 # 8,712 routes, so the invariant that a failed model is never re-emitted
