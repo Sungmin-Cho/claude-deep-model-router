@@ -181,7 +181,9 @@ neither by demoting a reviewer below the band nor by re-seating one onto the
 implementer's own model; the adjudicator is reported unavailable instead.
 `band_floor_unsatisfiable` marks a shortage that will *not* clear by retrying,
 and a compensation's bonus seat never upgrades the band's own independence
-requirement. `references/review-policy.md` has the seating rules.
+requirement. `effort_below_floor` fires when a seated model's ceiling is below
+the effort a floor required; the route stays executable and asks a human.
+`references/review-policy.md` has the seating rules.
 
 If you cannot run the script, compute it by hand from the tables below — the
 script reads `config/model-routing.yaml`, and this file describes the same
@@ -325,6 +327,10 @@ weaken the review.
 | `MEDIUM` | one stronger role, cross-family preferred | `HIGH` | yes |
 | `HIGH` | senior_engineer + reasoning_specialist | `HIGH` | yes |
 | `CRITICAL` | senior_engineer + reasoning_specialist | `MAX` | yes |
+
+A reviewer's effective effort is its `effort_ceiling_applied` entry's
+`capped_at` when one exists, otherwise `review.effort`. The CLI token is that
+level looked up in `effort_map` under the reviewer model's family.
 
 `CRITICAL` additionally requires every one of these to appear as an explicit
 finding category — including when the answer is "checked, nothing found":

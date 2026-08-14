@@ -1214,7 +1214,8 @@ def test_d15_every_human_control_action_is_validated_and_load_bearing():
     # producing the same route, because the cap is a safety limit rather than a
     # policy choice. A key whose values cannot differ is not configuration.
     keys = ("on_independence_unachievable", "on_any_critical_review",
-            "on_judge_unavailable", "on_review_depth_reduced")
+            "on_judge_unavailable", "on_review_depth_reduced",
+            "on_effort_below_floor")
     for key in keys:
         for bad in ("require_human_confirmaton", "", None, 1, "TERMINAL", "gate"):
             altered = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"], key: bad}}
@@ -1253,6 +1254,31 @@ def test_d15_every_human_control_action_is_validated_and_load_bearing():
         assert seen["require_human_confirmation"][1], f"{key}: no gate"
         assert len(set(seen.values())) >= 2, (
             f"{key}: every action produces the same outcome {seen} — read, but inert")
+
+    # `on_effort_below_floor` needs a model that cannot reach the band's review
+    # effort. Injected here rather than assumed from the registry, so the probe
+    # states its own precondition.
+    capped_cfg = {**CFG, "models": {**CFG["models"], "claude_senior": {
+        **CFG["models"]["claude_senior"], "effort_ceiling": "HIGH"}}}
+    seen = {}
+    probe = dict(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+                 blast_radius=3, reversibility=2, flags=["auth_sensitive"])
+    for action in ("terminal", "require_human_confirmation", "notify_human"):
+        cfg = {**capped_cfg, "human_in_the_loop": {
+            **capped_cfg["human_in_the_loop"], "on_effort_below_floor": action}}
+        out = route(_task(**probe), cfg)
+        seen[action] = (out["terminal"] is not None,
+                        out["requires_human_confirmation"])
+    assert seen["terminal"][0], "on_effort_below_floor: 'terminal' produced no terminal state"
+    assert seen["require_human_confirmation"][1], "on_effort_below_floor: no gate"
+    assert len(set(seen.values())) >= 2, (
+        f"on_effort_below_floor: every action produces the same outcome {seen}")
+
+    for bad in ("require_human_confirmaton", "", None, 1, "TERMINAL", "gate"):
+        altered = {**CFG, "human_in_the_loop": {
+            **CFG["human_in_the_loop"], "on_effort_below_floor": bad}}
+        with pytest.raises(ConfigError):
+            Policy(altered)
 
 
 def test_d15_every_reference_skill_md_names_actually_exists():
@@ -1597,6 +1623,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
         "critical_review_band": "a CRITICAL review cannot be accepted automatically",
         "no_adjudicator": "no adjudicator is available",
         "review_below_band": "the review is staffed below its band",
+        "effort_below_floor":
+            "the selected model cannot reach the effort a floor required",
     }
     from route_task import CAUSE_REASONS
     assert CAUSE_REASONS == EXPECTED_WORDING, (
@@ -1617,6 +1645,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
             "critical_review_band": rv["band"] == "CRITICAL",
             "no_adjudicator": bool(rv["judge_unavailable"]),
             "review_below_band": bool(rv["review_depth_reduced"]),
+            "effort_below_floor": any(
+                r["floor_broken"] for r in out["effort_ceiling_applied"]),
         }
 
     # The oracle must cover exactly the causes the router declares. A control

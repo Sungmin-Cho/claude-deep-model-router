@@ -83,6 +83,8 @@ CAUSE_REASONS = {
     "critical_review_band": "a CRITICAL review cannot be accepted automatically",
     "no_adjudicator": "no adjudicator is available",
     "review_below_band": "the review is staffed below its band",
+    "effort_below_floor":
+        "the selected model cannot reach the effort a floor required",
 }
 
 
@@ -248,7 +250,8 @@ class Policy:
         # incident response it exists to serve).
         per_key = dict.fromkeys((
             "on_independence_unachievable", "on_any_critical_review",
-            "on_judge_unavailable", "on_review_depth_reduced"), implemented)
+            "on_judge_unavailable", "on_review_depth_reduced",
+            "on_effort_below_floor"), implemented)
         per_key["on_production_hotfix"] = {
             "require_human_confirmation", "defer_human_confirmation"}
         for key, allowed in per_key.items():
@@ -1606,6 +1609,22 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # cannot be checked; a cause code can, and
     # `test_d19_every_control_fires_exactly_on_its_declared_cause` asserts that
     # each control's predicate partitions the sweep exactly as its cause says.
+    # Reviewer and judge seats, now that the roster is final. Their floor is
+    # the review band's own effort — the promoted band, because that is the
+    # review that will run. Unlike the worker there is no table/floor split
+    # here: what the band names IS the requirement.
+    review_floor = cfg["review"][review["band"]]["effort"]
+    for role in list(review["reviewers"]) + ([judge] if judge else []):
+        model = resolved.get(role)
+        capped = _clamp(policy, review_floor, model)
+        if capped != review_floor:
+            ceiling_records.append({
+                "role": role, "model": model,
+                "requested": review_floor, "capped_at": capped,
+                "floor_broken": f"review.{review['band']}.effort",
+                "floor_requires": review_floor,
+            })
+
     hitl = cfg["human_in_the_loop"]
     controls = [
         Control("on_independence_unachievable", "caller_declared_isolation_gap",
@@ -1619,6 +1638,9 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                 "HUMAN_REQUIRED"),
         Control("on_review_depth_reduced", "review_below_band",
                 bool(review.get("review_depth_reduced")),
+                "HUMAN_REQUIRED"),
+        Control("on_effort_below_floor", "effort_below_floor",
+                any(r["floor_broken"] for r in ceiling_records),
                 "HUMAN_REQUIRED"),
     ]
 
@@ -1757,7 +1779,8 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     if (task.has("production_hotfix") and requires_human and not terminal
             and hitl["on_production_hotfix"] == "defer_human_confirmation"
             and not review.get("independence_compromised")
-            and not review.get("review_depth_reduced")):
+            and not review.get("review_depth_reduced")
+            and not any(r["floor_broken"] for r in ceiling_records)):
         deferred = True
         requires_human = False
         effort_notes.append(

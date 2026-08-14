@@ -349,6 +349,10 @@ human_in_the_loop:
   # the JSON: a caller that reads success as authorisation walks through a gate
   # it cannot see. Terminal states stay 1; invalid input stays 2.
   on_review_depth_reduced:      require_human_confirmation
+  # A seat whose model cannot reach the effort a floor required. Same family of
+  # fact as `review_depth_reduced` — the review does not run at the depth the
+  # band asked for — so a hotfix does not defer it either.
+  on_effort_below_floor:        require_human_confirmation
   human_gate_exit_status:       3
   # `on_routing_confidence_below` used to sit here holding 0.60 — the same
   # number as `router.confidence.escalate_below`, which is the one the router
