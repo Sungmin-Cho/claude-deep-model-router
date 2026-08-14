@@ -275,8 +275,11 @@ def test_s18_both_runtimes_agree_on_role_effort_and_review_band():
     assert a["review"]["band"] == b["review"]["band"]
     assert a["review"]["reviewers"] == b["review"]["reviewers"]
     assert a["risk_band"] == b["risk_band"]
-    # The native effort spelling is the one thing allowed to differ; it is
-    # asserted concretely in test_defects.py::test_d9_parity_holds_...
+    # Round 21: the native spelling used to be the one field allowed to differ
+    # between runtimes. It is now keyed by the family of the model that runs,
+    # and both runtimes resolve the same worker under the shared binding — so
+    # it is equal too, and asserting that is what keeps this honest.
+    assert a["selected_effort_native"] == b["selected_effort_native"]
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +375,12 @@ def test_every_role_resolves_in_every_binding():
 
 
 def test_effort_maps_cover_every_conceptual_level():
-    for runtime, mapping in CFG["effort_map"].items():
-        assert set(mapping) == set(CFG["effort_levels"]), f"{runtime} effort map is incomplete"
+    families = {m["family"] for m in CFG["models"].values()}
+    assert set(CFG["effort_map"]) == families, (
+        "effort_map is keyed by model family; every family needs a spelling")
+    for family, mapping in CFG["effort_map"].items():
+        assert set(mapping) == set(CFG["effort_levels"]), (
+            f"{family} does not spell every conceptual level")
 
 
 def test_review_policy_exists_for_every_band():

@@ -170,10 +170,32 @@ class Policy:
         self.task_classes: list[str] = list(cfg["worker_selection"])
         self.critical_domain_flags: tuple[str, ...] = tuple(cfg["flags"]["critical_domain"])
         self.known_flags: frozenset[str] = frozenset(f for g in cfg["flags"].values() for f in g)
-        self.runtimes: frozenset[str] = frozenset(cfg["effort_map"])
+        self.runtimes: frozenset[str] = frozenset(cfg["runtimes"])
         self.model_ids: frozenset[str] = frozenset(m["id"] for m in cfg["models"].values())
         self.id_to_key: dict[str, str] = {m["id"]: k for k, m in cfg["models"].items()}
         self.family_of: dict[str, str] = {m["id"]: m["family"] for m in cfg["models"].values()}
+
+        # The two blocks describe different axes and must both be complete:
+        # a runtime with no degraded binding cannot survive a downed bridge,
+        # and a family with no effort map cannot have its effort spelled.
+        for runtime, spec in cfg["runtimes"].items():
+            binding = spec["degraded_binding"]
+            if binding not in cfg["role_bindings"]:
+                raise ConfigError(
+                    f"runtimes.{runtime}.degraded_binding names {binding!r}, "
+                    f"which is not a role binding")
+            fams = {cfg["models"][k]["family"] for k in cfg["role_bindings"][binding].values()}
+            if len(fams) != 1:
+                raise ConfigError(
+                    f"role_bindings.{binding} spans {sorted(fams)}; a degraded "
+                    f"binding is what survives when the bridge is down, so it "
+                    f"must name exactly one family")
+        families = set(self.family_of.values())
+        if set(cfg["effort_map"]) != families:
+            raise ConfigError(
+                f"effort_map is keyed by model family; it covers "
+                f"{sorted(cfg['effort_map'])} but the registry holds "
+                f"{sorted(families)}")
 
         # Strength, measured on the model rather than on the role holding it.
         # Every comparison that used `roles.index(...)` as a proxy for capability
@@ -1705,7 +1727,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "selected_role": worker if executable else None,
         "selected_model": resolved.get(worker) if executable else None,
         "selected_effort": effort if executable else None,
-        "selected_effort_native": cfg["effort_map"][task.runtime][effort] if executable else None,
+        # The family of the model that will actually run, not the family of
+        # the host. See the note on `effort_map` in the config.
+        "selected_effort_native": (
+            cfg["effort_map"][policy.family_of[resolved[worker]]][effort]
+            if executable else None),
         "review": {
             "band": review["band"],
             "reviewers": review["reviewers"],

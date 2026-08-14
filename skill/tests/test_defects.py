@@ -577,10 +577,11 @@ def test_d9_parity_holds_including_the_native_effort_spelling():
     assert a["selected_role"] == b["selected_role"]
     assert a["selected_effort"] == b["selected_effort"]
     assert a["review"]["band"] == b["review"]["band"]
-    claude_map = CFG["effort_map"]["claude_code"]
-    codex_map = CFG["effort_map"]["codex"]
-    assert a["selected_effort_native"] == claude_map[a["selected_effort"]]
-    assert b["selected_effort_native"] == codex_map[b["selected_effort"]]
+    # Keyed by the family of the model that runs, not by the host runtime.
+    fam = {m["id"]: m["family"] for m in CFG["models"].values()}
+    for out in (a, b):
+        expected = CFG["effort_map"][fam[out["selected_model"]]][out["selected_effort"]]
+        assert out["selected_effort_native"] == expected
 
 
 # ---------------------------------------------------------------------------
@@ -960,9 +961,11 @@ DOCUMENTED_BUT_UNREAD = {
     "review.MEDIUM.preferred_by_implementer.worker_balanced_alt": "see above",
     "effort_by_work": "per-work-kind guidance for the caller; the router's own "
                       "effort comes from effort_by_work entries that map to a band",
-    "effort_map.claude_code.MINIMAL": "vocabulary completeness — no band or "
-                                      "floor selects MINIMAL",
-    "effort_map.codex.MINIMAL": "same",
+    "effort_map.claude.MINIMAL": "vocabulary completeness — no band or "
+                                 "floor selects MINIMAL",
+    "effort_map.openai.MINIMAL": "same",
+    "runtimes": "read as a whole by Policy.__init__ for the runtime "
+                "vocabulary and the degraded-binding validation",
     "models": "ids/families/tiers are read; price_per_mtok and verified are "
               "cost and provenance documentation for people",
     "transports": "how the CALLER invokes each model; the router names models, "

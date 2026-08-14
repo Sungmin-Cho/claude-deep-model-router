@@ -12,7 +12,7 @@
 # Verification status of every identifier is recorded in `verification_ledger`
 # at the bottom. Keep it honest: "assumed" and "verified" must not blur.
 
-version: 2
+version: 3
 
 # ---------------------------------------------------------------------------
 # Router defaults
@@ -468,15 +468,31 @@ worker_balanced_selection:
 # Runtime adapters
 # ---------------------------------------------------------------------------
 
+# Which runtimes this router can be asked to route for, and which
+# single-provider binding survives when that runtime's cross-provider bridge
+# is down. Round 21: the runtime vocabulary used to be derived from
+# `effort_map`'s keys, and the degraded binding was a two-way `if` in three
+# places in the script. Both are policy, so both live here.
+runtimes:
+  claude_code: { degraded_binding: claude_only }
+  codex:       { degraded_binding: openai_only }
+
+# Conceptual effort level -> the token that family's CLI accepts.
+#
+# Keyed by model FAMILY, not by host runtime. The value describes what the
+# TARGET model's CLI will accept, and the default binding is shared across
+# runtimes — so a router running under one host routinely dispatches a model
+# of another family. Keying this by host meant the emitted spelling described
+# a CLI that was not going to receive it.
 effort_map:
-  claude_code:
+  claude:
     MINIMAL:   low        # no distinct minimal tier exists; collapses to low
     LOW:       low
     MEDIUM:    medium
     HIGH:      high
     VERY_HIGH: xhigh
     MAX:       max
-  codex:
+  openai:
     MINIMAL:   none       # verified: `minimal` is rejected, `none` is accepted
     LOW:       low
     MEDIUM:    medium
