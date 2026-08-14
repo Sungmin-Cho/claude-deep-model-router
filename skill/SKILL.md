@@ -116,7 +116,7 @@ Other inputs worth knowing:
 | Flag | Use |
 |---|---|
 | `--format json` | machine-readable route |
-| `--runtime codex` | the Codex effort spelling |
+| `--runtime claude_code\|codex\|grok` | the host, and the degraded binding that survives when that host's cross-provider bridge is down. Effort spelling comes from the selected model's family, not from this flag |
 | `--prior-failures N` | after a failed attempt; `--prior-models` must then name **one concrete model id per failure** |
 | `--unavailable <role>` / `--unavailable-models <id>` | a specific role or model does not resolve |
 | `--flags bridge_down` | the whole cross-provider transport is unreachable — switches to the degraded single-provider binding |
@@ -308,6 +308,13 @@ band HIGH                 → effort ≥ HIGH
 band CRITICAL             → effort ≥ VERY_HIGH
 any critical-domain flag  → effort ≥ HIGH
 ```
+
+`selected_effort` is what the policy asked for and never changes meaning.
+`selected_effort_effective` is what the worker's model actually receives —
+equal to the ask when the model has no ceiling, lower when it does. A cap that
+breaks a floor (`effort_below_floor`) keeps the route executable and asks a
+human. The native CLI token is the effective level looked up under the worker
+model's family.
 
 **As orchestrator, default to `worker_fast` at `HIGH`.** Classifying, building
 the task graph, and detecting escalation conditions are well served by high

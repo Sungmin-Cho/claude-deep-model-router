@@ -148,6 +148,8 @@ routing_metrics:
   selected_role:
   selected_model:
   selected_effort:
+  selected_effort_effective:   # what the worker's model actually receives
+  effort_ceiling_applied: []   # seats whose model could not take the ask
   review_band:
   reviewers: []
   review_independence: enforced | planned | degraded | unavailable | not_applicable

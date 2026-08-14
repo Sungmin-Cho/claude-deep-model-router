@@ -23,7 +23,7 @@ confidence.
 effort to provider values. Owns invocation syntax, session management, and
 isolation mechanics.
 
-Keeping the layers apart is what lets the same policy drive both runtimes and
+Keeping the layers apart is what lets the same policy drive every runtime and
 survive model renames. Any provider-specific string that leaks into Layer A is
 a bug in the policy, not a shortcut.
 
@@ -33,8 +33,8 @@ Before the first route in a session, establish what you can actually invoke:
 
 ```yaml
 capabilities:
-  runtime: claude_code | codex | unknown
-  available_families: [claude, openai]
+  runtime: claude_code | codex | grok | unknown
+  available_families: [claude, openai, xai]
   available_models: []          # resolved ids only
   effort_control: native | approximate | none
   effort_values: []             # values the CLI actually accepts
@@ -71,7 +71,12 @@ Conceptual levels are ordered:
 MINIMAL < LOW < MEDIUM < HIGH < VERY_HIGH < MAX
 ```
 
-### Claude Code
+The map is keyed by the **model's family**, not by the host runtime. The value
+is the token that family's CLI will accept. A session hosted on one runtime
+routinely dispatches a model of another family; looking the spelling up under
+the host used to emit a token the target CLI would reject.
+
+### claude family
 
 Accepted values: `low | medium | high | xhigh | max`.
 
@@ -84,10 +89,7 @@ VERY_HIGH: xhigh
 MAX:       max
 ```
 
-Note the `MINIMAL → low` collapse: do not assume a distinct minimal tier exists
-on this runtime.
-
-### Codex
+### openai family
 
 Accepted values: `none | low | medium | high | xhigh | max`. Verified by probing
 each value against the installed CLI — **`minimal` is rejected**, `none` is
@@ -104,6 +106,22 @@ MAX:       max
 
 Set it with `-c model_reasoning_effort=<value>`.
 
+### xai family
+
+Accepted values: `low | medium | high | xhigh`. There is no minimal or none
+tier — reasoning cannot be disabled — and the CLI rejects `max`. The family
+tops out at `xhigh`.
+
+```yaml
+MINIMAL:   low
+LOW:       low
+MEDIUM:    medium
+HIGH:      high
+VERY_HIGH: xhigh
+MAX:       xhigh      # unreachable: the clamp runs before this lookup and
+                      # the only xai model's ceiling is VERY_HIGH
+```
+
 ### When effort control is unavailable
 
 If `effort_control: none`, approximate in this order of preference:
@@ -119,15 +137,21 @@ account for it.
 
 ## Transports
 
-Both runtimes have a native subagent mechanism and a CLI bridge to the other
-family. Both bridges are verified working.
+Each runtime has a native subagent and CLI bridges to the other families.
+Verification is per direction, not a blanket "the bridges work":
+
+- Claude Code → openai (`codex exec`) — verified
+- Codex → claude (`claude -p`) — verified
+- Claude Code → xai (`grok -p`) — verified
+- Codex → xai, grok → claude, grok → openai — assumed (same mechanisms, the
+  hosted direction was not probed)
 
 ### Claude Code
 
 **Native:** the `Agent` tool. Context isolation is the enforcement boundary for
 independent review.
 
-**To OpenAI models:**
+**To openai models:**
 
 ```bash
 codex exec -m <model-id> \
@@ -140,6 +164,16 @@ codex exec -m <model-id> \
 Runs as a separate process with a fresh session — isolation holds by
 construction.
 
+**To xai models:**
+
+```bash
+grok --no-auto-update -p <prompt> -m <id> \
+    --effort <low|medium|high|xhigh> \
+    --output-format plain -s <fresh-uuid>
+```
+
+Also a separate process with a fresh session.
+
 ### Codex
 
 **Native:** the `multi_agent` feature (stable, enabled). Its context-isolation
@@ -147,15 +181,37 @@ semantics have **not** been verified to match the Claude `Agent` tool's. Until
 they are, either confirm isolation on the first dual review of a session, or
 run both reviewers as separate `codex exec` processes.
 
-**To Claude models:**
+**To claude models:**
 
 ```bash
 claude -p --model <model-id> \
+    --effort <effort> \
     --permission-mode <mode> \
     "<prompt>"
 ```
 
-Also a separate process with a fresh session.
+Also a separate process with a fresh session. `--effort` is required: without
+it the band's level does not cross the bridge.
+
+**To xai models:** same `grok -p` command as above. The mechanism is verified
+from Claude Code; the Codex-hosted direction is assumed.
+
+### grok
+
+**Native:** the CLI's `--agents` / `--no-subagents` surface. Isolation
+semantics have **not** been verified. Until they are, treat a grok-native dual
+review as degraded unless both reviewers run as separate processes.
+
+**To claude models:** the `claude -p --effort` command above. Assumed from this
+host; the flag itself is verified.
+
+**To openai models:**
+
+```bash
+codex exec -m <id> -c model_reasoning_effort=<effort>
+```
+
+Assumed from this host; the same mechanism is verified from Claude Code.
 
 ### Confirming a transport
 
@@ -187,19 +243,33 @@ never fails it.
 
 | Unavailable | Fallback |
 |---|---|
-| `worker_fast` (OpenAI) | `claude_worker_fast`; if absent, `worker_balanced` |
-| `worker_balanced` (Claude) | `worker_balanced_alt` (OpenAI middle tier) |
-| `reasoning_specialist` (OpenAI) | `senior_engineer` at one effort level higher |
-| `principal_architect` | `senior_engineer` at `MAX` + an additional independent second review |
+| `worker_fast` (openai) | `claude_worker_fast`, then `claude_worker_balanced` |
+| `worker_balanced` (xai) | `claude_worker_balanced`, then `openai_worker_balanced`, then `claude_senior` |
+| `senior_engineer` (claude) | `openai_reasoning`, then `claude_architect` |
+| `reasoning_specialist` (openai) | `claude_senior`, then `claude_architect` |
+| `principal_architect` (claude) | `claude_senior`, then `openai_reasoning` |
 | Cross-family reviewer | Strongest available same-family reviewer; set `cross_family_review: false` |
 
 ### Codex runtime
 
 | Unavailable | Fallback |
 |---|---|
-| `worker_balanced` (Claude) | `openai_worker_balanced`, or `reasoning_specialist` if band ≥ `HIGH` |
-| `senior_engineer` (Claude) | `reasoning_specialist` |
-| `principal_architect` (Claude) | `reasoning_specialist` at `MAX` + a second independent review if available |
+| `worker_fast` (openai) | `openai_worker_balanced`, then `claude_worker_fast` |
+| `worker_balanced` (xai) | `claude_worker_balanced`, then `openai_worker_balanced`, then `openai_reasoning` |
+| `senior_engineer` (claude) | `openai_reasoning`, then `claude_senior` |
+| `reasoning_specialist` (openai) | `openai_reasoning`, then `claude_senior` |
+| `principal_architect` (claude) | `openai_reasoning`, then `claude_architect` |
+| Cross-family reviewer | Strongest available same-family reviewer; set `cross_family_review: false` |
+
+### grok runtime
+
+| Unavailable | Fallback |
+|---|---|
+| `worker_fast` (openai) | `claude_worker_fast`, then `openai_worker_balanced` |
+| `worker_balanced` (xai) | `claude_worker_balanced`, then `openai_worker_balanced` |
+| `senior_engineer` (claude) | `claude_senior`, then `openai_reasoning` |
+| `reasoning_specialist` (openai) | `openai_reasoning`, then `claude_senior` |
+| `principal_architect` (claude) | `claude_architect`, then `claude_senior` |
 | Cross-family reviewer | Strongest available same-family reviewer; set `cross_family_review: false` |
 
 ### Degraded bindings
@@ -223,12 +293,26 @@ openai_only:
   senior_engineer:      openai_reasoning
   reasoning_specialist: openai_reasoning
   principal_architect:  openai_reasoning       # at MAX effort + second review
+
+xai_only:
+  worker_fast:          xai_frontier
+  worker_balanced:      xai_frontier
+  senior_engineer:      xai_frontier
+  reasoning_specialist: xai_frontier          # at VERY_HIGH; the model's ceiling
+  principal_architect:  xai_frontier          # at VERY_HIGH; the model's ceiling
 ```
 
-Both degraded bindings collapse the two frontier roles onto one model. That
-means dual review loses its family diversity — the second reviewer is the same
-model at the same tier, which catches far less. Set `cross_family_review: false`
-and weigh the second verdict accordingly.
+`claude_only` and `openai_only` collapse the two frontier roles onto one model,
+so dual review loses family diversity — set `cross_family_review: false` and
+weigh the second verdict accordingly. They still have enough distinct models
+to seat independent reviewers, so a band that requires independence stays
+executable (at reduced depth under `openai_only`).
+
+`xai_only` is not that pattern. One model fills every role, so any band that
+requires independent review is `INDEPENDENCE_UNAVAILABLE` — terminal, not
+merely thin. That is the honest answer: there is no way to run an independent
+review against a single model. Only `LOW` (independence not required) stays
+executable.
 
 ## Disclosing degradation
 

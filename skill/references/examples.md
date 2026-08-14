@@ -1,9 +1,10 @@
 # Worked routing decisions
 
 Every output below is real — produced by `scripts/route_task.py` against
-`config/model-routing.yaml`, not written by hand. Roles are shown rather than
-model ids, because concrete identifiers live in the registry and nowhere else;
-resolve them there.
+`config/model-routing.yaml`, not written by hand. Registry keys replace
+model ids in the pasted stdout (and in any command that had to name one),
+because concrete identifiers live in the registry and nowhere else; resolve
+them there.
 
 If you change the policy and these stop matching, the examples are wrong, not
 the policy. Regenerate rather than edit by hand.
@@ -29,9 +30,28 @@ the policy. Regenerate rather than edit by hand.
 **Task:** rename a symbol across 12 files. `c0 u0 b0 r0`
 
 ```
-score=0  band=LOW   worker=worker_fast / LOW
-review=LOW: worker_fast
-  independence_required=false   review_independence=not_applicable
+python3 scripts/route_task.py --class MECHANICAL \
+    --complexity 0 --uncertainty 0 --blast-radius 0 --reversibility 0
+```
+
+```
+risk_score:  0
+risk_band:   LOW
+overrides:   (none)
+worker:      worker_fast  ->  openai_worker_fast
+effort:      LOW  (native: low)
+review:
+  band:            LOW
+  reviewers:       worker_fast
+  models:          openai_worker_fast
+  effort:          MEDIUM
+  required:        independent=False
+  actual:          not_applicable
+cross_family_review: False
+fallbacks:   (none)
+confidence:  0.95
+
+MECHANICAL scored 0/18 (c=0 u=0 b=0 r=0) -> band LOW. Worker worker_fast at LOW effort. Review band LOW: worker_fast, independence_required=False, review_independence=not_applicable. No fallbacks applied.
 ```
 
 Twelve files sounds like a lot, and it routes to the cheapest model at the
@@ -48,14 +68,35 @@ independence, so there is nothing to fail to enforce.
 `auth_sensitive`
 
 ```
-score=3  band=LOW → HIGH             overrides=[critical_domain]
-worker=worker_balanced / HIGH
-review=HIGH: senior_engineer, reasoning_specialist
-  independence_required=true   review_independence=degraded
-cross_family_review=true
+python3 scripts/route_task.py --class IMPLEMENTATION \
+    --complexity 1 --uncertainty 0 --blast-radius 1 --reversibility 0 \
+    --flags auth_sensitive
 ```
 
-**The raw score says `LOW`. The route is `HIGH` with dual independent review.**
+```
+risk_score:  3
+risk_band:   HIGH
+overrides:   ['critical_domain']
+worker:      worker_balanced  ->  xai_frontier
+effort:      HIGH  (native: high)
+review:
+  band:            HIGH
+  reviewers:       senior_engineer, reasoning_specialist
+  models:          claude_senior, openai_reasoning
+  effort:          HIGH
+  required:        independent=True
+  actual:          degraded
+cross_family_review: True
+fallbacks:   (none)
+confidence:  0.95
+notes:
+  - band HIGH floored effort at HIGH
+
+IMPLEMENTATION scored 3/18 (c=1 u=0 b=1 r=0) -> band HIGH. Overrides applied: critical_domain. Critical-domain flags: auth_sensitive. Worker worker_balanced at HIGH effort. Review band HIGH: senior_engineer, reasoning_specialist, independence_required=True, review_independence=degraded. No fallbacks applied.
+```
+
+**The raw score is 3, which is `LOW`. The emitted band is `HIGH` with dual
+independent review.**
 
 Every dimension is honestly small — it really is a simple, reversible,
 well-understood change — and it still must not ship on a single lightweight
@@ -69,6 +110,9 @@ router declines to say either way. `--isolation available` moves it to
 it to `enforced`. A capability attestation is not evidence that the capability
 was used.
 
+The worker is `xai_frontier`. HIGH is at or below that model's ceiling, so
+requested and effective effort stay equal.
+
 ---
 
 ## Debugging with an unknown root cause
@@ -77,16 +121,46 @@ was used.
 `c2 u2 b1 r0`, `auth_sensitive`, `unknown_root_cause`
 
 ```
-score=8  band=HIGH   overrides=[critical_domain,
-                                low_routing_confidence_raised_review_to_CRITICAL]
-worker=worker_balanced / MAX
-review=CRITICAL: senior_engineer, reasoning_specialist   judge=principal_architect
-routing_confidence=0.77          requires_human_confirmation=true
+python3 scripts/route_task.py --class DEBUGGING \
+    --complexity 2 --uncertainty 2 --blast-radius 1 --reversibility 0 \
+    --flags auth_sensitive,unknown_root_cause
 ```
 
-**Effort is `MAX`,** above the band's `HIGH` floor: `unknown_root_cause` maps
-to `MAX` directly, because when you do not know what is wrong, thinking harder
-is the only lever that reliably helps.
+```
+risk_score:  8
+risk_band:   HIGH
+overrides:   ['critical_domain', 'low_routing_confidence_raised_review_to_CRITICAL']
+  already satisfied by another rule: ['critical_domain']
+worker:      worker_balanced  ->  xai_frontier
+effort:      MAX -> VERY_HIGH  (native: xhigh)
+review:
+  band:            CRITICAL
+  reviewers:       senior_engineer, reasoning_specialist
+  models:          claude_senior, openai_reasoning
+  effort:          MAX
+  required:        independent=True
+  actual:          degraded
+  checks:          security, edge_cases, rollback, test_adequacy, specification_compliance
+  judge:           principal_architect -> claude_architect
+cross_family_review: True
+fallbacks:   (none)
+confidence:  0.77
+human:       CONFIRMATION REQUIRED
+notes:
+  - confirm/on_any_critical_review: a CRITICAL review cannot be accepted automatically
+
+DEBUGGING scored 8/18 (c=2 u=2 b=1 r=0) -> band HIGH. Overrides applied: critical_domain, low_routing_confidence_raised_review_to_CRITICAL. Overrides that fired but were already satisfied: critical_domain. Critical-domain flags: auth_sensitive. Worker worker_balanced at VERY_HIGH effort (MAX was requested; the model's ceiling is lower). Review band CRITICAL: senior_engineer, reasoning_specialist, independence_required=True, review_independence=degraded. Judge: principal_architect. Required checks: security, edge_cases, rollback, test_adequacy, specification_compliance. No fallbacks applied. Human control: a CRITICAL review cannot be accepted automatically. Requires human confirmation before proceeding.
+```
+
+**The policy asked for `MAX`.** `unknown_root_cause` maps there directly,
+above the band's `HIGH` floor: when you do not know what is wrong, thinking
+harder is the only lever that reliably helps.
+
+**The worker receives `VERY_HIGH`.** `xai_frontier` has a ceiling one step
+below `MAX`. `selected_effort` stays `MAX` — that is what was asked for —
+and `selected_effort_effective` is `VERY_HIGH`, native `xhigh`. The worker
+floor is `HIGH`, so the cap does not break a floor and `effort_below_floor`
+does not fire. Exit status is 3 because the review is `CRITICAL`.
 
 **Review is `CRITICAL`, one band above the risk band.** Confidence came out at
 0.77, below the 0.80 threshold, so the review band was raised. The router is
@@ -107,17 +181,48 @@ half a control, which is worse than none because it looks whole.
 `financial_sensitive`
 
 ```
-score=17 band=CRITICAL   overrides=[critical_domain, critical_irreversible]
-worker=principal_architect / MAX
-review=CRITICAL: senior_engineer, reasoning_specialist   judge=principal_architect
-required_checks=[security, edge_cases, rollback, test_adequacy,
-                 specification_compliance]
-routing_confidence=0.75          requires_human_confirmation=true
+python3 scripts/route_task.py --class ARCHITECTURE \
+    --complexity 3 --uncertainty 3 --blast-radius 3 --reversibility 2 \
+    --flags financial_sensitive
+```
+
+```
+risk_score:  17
+risk_band:   CRITICAL
+overrides:   ['critical_domain', 'critical_irreversible']
+  already satisfied by another rule: ['critical_domain', 'critical_irreversible']
+worker:      principal_architect  ->  claude_architect
+effort:      MAX  (native: max)
+review:
+  band:            CRITICAL
+  reviewers:       senior_engineer, reasoning_specialist
+  models:          claude_senior, openai_reasoning
+  effort:          MAX
+  required:        independent=True
+  actual:          degraded
+  checks:          security, edge_cases, rollback, test_adequacy, specification_compliance
+  judge:           UNAVAILABLE — a human settles any disagreement
+cross_family_review: True
+fallbacks:   (none)
+confidence:  0.75
+human:       CONFIRMATION REQUIRED
+notes:
+  - confirm/on_any_critical_review: a CRITICAL review cannot be accepted automatically
+  - confirm/on_judge_unavailable: no adjudicator is available
+
+ARCHITECTURE scored 17/18 (c=3 u=3 b=3 r=2) -> band CRITICAL. Overrides applied: critical_domain, critical_irreversible. Overrides that fired but were already satisfied: critical_domain, critical_irreversible. Critical-domain flags: financial_sensitive. Worker principal_architect at MAX effort. Review band CRITICAL: senior_engineer, reasoning_specialist, independence_required=True, review_independence=degraded. No independent adjudicator is available at or above every party's tier (the implementer included); a human must resolve any disagreement. Required checks: security, edge_cases, rollback, test_adequacy, specification_compliance. No fallbacks applied. Human control: a CRITICAL review cannot be accepted automatically. Human control: no adjudicator is available. Requires human confirmation before proceeding.
 ```
 
 `critical_irreversible` fired because a critical-domain flag met
 `reversibility >= 2` — the worst case the policy knows how to describe:
 expensive to get wrong, and you cannot simply undo it.
+
+**The judge is unavailable.** The implementer already holds
+`principal_architect`, the only seat at that capability tier. An adjudicator
+must be a model no party holds and no weaker than any of them — including the
+implementer. There is no such model, so a human settles disagreement. Binding
+the architect as judge of its own work would be the implementer wearing a
+second label.
 
 ---
 
@@ -125,9 +230,43 @@ expensive to get wrong, and you cannot simply undo it.
 
 **Task:** anything whose dimensions sum to 10. `c2 u2 b2 r0`
 
+Ran once per task class. Every class emitted `risk_score: 10` / `risk_band:
+HIGH`. Representative output (`MECHANICAL`):
+
 ```
-score=10  band=HIGH   — for all eleven task classes, without exception
+python3 scripts/route_task.py --class MECHANICAL \
+    --complexity 2 --uncertainty 2 --blast-radius 2 --reversibility 0
 ```
+
+```
+risk_score:  10
+risk_band:   HIGH
+overrides:   (none)
+worker:      worker_balanced  ->  xai_frontier
+effort:      HIGH  (native: high)
+review:
+  band:            HIGH
+  reviewers:       senior_engineer, reasoning_specialist
+  models:          claude_senior, openai_reasoning
+  effort:          HIGH
+  required:        independent=True
+  actual:          degraded
+cross_family_review: True
+fallbacks:   (none)
+confidence:  0.87
+notes:
+  - band HIGH floored effort at HIGH
+
+MECHANICAL scored 10/18 (c=2 u=2 b=2 r=0) -> band HIGH. Worker worker_balanced at HIGH effort. Review band HIGH: senior_engineer, reasoning_specialist, independence_required=True, review_independence=degraded. No fallbacks applied.
+```
+
+Workers differ by class, as the table says they must. The band does not:
+
+| Class | Worker |
+|---|---|
+| `MECHANICAL` `IMPLEMENTATION` `DEBUGGING` `REFACTORING` `TESTING` `DOCUMENTATION` | `worker_balanced` |
+| `ARCHITECTURE` `MIGRATION` `REVIEW` `OPERATIONS` | `senior_engineer` |
+| `INVESTIGATION` | `reasoning_specialist` |
 
 This looks like a non-example and is in the test suite for a reason. An earlier
 policy compared `score >= 10` in one section and configured `high_risk_max: 10`
@@ -143,13 +282,41 @@ that lands on the boundary goes wrong.
 `c2 u2 b2 r0`, `reasoning_centric=true`
 
 ```
-score=10  band=HIGH   worker=reasoning_specialist / HIGH
-review=HIGH: senior_engineer, reasoning_specialist
+python3 scripts/route_task.py --class INVESTIGATION \
+    --complexity 2 --uncertainty 2 --blast-radius 2 --reversibility 0 \
+    --reasoning-centric
+```
+
+```
+risk_score:  10
+risk_band:   HIGH
+overrides:   (none)
+worker:      reasoning_specialist  ->  openai_reasoning
+effort:      HIGH  (native: high)
+review:
+  band:            HIGH
+  reviewers:       senior_engineer, principal_architect
+  models:          claude_senior, claude_architect
+  effort:          HIGH
+  required:        independent=True
+  actual:          degraded
+cross_family_review: False
+fallbacks:   (none)
+confidence:  0.87
+
+INVESTIGATION scored 10/18 (c=2 u=2 b=2 r=0) -> band HIGH. Worker reasoning_specialist at HIGH effort. Review band HIGH: senior_engineer, principal_architect, independence_required=True, review_independence=degraded. Reviewer slot substituted: reasoning_specialist -> principal_architect (would have shared a model with the implementer). No fallbacks applied. cross_family_review=false — reviewers share a family; weigh the second verdict accordingly.
 ```
 
 Same score as the previous example, different worker. The dimensions do not
 distinguish these two tasks — `reasoning_centric` does. Here the hard part is
 establishing what is true, not writing code.
+
+HIGH's configured reviewers are `senior_engineer` and `reasoning_specialist`.
+The implementer already holds the second of those, so de-confliction
+substitutes `principal_architect`. Both seated reviewers are then claude, and
+`cross_family_review` is false. That is a recorded substitution, not a
+fallback — the shipped roles changed, the models those roles would have
+resolved to did not need replacing.
 
 ---
 
@@ -159,10 +326,36 @@ establishing what is true, not writing code.
 `data_integrity_sensitive`
 
 ```
-score=16 band=CRITICAL   overrides=[critical_domain, critical_irreversible,
-                                    migration_data_integrity]
-worker=principal_architect / MAX
-review=CRITICAL: senior_engineer, reasoning_specialist   judge=principal_architect
+python3 scripts/route_task.py --class MIGRATION \
+    --complexity 3 --uncertainty 2 --blast-radius 3 --reversibility 3 \
+    --flags migration,data_integrity_sensitive
+```
+
+```
+risk_score:  16
+risk_band:   CRITICAL
+overrides:   ['critical_domain', 'critical_irreversible', 'migration_data_integrity']
+  already satisfied by another rule: ['critical_domain', 'critical_irreversible', 'migration_data_integrity']
+worker:      principal_architect  ->  claude_architect
+effort:      MAX  (native: max)
+review:
+  band:            CRITICAL
+  reviewers:       senior_engineer, reasoning_specialist
+  models:          claude_senior, openai_reasoning
+  effort:          MAX
+  required:        independent=True
+  actual:          degraded
+  checks:          security, edge_cases, rollback, test_adequacy, specification_compliance
+  judge:           UNAVAILABLE — a human settles any disagreement
+cross_family_review: True
+fallbacks:   (none)
+confidence:  0.87
+human:       CONFIRMATION REQUIRED
+notes:
+  - confirm/on_any_critical_review: a CRITICAL review cannot be accepted automatically
+  - confirm/on_judge_unavailable: no adjudicator is available
+
+MIGRATION scored 16/18 (c=3 u=2 b=3 r=3) -> band CRITICAL. Overrides applied: critical_domain, critical_irreversible, migration_data_integrity. Overrides that fired but were already satisfied: critical_domain, critical_irreversible, migration_data_integrity. Critical-domain flags: data_integrity_sensitive. Worker principal_architect at MAX effort. Review band CRITICAL: senior_engineer, reasoning_specialist, independence_required=True, review_independence=degraded. No independent adjudicator is available at or above every party's tier (the implementer included); a human must resolve any disagreement. Required checks: security, edge_cases, rollback, test_adequacy, specification_compliance. No fallbacks applied. Human control: a CRITICAL review cannot be accepted automatically. Human control: no adjudicator is available. Requires human confirmation before proceeding.
 ```
 
 Three overrides fire independently and agree. Each encodes a different reason
@@ -171,6 +364,9 @@ this is dangerous, and any one alone would produce the right band.
 `rollback` is a required check, not an optional finding. For a migration this
 irreversible, "we have a rollback plan" is part of the deliverable.
 
+The judge is unavailable for the same reason as the payments case: the
+implementer already holds the architect seat.
+
 ---
 
 ## After a failed attempt
@@ -178,52 +374,129 @@ irreversible, "we have a rollback plan" is part of the deliverable.
 **Task:** an ordinary feature; the fast worker already failed once.
 `c1 u1 b1 r0`, `prior_failures=1`
 
+`--prior-models` takes that worker's concrete registry id (the identifier
+lives in the config):
+
 ```
-score=5  band=MEDIUM   worker=worker_balanced / MEDIUM
-review=MEDIUM: reasoning_specialist
-note: escalated above capability tier 0
+python3 scripts/route_task.py --class IMPLEMENTATION \
+    --complexity 1 --uncertainty 1 --blast-radius 1 --reversibility 0 \
+    --prior-failures 1 --prior-models <openai_worker_fast id>
+```
+
+```
+risk_score:  5
+risk_band:   MEDIUM
+overrides:   (none)
+worker:      worker_balanced  ->  xai_frontier
+effort:      MEDIUM  (native: medium)
+review:
+  band:            MEDIUM
+  reviewers:       reasoning_specialist
+  models:          openai_reasoning
+  effort:          HIGH
+  required:        independent=True
+  actual:          degraded
+cross_family_review: True
+fallbacks:   (none)
+excluded:    ['openai_worker_fast'] (already failed)
+confidence:  0.9
+notes:
+  - escalated above capability tier 0
+
+IMPLEMENTATION scored 5/18 (c=1 u=1 b=1 r=0) -> band MEDIUM. Worker worker_balanced at MEDIUM effort. Review band MEDIUM: reasoning_specialist, independence_required=True, review_independence=degraded. No fallbacks applied. Excluded as already-failed: openai_worker_fast.
 ```
 
 Without the failure this routes to `worker_fast`. With it, the router refuses
-to hand the task back to the capability tier that already failed.
+to hand the task back to the capability tier that already failed. The first
+escalation is now `xai_frontier`.
 
-**The escalation requires the history.** `--prior-failures 1` on its own — or
-with a role alias, or with the wrong number of ids — is
-`RETRY_HISTORY_REQUIRED`: terminal, no bindings, exit 1, with a note naming what
-to pass. Five rounds of inferring which model a previous attempt ran produced
-five different defects, so the router asks the one party that knows. Feed back
-the `selected_model` of each failed attempt — it is already in the route you
+**The escalation requires the history.** `--prior-failures 1` on its own is
+`RETRY_HISTORY_REQUIRED`:
+
+```
+python3 scripts/route_task.py --class IMPLEMENTATION \
+    --complexity 1 --uncertainty 1 --blast-radius 1 --reversibility 0 \
+    --prior-failures 1
+```
+
+```
+risk_score:  5
+risk_band:   MEDIUM
+overrides:   (none)
+TERMINAL:    RETRY_HISTORY_REQUIRED  — no executable bindings emitted
+review (policy only — not dispatchable):
+  band:            MEDIUM
+  reviewers:       worker_balanced
+  required:        independent=True
+  actual:          degraded
+cross_family_review: True
+fallbacks:   (none)
+confidence:  0.9
+human:       CONFIRMATION REQUIRED
+notes:
+  - retry history required: 1 prior failure(s) but 0 concrete model id(s) supplied — pass --prior-models with one model id per failure
+
+IMPLEMENTATION scored 5/18 (c=1 u=1 b=1 r=0) -> band MEDIUM. TERMINAL: RETRY_HISTORY_REQUIRED — no executable bindings emitted; routing confidence 0.9 after 1 prior failure(s). Surface to a human with what was tried, what evidence accumulated, and the blocking uncertainty. Review band MEDIUM: worker_balanced, independence_required=True, review_independence=degraded. No fallbacks applied. Requires human confirmation before proceeding.
+```
+
+Five rounds of inferring which model a previous attempt ran produced five
+different defects, so the router asks the one party that knows. Feed back the
+`selected_model` of each failed attempt — it is already in the route you
 dispatched from.
 
 ---
 
 ## When a model is unreachable
 
-**Task:** a security-sensitive change with the OpenAI reasoning model
+**Task:** a security-sensitive change with the OpenAI reasoning role
 unavailable. `c2 u1 b2 r1`, `security_sensitive`,
 `--unavailable reasoning_specialist`
 
 ```
-score=9  band=HIGH   overrides=[critical_domain]
-worker=worker_balanced / HIGH
-review=HIGH: senior_engineer, reasoning_specialist
-fallbacks=[reasoning_specialist: <openai reasoning> unavailable -> <claude senior>]
-cross_family_review=FALSE
+python3 scripts/route_task.py --class IMPLEMENTATION \
+    --complexity 2 --uncertainty 1 --blast-radius 2 --reversibility 1 \
+    --flags security_sensitive --unavailable reasoning_specialist
+```
+
+```
+risk_score:  9
+risk_band:   HIGH
+overrides:   ['critical_domain']
+  already satisfied by another rule: ['critical_domain']
+worker:      worker_balanced  ->  xai_frontier
+effort:      HIGH  (native: high)
+review:
+  band:            HIGH
+  reviewers:       senior_engineer, principal_architect
+  models:          claude_senior, claude_architect
+  effort:          HIGH
+  required:        independent=True
+  actual:          degraded
+cross_family_review: False
+fallbacks:   (none)
+confidence:  0.95
+
+IMPLEMENTATION scored 9/18 (c=2 u=1 b=2 r=1) -> band HIGH. Overrides applied: critical_domain. Overrides that fired but were already satisfied: critical_domain. Critical-domain flags: security_sensitive. Worker worker_balanced at HIGH effort. Review band HIGH: senior_engineer, principal_architect, independence_required=True, review_independence=degraded. Reviewer slot substituted: reasoning_specialist -> principal_architect (would have duplicated another reviewer). No fallbacks applied. cross_family_review=false — reviewers share a family; weigh the second verdict accordingly.
 ```
 
 The route still emits — a missing model degrades the route, never fails it.
 
-Two things to read carefully. First, the fallback **actually changed the
-model**: five of ten (role × runtime) fallback paths used to substitute the
-same model back and record a downgrade that never happened, which is a recorded
-degradation with no degradation — the most misleading state a metric can be in.
-A fallback is now recorded only when the emitted model differs.
+`--unavailable reasoning_specialist` withholds that role's bound model.
+De-confliction then substitutes the reviewer seat (`reasoning_specialist` →
+`principal_architect`) so the two reviewers are not the same model. No
+fallback is recorded: a fallback is written only when a role that actually
+ships resolved to a different model than its binding, and the shipped roles
+here never needed that. The two seated reviewers are both claude, so
+`cross_family_review` is false. The review still catches things; it catches
+considerably less than the count suggests. The flag exists so nobody reads
+this route later and believes a cross-family review happened.
 
-Second, `cross_family_review=FALSE`. Both reviewer roles resolve to the same
-family now, so the "two independent reviewers" share every failure mode. The
-review still catches things; it catches considerably less than the count
-suggests. The flag exists so nobody reads this route later and believes a
-cross-family review happened.
+There are three runtimes and fifteen (role × runtime) fallback paths. A
+fallback is recorded only when the emitted model differs. The rule exists
+because, when there were two runtimes, five of the ten paths used to
+substitute the same model back and record a downgrade that never happened —
+a recorded degradation with no degradation, the most misleading state a
+metric can be in.
 
 ---
 
@@ -232,10 +505,32 @@ cross-family review happened.
 **Task:** anything, after four failed attempts. `prior_failures=4`
 
 ```
-score=6  band=MEDIUM
-TERMINAL=HUMAN_REQUIRED
-selected_model=null   reviewer_models=[]   judge_model=null   review effort=null
-requires_human_confirmation=true
+python3 scripts/route_task.py --class IMPLEMENTATION \
+    --complexity 1 --uncertainty 1 --blast-radius 1 --reversibility 1 \
+    --prior-failures 4 \
+    --prior-models <openai_worker_fast id>,<openai_worker_fast id>,<openai_worker_fast id>,<openai_worker_fast id>
+```
+
+```
+risk_score:  6
+risk_band:   MEDIUM
+overrides:   (none)
+TERMINAL:    HUMAN_REQUIRED  — no executable bindings emitted
+review (policy only — not dispatchable):
+  band:            MEDIUM
+  reviewers:       reasoning_specialist
+  required:        independent=True
+  actual:          degraded
+cross_family_review: True
+fallbacks:   (none)
+excluded:    ['openai_worker_fast'] (already failed)
+confidence:  0.8
+human:       CONFIRMATION REQUIRED
+notes:
+  - escalated above capability tier 0
+  - retry budget spent: 4 attempt(s) against a cap of 4 — stop retrying and surface what was tried to a human
+
+IMPLEMENTATION scored 6/18 (c=1 u=1 b=1 r=1) -> band MEDIUM. TERMINAL: HUMAN_REQUIRED — no executable bindings emitted; routing confidence 0.8 after 4 prior failure(s). Surface to a human with what was tried, what evidence accumulated, and the blocking uncertainty. Review band MEDIUM: reasoning_specialist, independence_required=True, review_independence=degraded. No fallbacks applied. Excluded as already-failed: openai_worker_fast. Requires human confirmation before proceeding.
 ```
 
 **No executable bindings are emitted at all, and the CLI exits nonzero.**
@@ -272,7 +567,8 @@ the invariants testable across every class and dimension combination rather
 than on a few hand-picked examples.
 
 **Say what you enforced, not what you asked for.** `independence_required` is
-policy; `review_independence` is evidence. `fallbacks_applied` records only
+policy; `review_independence` is evidence. `selected_effort` is the ask;
+`selected_effort_effective` is what runs. `fallbacks_applied` records only
 real substitutions. `terminal` withholds the model rather than emitting one you
 must not run. Every one of those pairs exists because collapsing it produced a
 claim the system could not back.

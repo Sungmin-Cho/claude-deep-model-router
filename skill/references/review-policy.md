@@ -126,11 +126,13 @@ that would rather wait is making a legitimate call and not a mistake.
 
 Deferral is scoped to the band's own review gate. A review that cannot be
 trusted still blocks: `independence_compromised` means the reviewers are the
-implementer under another label, and `review_depth_reduced` means there are
-fewer of them than the band asks. An incident does not make an untrustworthy
-review acceptable. `judge_unavailable` deliberately does not block deferral —
-an adjudicator is needed only if the two reviewers disagree, which is an event
-after the review, which is where the deferred confirmation already is.
+implementer under another label, `review_depth_reduced` means there are fewer
+of them than the band asks, and `effort_below_floor` means a seated model
+cannot reach the effort a floor required. An incident does not make an
+untrustworthy review acceptable. `judge_unavailable` deliberately does not
+block deferral — an adjudicator is needed only if the two reviewers disagree,
+which is an event after the review, which is where the deferred confirmation
+already is.
 
 ## Reviewer independence
 
@@ -156,13 +158,14 @@ of the mechanism, not an instruction.
 
 ## Enforcing isolation per runtime
 
-Both runtimes have the same two mechanisms available: a native subagent for the
-same-family reviewer, and a CLI bridge for the cross-family one.
+Each runtime has a native subagent for a same-family reviewer and CLI bridges
+for the others.
 
-| Runtime | Reviewer 1 (native) | Reviewer 2 (bridged) |
+| Runtime | Native | Bridged |
 |---|---|---|
-| Claude Code | `Agent` tool subagent | `codex exec` |
-| Codex | `multi_agent` subagent | `claude -p` |
+| Claude Code | `Agent` tool subagent | `codex exec` / `grok -p` |
+| Codex | `multi_agent` subagent | `claude -p` / `grok -p` |
+| grok | native `--agents` subagent | `claude -p` / `codex exec` |
 
 **Claude Code:** dispatch each reviewer as a separate subagent via the `Agent`
 tool, and issue both dispatches **in a single message** so they run
@@ -174,16 +177,23 @@ enforcement boundary.
 fresh session. Do not reuse a session identifier across reviewers, and do not
 pipe reviewer A's stdout into reviewer B's prompt construction.
 
-**The bridge is isolated by construction.** `codex exec` and `claude -p` each
-spawn a fresh process with a fresh session, so the cross-family reviewer cannot
-see the other's context even in principle. That is a nice property to have on
-the reviewer that matters most.
+**grok:** default HIGH and CRITICAL reviewers are the claude and openai
+frontier seats, so a grok-hosted dual review is two bridged processes by
+construction. The native subagent is for same-family review; under `xai_only`
+any band that requires independent review is terminal, so that path does not
+arise as an executable dual review.
 
-**Codex native subagents carry an unverified assumption.** The `multi_agent`
-feature is enabled, but whether its context isolation matches the Claude
-`Agent` tool's has not been empirically confirmed. Until it has, verify
-isolation on the first dual review of a session, or run both Codex reviewers as
-separate `codex exec` processes, which is isolated for certain.
+**The bridge is isolated by construction.** `codex exec`, `claude -p`, and
+`grok -p` each spawn a fresh process with a fresh session, so a bridged
+reviewer cannot see the other's context even in principle. That is a nice
+property to have on the reviewer that matters most.
+
+**Codex and grok native subagents carry an unverified assumption.** Codex
+`multi_agent` is enabled, and grok exposes `--agents` / `--no-subagents`, but
+whether either isolates context the way independent review requires has not
+been empirically confirmed. Until it has, verify isolation on the first dual
+review of a session, or run both reviewers as separate processes, which is
+isolated for certain.
 
 ## Reporting what you actually got
 
