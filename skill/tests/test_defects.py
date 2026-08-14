@@ -2087,6 +2087,8 @@ def test_d23_a_ceiling_record_appears_exactly_when_a_seat_was_capped():
         for rec in records:
             assert rec["capped_at"] != rec["requested"], (
                 f"a record with nothing capped: {rec}")
+        roles = [rec["role"] for rec in records]
+        assert len(roles) == len(set(roles)), f"same seat twice: {records}"
         if not out["terminal"] and out["selected_effort_effective"] != out["selected_effort"]:
             assert any(r["role"] == out["selected_role"] for r in records), (
                 f"worker effort moved {out['selected_effort']} -> "
@@ -2145,3 +2147,44 @@ def test_d23_a_terminal_route_keeps_the_ceiling_record_without_the_model():
     assert out["effort_ceiling_applied"], "the disclosure was dropped on terminal"
     assert all(rec["model"] is None for rec in out["effort_ceiling_applied"])
     assert out["selected_effort_effective"] is None
+
+
+def test_d23_worker_clamp_reads_peek_not_the_provisional_resolved_map():
+    """`resolve()` is all-or-nothing: a judge shortage empties `resolved` for
+    the whole pass. `_seat_judge` can then drop the judge so the FINAL
+    resolution succeeds, but a clamp that read `resolved.get` already ran
+    against `{}` and shipped an effort the worker cannot receive."""
+    cfg = {**CFG, "models": {**CFG["models"], "claude_worker_balanced": {
+        **CFG["models"]["claude_worker_balanced"], "effort_ceiling": "LOW"}}}
+    out = route(_task(task_class="MIGRATION", flags=["review_disagreement"],
+                      unavailable_models=_leave_only("claude-sonnet-5")), cfg)
+    assert out["terminal"] is None, f"probe went terminal: {out['terminal']}"
+    assert out["selected_model"] == "claude-sonnet-5"
+    assert out["selected_effort"] == "HIGH"
+    assert out["selected_effort_effective"] == "LOW", (
+        f"worker clamp missed a LOW ceiling: effective={out['selected_effort_effective']} "
+        f"records={out['effort_ceiling_applied']}")
+    assert out["selected_effort_native"] == "low"
+    worker_recs = [rec for rec in out["effort_ceiling_applied"]
+                   if rec["role"] == out["selected_role"]]
+    assert worker_recs, f"worker clamp wrote nothing: {out['effort_ceiling_applied']}"
+    assert worker_recs[0]["model"] == "claude-sonnet-5"
+    assert worker_recs[0]["requested"] == "HIGH"
+    assert worker_recs[0]["capped_at"] == "LOW"
+
+
+def test_d23_the_same_role_writes_one_ceiling_row():
+    """When `_deconflict` cannot substitute, the worker stays in
+    `review["reviewers"]` and both clamps would write it. Design §4.3.3:
+    the same seat appears once. The broken floor must survive the merge."""
+    out = r(task_class="MECHANICAL", complexity=3, uncertainty=3,
+            blast_radius=3, reversibility=3,
+            unavailable_models=_leave_only("grok-4.6"))
+    roles = [rec["role"] for rec in out["effort_ceiling_applied"]]
+    assert len(roles) == len(set(roles)), (
+        f"same seat twice: {out['effort_ceiling_applied']}")
+    senior = [rec for rec in out["effort_ceiling_applied"]
+              if rec["role"] == "senior_engineer"]
+    assert len(senior) == 1, f"expected one senior_engineer row: {senior}"
+    assert senior[0]["floor_broken"] == "review.CRITICAL.effort"
+    assert senior[0]["floor_requires"] == "MAX"

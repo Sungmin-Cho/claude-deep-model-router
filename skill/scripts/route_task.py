@@ -1396,15 +1396,21 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         # compensation really did raise what was asked for, and `selected_effort`
         # is what was asked for.
         #
-        # Only the worker's own resolved family is read. The reviewer roster is
-        # still moved by `_deconflict` and `_seat_judge` below, so a reviewer
-        # clamp here would read a seating that does not ship.
-        worker_effective = _clamp(policy, effort, resolved.get(worker))
+        # `peek`, not the provisional `resolved` map. `resolve()` is
+        # all-or-nothing: a shortage on any role empties the map for the whole
+        # pass. `_seat_judge` can then drop the judge so the FINAL resolve
+        # succeeds, and a clamp that already ran against `{}` ships the
+        # uncapped effort. `peek` is pure, depends on no other role, and
+        # equals the final `resolved[worker]` whenever resolution succeeds.
+        # Reviewer seating still moves below, so a reviewer clamp here would
+        # still read a roster that does not ship.
+        worker_model = resolver.peek(worker)
+        worker_effective = _clamp(policy, effort, worker_model)
         if worker_effective != effort:
             floor = _worker_effort_floor(task, band, policy)
             broken = floor and policy.efforts.index(worker_effective) < policy.efforts.index(floor[1])
             ceiling_records.append({
-                "role": worker, "model": resolved.get(worker),
+                "role": worker, "model": worker_model,
                 "requested": effort, "capped_at": worker_effective,
                 "floor_broken": floor[0] if broken else None,
                 "floor_requires": floor[1] if broken else None,
@@ -1618,12 +1624,22 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         model = resolved.get(role)
         capped = _clamp(policy, review_floor, model)
         if capped != review_floor:
-            ceiling_records.append({
+            record = {
                 "role": role, "model": model,
                 "requested": review_floor, "capped_at": capped,
                 "floor_broken": f"review.{review['band']}.effort",
                 "floor_requires": review_floor,
-            })
+            }
+            # Same seat, once. When `_deconflict` cannot substitute, the
+            # worker stays in `review["reviewers"]` and both clamps would
+            # write it. A floor that broke must not be erased by a row that
+            # did not break one.
+            existing = next((r for r in ceiling_records if r["role"] == role), None)
+            if existing is None:
+                ceiling_records.append(record)
+            elif record["floor_broken"] and not existing["floor_broken"]:
+                existing["floor_broken"] = record["floor_broken"]
+                existing["floor_requires"] = record["floor_requires"]
 
     hitl = cfg["human_in_the_loop"]
     controls = [
