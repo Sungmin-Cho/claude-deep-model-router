@@ -2135,6 +2135,39 @@ def test_d23_the_native_spelling_is_always_a_token_that_model_accepts():
     assert seen, "no executable route in the sweep — the assertion was vacuous"
 
 
+def test_d23_native_is_looked_up_from_the_effort_that_ships():
+    """Since the request/effective split, native is `map[family][effective]`.
+    Nothing on the shipped registry can prove that: the only capped family maps
+    MAX and VERY_HIGH to the same token, so indexing the requested level instead
+    emits the identical string and every assertion stays green.
+
+    So the discriminating case is built rather than found. A Claude model capped
+    at HIGH separates the two lookups — `claude.MAX` is `max` and `claude.HIGH`
+    is `high` — and a route that requests MAX must then emit `high`. Reverting
+    the index to `selected_effort` fails here and nowhere else, which is the
+    only reason this test exists.
+    """
+    import copy
+    cfg = copy.deepcopy(CFG)
+    cfg["models"]["claude_senior"]["effort_ceiling"] = "HIGH"
+    m = cfg["effort_map"]["claude"]
+    assert m["MAX"] != m["HIGH"], (
+        "the probe rests on these two spellings differing; if the map changed, "
+        "this test no longer discriminates and must be rebuilt")
+
+    out = route(_task(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+                      blast_radius=3, reversibility=2, flags=["auth_sensitive"],
+                      unavailable_models=["claude-fable-5"]), cfg)
+    assert out["selected_model"] == "claude-opus-5", "probe drifted"
+    assert out["selected_effort"] == "MAX", "probe drifted"
+    assert out["selected_effort_effective"] == "HIGH", (
+        f"the cap did not apply: {out['selected_effort_effective']}")
+    assert out["selected_effort_native"] == m["HIGH"], (
+        f"native is {out['selected_effort_native']!r}; it must come from the "
+        f"effort that ships ({m['HIGH']!r}), not the one that was asked for "
+        f"({m['MAX']!r})")
+
+
 def test_d23_a_ceiling_record_appears_exactly_when_a_seat_was_capped():
     """The record is the disclosure. Emitting it when nothing was capped makes
     a managed decision out of a non-event; omitting it when something was makes
