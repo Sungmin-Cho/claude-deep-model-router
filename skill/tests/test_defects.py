@@ -135,16 +135,29 @@ def test_d1_fallback_note_is_only_recorded_when_the_model_actually_changed():
     assert saw_a_real_fallback, "the probe set never triggered a fallback — assertion was vacuous"
 
 
+# Hardcoded on purpose: this is the contract a runtime's degraded binding
+# must satisfy, not a restatement of it. Deriving it from `degraded_binding`
+# made the oracle agree with any binding the config named, including a
+# binding on the far side of the very bridge that is down.
+NATIVE_FAMILY = {"claude_code": "claude", "codex": "openai", "grok": "xai"}
+
+
 def test_d1_bridge_down_never_crosses_the_provider_boundary():
     """When the bridge is down the other family is unreachable by definition,
     so naming a model from it produces a route that cannot be executed."""
+    assert set(NATIVE_FAMILY) == set(CFG["runtimes"]), (
+        f"NATIVE_FAMILY covers {sorted(NATIVE_FAMILY)} but runtimes are "
+        f"{sorted(CFG['runtimes'])}; a new runtime must be pinned here")
     families = {m["id"]: m["family"] for m in CFG["models"].values()}
-    local = {
-        rt: families[CFG["models"][next(iter(
-            CFG["role_bindings"][CFG["runtimes"][rt]["degraded_binding"]].values()
-        ))]["id"]]
-        for rt in CFG["runtimes"]
-    }
+    for runtime, expected_family in NATIVE_FAMILY.items():
+        binding = CFG["runtimes"][runtime]["degraded_binding"]
+        bound = {CFG["models"][key]["family"]
+                 for key in CFG["role_bindings"][binding].values()}
+        assert bound == {expected_family}, (
+            f"{runtime}'s degraded binding {binding!r} resolves to "
+            f"{sorted(bound)}, not {expected_family}"
+        )
+    local = NATIVE_FAMILY
     for runtime, (role, probe) in itertools.product(sorted(CFG["runtimes"]),
                                                     ROLE_FORCING_ROUTES.items()):
         for unavailable in ([], [role]):
@@ -2049,6 +2062,17 @@ def test_d23_an_effort_ceiling_must_name_a_real_effort_level():
     assert policy.ceiling_of[CFG["models"][other]["id"]] is None
 
 
+# Independent of `effort_map`, on purpose. Probed against each CLI on
+# 2026-08-14; see the config's verification_ledger. If a CLI's vocabulary
+# changes, this table and the map both have to move, and that is the point:
+# an oracle that reads the map cannot tell you the map is wrong.
+ACCEPTED_CLI_TOKENS = {
+    "claude": {"low", "medium", "high", "xhigh", "max"},
+    "openai": {"none", "low", "medium", "high", "xhigh", "max"},
+    "xai":    {"low", "medium", "high", "xhigh"},   # `max` and `none` rejected
+}
+
+
 def test_d23_the_native_spelling_is_always_a_token_that_model_accepts():
     """Both directions. A route that names an effort the model's CLI rejects is
     not executable, and one that quietly under-delivers is the same defect
@@ -2056,6 +2080,9 @@ def test_d23_the_native_spelling_is_always_a_token_that_model_accepts():
     from route_task import Policy
     policy = Policy(CFG)
     fam = {m["id"]: m["family"] for m in CFG["models"].values()}
+    assert set(ACCEPTED_CLI_TOKENS) == set(fam.values()), (
+        f"ACCEPTED_CLI_TOKENS covers {sorted(ACCEPTED_CLI_TOKENS)} but "
+        f"the registry holds {sorted(set(fam.values()))}")
     levels = CFG["effort_levels"]
     seen = 0
     for out in _sweep():
@@ -2073,7 +2100,12 @@ def test_d23_the_native_spelling_is_always_a_token_that_model_accepts():
             assert levels.index(effective) <= levels.index(ceiling), (
                 f"{model} cannot receive {effective} (ceiling {ceiling})")
             assert levels.index(effective) <= levels.index(requested)
-        assert out["selected_effort_native"] == CFG["effort_map"][fam[model]][effective]
+        native = out["selected_effort_native"]
+        assert native == CFG["effort_map"][fam[model]][effective]
+        assert native in ACCEPTED_CLI_TOKENS[fam[model]], (
+            f"{model} ({fam[model]}) emitted native {native!r}, which that "
+            f"family's CLI does not accept; accepted={sorted(ACCEPTED_CLI_TOKENS[fam[model]])}"
+        )
         seen += 1
     assert seen, "no executable route in the sweep — the assertion was vacuous"
 
