@@ -41,6 +41,12 @@ from route_task import (  # noqa: E402
 CFG = load_config()
 
 
+def _leave_only(*keep):
+    """Everything but the one model this probe is about. Enumerating five ids
+    meant the oracle went stale the moment the registry grew."""
+    return sorted({m["id"] for m in CFG["models"].values()} - set(keep))
+
+
 def _task(**kw):
     kw.setdefault("complexity", 0)
     kw.setdefault("uncertainty", 0)
@@ -600,10 +606,9 @@ def test_d9_parity_holds_including_the_native_effort_spelling():
 
 DIMENSION_SWEEP = [(0, 0, 0, 0), (2, 2, 2, 0), (3, 2, 3, 1), (3, 3, 3, 3), (2, 2, 2, 2)]
 BINDING_SWEEP = [
-    dict(runtime="claude_code", flags=[]),
-    dict(runtime="claude_code", flags=["bridge_down"]),
-    dict(runtime="codex", flags=[]),
-    dict(runtime="codex", flags=["bridge_down"]),
+    dict(runtime=rt, flags=list(f))
+    for rt in sorted(CFG["runtimes"])
+    for f in ([], ["bridge_down"])
 ]
 
 # Scarcity is what forces roles onto shared models, and the previous sweep
@@ -618,6 +623,8 @@ SCARCITY_SWEEP = [
     _MODEL_IDS[:3],
     _MODEL_IDS[1:4],
     _MODEL_IDS[2:5],
+    sorted(set(_MODEL_IDS) - {"claude-opus-5", "gpt-5.6-sol", "grok-4.6"}),
+    sorted(set(_MODEL_IDS) - {"grok-4.6"}),
 ]
 
 
@@ -887,10 +894,16 @@ def test_d13_the_judge_retry_never_seats_the_implementer_as_its_own_reviewer():
     route traded a distinct, stronger reviewer for the implementer itself,
     recorded nothing (LOW's depth floor is 0, so the shortfall gate cannot fire
     either), and flipped requires_human_confirmation from true to false."""
+    keep = ("claude-opus-5", "gpt-5.6-terra")
     out = r(task_class="MIGRATION", flags=["review_disagreement"], runtime="claude_code",
-            unavailable_models=["gpt-5.6-luna", "claude-haiku-4-5-20251001",
-                                "claude-sonnet-5", "claude-fable-5", "gpt-5.6-sol"])
+            unavailable_models=_leave_only(*keep))
     rv = out["review"]
+    remaining = sorted({m["id"] for m in CFG["models"].values()} - set(out["unavailable_models"]))
+    seats = [out["selected_role"], *rv["reviewers"], rv["judge"]]
+    assert remaining == sorted(keep), (
+        f"precondition 'two models' drifted: remaining={remaining}")
+    assert len(seats) == 3, (
+        f"precondition 'three seats' drifted: seats={seats}")
     assert rv["band"] == "LOW" and out["route_path"] == "disagreement", "probe drifted"
     assert out["selected_model"] not in rv["reviewer_models"], (
         f"implementer {out['selected_model']} was re-seated as its own reviewer "
@@ -930,8 +943,10 @@ DOCUMENTED_BUT_UNREAD = {
                          "inert-flag test; the effect itself lives in `overrides`",
     "worker_promotions": "prose description of promotions implemented in "
                          "select_worker; kept as the human-readable statement",
-    "worker_balanced_selection": "documents that worker_balanced_alt is a "
-                                 "same-family fallback, which `fallbacks` implements",
+    "worker_balanced_selection": "documents that worker_balanced_alt is the "
+                                 "first-escalation fallback; the alt is now Claude "
+                                 "while worker_fast is OpenAI, so it is no longer "
+                                 "a same-family fallback. `fallbacks` implements it",
     "verification_ledger": "provenance of the identifiers, read by people",
     "router.default_worker": "states the policy's starting point; the table in "
                              "worker_selection is what executes",
@@ -964,6 +979,13 @@ DOCUMENTED_BUT_UNREAD = {
     "effort_map.claude.MINIMAL": "vocabulary completeness — no band or "
                                  "floor selects MINIMAL",
     "effort_map.openai.MINIMAL": "same",
+    "effort_map.xai.MINIMAL": "same",
+    "effort_map.xai.MAX": "the clamp runs before the native lookup and the "
+                          "only xai model's ceiling is VERY_HIGH, so this leaf "
+                          "is unreachable rather than merely unvisited",
+    "effort_map.xai.LOW": "the probes below never pair the only xai seat with "
+                          "LOW effort — reachable via a prior-failure promotion "
+                          "on MECHANICAL/LOW, which this probe set does not build",
     "models": "ids/families/tiers are read; price_per_mtok and verified are "
               "cost and provenance documentation for people",
     "transports": "how the CALLER invokes each model; the router names models, "
@@ -1034,7 +1056,7 @@ def test_d14_every_config_rule_has_a_consumer_or_a_recorded_reason():
                   ["long_horizon"], ["migration", "data_integrity_sensitive"],
                   ["unknown_root_cause"], ["production_hotfix"], ["public_api_change"],
                   ["concurrency_sensitive"], ["auth_sensitive", "review_disagreement"])
-        for rt in ("claude_code", "codex")
+        for rt in sorted(CFG["runtimes"])
         for pf, pm in ((0, []), (1, ["senior_engineer"]), (2, []), (5, []))
         for um in ([], ["claude-fable-5"], ["claude-opus-5", "gpt-5.6-sol"])
         for iso in (None, True, False)
@@ -1436,8 +1458,11 @@ def test_d20_a_shortage_never_buries_a_reason_the_caller_can_act_on():
     # subject of a test must never be its own precondition. It is also the only
     # positive coverage `SUPPLY_EXHAUSTED` has, so it asserts the terminal.
     produced = r(task_class="MECHANICAL", flags=["auth_sensitive"],
-                 unavailable_models=["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
-                                     "gpt-5.6-luna", "gpt-5.6-sol"])
+                 unavailable_models=_leave_only("claude-haiku-4-5-20251001"))
+    remaining = sorted({m["id"] for m in CFG["models"].values()}
+                       - set(produced["unavailable_models"]))
+    assert remaining == ["claude-haiku-4-5-20251001"], (
+        f"precondition 'one model left' drifted: remaining={remaining}")
     assert produced["terminal"] == "SUPPLY_EXHAUSTED", (
         f"a route with one model left emitted {produced['terminal']}")
     assert produced["review"]["independence_compromised"], (
@@ -1454,9 +1479,15 @@ def test_d21_the_promotion_decision_sees_the_confidence_that_ships():
     raises the review band one level" quietly did not apply. The fixed point
     exists precisely so the promotion sees the final number."""
     threshold = CFG["router"]["confidence"]["extra_review_below"]
+    # Same remaining pair the five-id withhold used to leave: haiku + terra.
+    # The promotion fires because that pair is thin, not because five names
+    # were listed.
+    keep = ("claude-haiku-4-5-20251001", "gpt-5.6-terra")
     out = r(task_class="MECHANICAL", flags=["review_disagreement", "unknown_root_cause"],
-            unavailable_models=["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
-                                "gpt-5.6-luna", "gpt-5.6-sol"])
+            unavailable_models=_leave_only(*keep))
+    remaining = sorted({m["id"] for m in CFG["models"].values()} - set(out["unavailable_models"]))
+    assert remaining == sorted(keep), (
+        f"precondition 'thin remaining pair' drifted: remaining={remaining}")
     assert out["routing_confidence"] < threshold, "probe drifted"
     assert any("low_routing_confidence" in o for o in out["band_overrides_applied"]), (
         f"confidence {out['routing_confidence']} is below {threshold} and the review "
@@ -1468,8 +1499,7 @@ def test_d21_the_promotion_decision_sees_the_confidence_that_ships():
     for task_class in ("MECHANICAL", "IMPLEMENTATION", "DEBUGGING"):
         for flags in ([], ["review_disagreement"], ["review_disagreement", "unknown_root_cause"]):
             for scarce in ([], ["claude-fable-5"],
-                           ["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
-                            "gpt-5.6-luna", "gpt-5.6-sol"]):
+                           _leave_only("claude-haiku-4-5-20251001", "gpt-5.6-terra")):
                 o = r(task_class=task_class, flags=list(flags), unavailable_models=list(scarce))
                 if o["terminal"]:
                     continue
@@ -1896,7 +1926,7 @@ def _disagreement_sweep():
     for task_class in TASK_CLASSES:
         for c, u, b, rev in DIMENSION_SWEEP:
             for flags in DISAGREEMENT_SWEEP:
-                for runtime in ("claude_code", "codex"):
+                for runtime in sorted(CFG["runtimes"]):
                     for scarce in SCARCITY_SWEEP:
                         try:
                             yield r(task_class=task_class, complexity=c, uncertainty=u,
