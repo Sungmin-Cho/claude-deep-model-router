@@ -443,10 +443,13 @@ models:
 # Role bindings
 # ---------------------------------------------------------------------------
 #
-# One binding, not one per runtime. Roles are filled by whichever model is best
-# for the job regardless of provider, because both cross-provider bridges are
-# verified working. The per-provider bindings below are degraded fallbacks for
-# when a bridge is down — not alternate defaults.
+# One binding, not one per runtime. Roles are filled by whichever model is
+# best for the job regardless of provider. Not every bridge is verified in
+# every direction. Claude Code → openai, Codex → claude, and Claude Code →
+# xai have been probed. Codex → xai, grok → claude, and grok → openai use
+# the same commands and are recorded as assumed. The per-provider bindings
+# below are degraded fallbacks for when a bridge is down — not alternate
+# defaults.
 
 role_bindings:
   default:
