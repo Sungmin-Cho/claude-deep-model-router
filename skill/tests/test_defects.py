@@ -108,7 +108,7 @@ def test_d1_no_fallback_returns_the_model_it_just_declared_unavailable():
     """The original defect: the degraded binding for a role often names the same
     model as the default binding, so the 'fallback' was a no-op that still
     recorded a downgrade in fallbacks_applied."""
-    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+    for runtime, (role, probe) in itertools.product(sorted(CFG["runtimes"]),
                                                     ROLE_FORCING_ROUTES.items()):
         out = r(**probe, runtime=runtime, unavailable_roles=[role])
         blocked = set(out["unavailable_models"])
@@ -123,7 +123,7 @@ def test_d1_fallback_note_is_only_recorded_when_the_model_actually_changed():
     """A recorded fallback that changed nothing is worse than no record — it
     reads as a managed degradation when none happened."""
     saw_a_real_fallback = False
-    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+    for runtime, (role, probe) in itertools.product(sorted(CFG["runtimes"]),
                                                     ROLE_FORCING_ROUTES.items()):
         out = r(**probe, runtime=runtime, unavailable_roles=[role])
         for note in out["fallbacks_applied"]:
@@ -139,8 +139,13 @@ def test_d1_bridge_down_never_crosses_the_provider_boundary():
     """When the bridge is down the other family is unreachable by definition,
     so naming a model from it produces a route that cannot be executed."""
     families = {m["id"]: m["family"] for m in CFG["models"].values()}
-    local = {"claude_code": "claude", "codex": "openai"}
-    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+    local = {
+        rt: families[CFG["models"][next(iter(
+            CFG["role_bindings"][CFG["runtimes"][rt]["degraded_binding"]].values()
+        ))]["id"]]
+        for rt in CFG["runtimes"]
+    }
+    for runtime, (role, probe) in itertools.product(sorted(CFG["runtimes"]),
                                                     ROLE_FORCING_ROUTES.items()):
         for unavailable in ([], [role]):
             kw = dict(probe)
@@ -162,7 +167,7 @@ def test_d1_a_failed_model_is_never_re_emitted_under_a_new_role():
     # — a regression test for a shipped Critical executing zero assertions,
     # green. Concrete ids now, and the escape hatch has to prove it is honest.
     checked = 0
-    for runtime in ("claude_code", "codex"):
+    for runtime in sorted(CFG["runtimes"]):
         for prior in ("claude-sonnet-5", "claude-opus-5", "gpt-5.6-sol"):
             out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=1, blast_radius=1,
                     runtime=runtime, flags=["bridge_down"],
