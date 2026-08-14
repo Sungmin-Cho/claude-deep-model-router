@@ -180,8 +180,17 @@ def test_d1_a_failed_model_is_never_re_emitted_under_a_new_role():
     # — a regression test for a shipped Critical executing zero assertions,
     # green. Concrete ids now, and the escape hatch has to prove it is honest.
     checked = 0
+    # One concrete prior from every configured family. Two Claude ids stay
+    # because the original probe used them; grok-4.6 is the family that was
+    # missing. A family added to the registry without a prior here is a
+    # retry path nobody exercises.
+    priors = ("claude-sonnet-5", "claude-opus-5", "gpt-5.6-sol", "grok-4.6")
+    fam = {m["id"]: m["family"] for m in CFG["models"].values()}
+    assert {fam[p] for p in priors} == set(fam.values()), (
+        f"priors {priors} miss a configured family "
+        f"{sorted(set(fam.values()) - {fam[p] for p in priors})}")
     for runtime in sorted(CFG["runtimes"]):
-        for prior in ("claude-sonnet-5", "claude-opus-5", "gpt-5.6-sol"):
+        for prior in priors:
             out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=1, blast_radius=1,
                     runtime=runtime, flags=["bridge_down"],
                     prior_failures=1, prior_models=[prior])
@@ -596,16 +605,32 @@ def test_d9_parity_holds_including_the_native_effort_spelling():
     in its own docstring was never checked."""
     kw = dict(task_class="DEBUGGING", complexity=2, uncertainty=3,
               blast_radius=2, reversibility=1, flags=["auth_sensitive"])
-    a = r(runtime="claude_code", **kw)
-    b = r(runtime="codex", **kw)
-    assert a["selected_role"] == b["selected_role"]
-    assert a["selected_effort"] == b["selected_effort"]
-    assert a["review"]["band"] == b["review"]["band"]
+    outs = [r(runtime=rt, **kw) for rt in sorted(CFG["runtimes"])]
+    first = outs[0]
+    for other in outs[1:]:
+        assert other["selected_role"] == first["selected_role"]
+        assert other["selected_effort"] == first["selected_effort"]
+        assert other["review"]["band"] == first["review"]["band"]
     # Keyed by the family of the model that runs, not by the host runtime.
+    # Native is map[family][effective], not map[family][requested].
     fam = {m["id"]: m["family"] for m in CFG["models"].values()}
-    for out in (a, b):
-        expected = CFG["effort_map"][fam[out["selected_model"]]][out["selected_effort"]]
+    for out in outs:
+        expected = CFG["effort_map"][fam[out["selected_model"]]][
+            out["selected_effort_effective"]]
         assert out["selected_effort_native"] == expected
+
+    # The route above happens to emit equal requested and effective, so the
+    # wrong key cannot fail. This one splits them: requested MAX, effective
+    # VERY_HIGH (the worker's ceiling).
+    split = r(task_class="DEBUGGING", complexity=2, uncertainty=2,
+              blast_radius=1, reversibility=0,
+              flags=["auth_sensitive", "unknown_root_cause"])
+    assert split["selected_effort"] == "MAX"
+    assert split["selected_effort_effective"] == "VERY_HIGH"
+    assert split["selected_effort"] != split["selected_effort_effective"]
+    expected = CFG["effort_map"][fam[split["selected_model"]]][
+        split["selected_effort_effective"]]
+    assert split["selected_effort_native"] == expected
 
 
 # ---------------------------------------------------------------------------

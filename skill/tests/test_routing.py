@@ -268,18 +268,19 @@ def test_s18_both_runtimes_agree_on_role_effort_and_review_band():
     ids may differ between runtimes."""
     kw = dict(task_class="DEBUGGING", complexity=2, uncertainty=3,
               blast_radius=2, reversibility=1, flags=["auth_sensitive"])
-    a = r(runtime="claude_code", **kw)
-    b = r(runtime="codex", **kw)
-    assert a["selected_role"] == b["selected_role"]
-    assert a["selected_effort"] == b["selected_effort"]
-    assert a["review"]["band"] == b["review"]["band"]
-    assert a["review"]["reviewers"] == b["review"]["reviewers"]
-    assert a["risk_band"] == b["risk_band"]
-    # Round 21: the native spelling used to be the one field allowed to differ
-    # between runtimes. It is now keyed by the family of the model that runs,
-    # and both runtimes resolve the same worker under the shared binding — so
-    # it is equal too, and asserting that is what keeps this honest.
-    assert a["selected_effort_native"] == b["selected_effort_native"]
+    outs = [r(runtime=rt, **kw) for rt in sorted(CFG["runtimes"])]
+    first = outs[0]
+    for other in outs[1:]:
+        assert other["selected_role"] == first["selected_role"]
+        assert other["selected_effort"] == first["selected_effort"]
+        assert other["review"]["band"] == first["review"]["band"]
+        assert other["review"]["reviewers"] == first["review"]["reviewers"]
+        assert other["risk_band"] == first["risk_band"]
+        # Round 21: the native spelling used to be the one field allowed to differ
+        # between runtimes. It is now keyed by the family of the model that runs,
+        # and every runtime resolves the same worker under the shared binding —
+        # so it is equal too, and asserting that is what keeps this honest.
+        assert other["selected_effort_native"] == first["selected_effort_native"]
 
 
 # ---------------------------------------------------------------------------
