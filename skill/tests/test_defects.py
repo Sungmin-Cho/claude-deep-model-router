@@ -964,8 +964,6 @@ DOCUMENTED_BUT_UNREAD = {
     "effort_map.claude.MINIMAL": "vocabulary completeness — no band or "
                                  "floor selects MINIMAL",
     "effort_map.openai.MINIMAL": "same",
-    "runtimes": "read as a whole by Policy.__init__ for the runtime "
-                "vocabulary and the degraded-binding validation",
     "models": "ids/families/tiers are read; price_per_mtok and verified are "
               "cost and provenance documentation for people",
     "transports": "how the CALLER invokes each model; the router names models, "
