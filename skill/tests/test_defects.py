@@ -2091,3 +2091,57 @@ def test_d23_a_ceiling_record_appears_exactly_when_a_seat_was_capped():
             assert any(r["role"] == out["selected_role"] for r in records), (
                 f"worker effort moved {out['selected_effort']} -> "
                 f"{out['selected_effort_effective']} with no record: {records}")
+
+
+def test_d23_a_capped_reviewer_seat_gates_on_a_live_route():
+    """The path the ceiling control actually fires on.
+
+    Not `xai_only` + CRITICAL: one model fills every seat there, so
+    de-confliction fails and the route is INDEPENDENCE_UNAVAILABLE before any
+    ceiling matters. The live path is the default binding under scarcity —
+    withholding the architect makes `_deconflict` seat `worker_balanced` in a
+    CRITICAL reviewer slot, where the band asks for MAX and the model tops out
+    one level below.
+
+    DOCUMENTATION/CRITICAL looks like the obvious probe and is not: its worker
+    IS `worker_balanced`, but the worker's ceiling equals `band_CRITICAL`'s
+    floor, so nothing breaks.
+    """
+    out = r(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+            blast_radius=3, reversibility=2, flags=["auth_sensitive"],
+            unavailable_models=["claude-fable-5"])
+    assert out["terminal"] is None, f"probe went terminal: {out['terminal']}"
+    assert out["review"]["band"] == "CRITICAL"
+    assert "grok-4.6" in out["review"]["reviewer_models"], (
+        f"probe drifted; reviewers are {out['review']['reviewer_models']}")
+
+    capped = [rec for rec in out["effort_ceiling_applied"] if rec["floor_broken"]]
+    assert capped, f"no floor broken: {out['effort_ceiling_applied']}"
+    assert all(rec["floor_broken"] == "review.CRITICAL.effort" for rec in capped)
+    assert all(rec["capped_at"] == "VERY_HIGH" and rec["requested"] == "MAX"
+               for rec in capped)
+
+    # Inclusion, not equality. The same withhold also drops the architect, so
+    # the judge cannot be seated and the compensation adds a third reviewer.
+    assert "effort_below_floor" in out["human_control_causes"]
+    assert out["requires_human_confirmation"]
+
+    # And the counter-case: a route with no capped seat never claims the cause.
+    clean = r(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+              blast_radius=3, reversibility=2, flags=["auth_sensitive"])
+    assert not [rec for rec in clean["effort_ceiling_applied"] if rec["floor_broken"]]
+    assert "effort_below_floor" not in clean["human_control_causes"]
+
+
+def test_d23_a_terminal_route_keeps_the_ceiling_record_without_the_model():
+    """`review_depth_reduced`'s rule, applied to the new record: the human still
+    needs to know a seat was capped, and a terminal route still names no model.
+    Emptying the list instead would make the d19 oracle disagree with the
+    dispatcher, which emitted the cause before emit ran."""
+    out = r(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+            blast_radius=3, reversibility=2, flags=["auth_sensitive"],
+            unavailable_models=["claude-fable-5"], isolation_available=False)
+    assert out["terminal"] == "INDEPENDENCE_UNAVAILABLE", "probe drifted"
+    assert out["effort_ceiling_applied"], "the disclosure was dropped on terminal"
+    assert all(rec["model"] is None for rec in out["effort_ceiling_applied"])
+    assert out["selected_effort_effective"] is None
