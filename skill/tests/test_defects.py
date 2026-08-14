@@ -1982,3 +1982,47 @@ def test_d23_an_effort_ceiling_must_name_a_real_effort_level():
     assert policy.ceiling_of[CFG["models"][key]["id"]] == "HIGH"
     other = next(k for k in CFG["models"] if k != key)
     assert policy.ceiling_of[CFG["models"][other]["id"]] is None
+
+
+def test_d23_the_native_spelling_is_always_a_token_that_model_accepts():
+    """Both directions. A route that names an effort the model's CLI rejects is
+    not executable, and one that quietly under-delivers is the same defect
+    pointed the other way."""
+    from route_task import Policy
+    policy = Policy(CFG)
+    fam = {m["id"]: m["family"] for m in CFG["models"].values()}
+    levels = CFG["effort_levels"]
+    seen = 0
+    for out in _sweep():
+        if out["terminal"]:
+            assert out["selected_effort_effective"] is None
+            continue
+        model = out["selected_model"]
+        effective, requested = out["selected_effort_effective"], out["selected_effort"]
+        ceiling = policy.ceiling_of[model]
+        if ceiling is None:
+            assert effective == requested, (
+                f"{model} has no ceiling but effort was reduced "
+                f"{requested} -> {effective}")
+        else:
+            assert levels.index(effective) <= levels.index(ceiling), (
+                f"{model} cannot receive {effective} (ceiling {ceiling})")
+            assert levels.index(effective) <= levels.index(requested)
+        assert out["selected_effort_native"] == CFG["effort_map"][fam[model]][effective]
+        seen += 1
+    assert seen, "no executable route in the sweep — the assertion was vacuous"
+
+
+def test_d23_a_ceiling_record_appears_exactly_when_a_seat_was_capped():
+    """The record is the disclosure. Emitting it when nothing was capped makes
+    a managed decision out of a non-event; omitting it when something was makes
+    the route claim an effort it does not deliver."""
+    for out in _sweep():
+        records = out["effort_ceiling_applied"]
+        for rec in records:
+            assert rec["capped_at"] != rec["requested"], (
+                f"a record with nothing capped: {rec}")
+        if not out["terminal"] and out["selected_effort_effective"] != out["selected_effort"]:
+            assert any(r["role"] == out["selected_role"] for r in records), (
+                f"worker effort moved {out['selected_effort']} -> "
+                f"{out['selected_effort_effective']} with no record: {records}")

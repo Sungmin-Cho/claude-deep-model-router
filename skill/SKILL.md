@@ -422,7 +422,8 @@ risk_score:  risk_band:   band_overrides_applied: []   critical_flags: []
 band_overrides_redundant: []   # fired, but another rule had already got there
 route_path:                    # null, or "disagreement"
 terminal:                      # null, or one of the four in the table above
-selected_role:  selected_model:  selected_effort:  selected_effort_native:
+selected_role:  selected_model:  selected_effort:  selected_effort_effective:
+selected_effort_native:
 review:
   band:  reviewers: []  reviewer_models: []  effort:
   independence_required:       # what the band asks for
@@ -438,6 +439,9 @@ review:
   judge:  judge_model:         # null when judge_unavailable — a human adjudicates
 cross_family_review: true | false
 fallbacks_applied: []          # only recorded when the model actually changed
+effort_ceiling_applied: []     # [{role, model, requested, capped_at,
+                               # floor_broken, floor_requires}]; a seat whose
+                               # model cannot receive the effort asked for
 fallback_compensations_applied: []
 unavailable_models: []
 excluded_prior_failures: []    # models withheld because they already failed
