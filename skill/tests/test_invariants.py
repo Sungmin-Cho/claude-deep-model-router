@@ -41,7 +41,10 @@ from route_task import (  # noqa: E402
 CFG = load_config()
 MODEL_IDS = sorted(m["id"] for m in CFG["models"].values())
 FAMILY_OF = {m["id"]: m["family"] for m in CFG["models"].values()}
-LOCAL_FAMILY = {"claude_code": "claude", "codex": "openai"}
+LOCAL_FAMILY = {
+    rt: FAMILY_OF[CFG["models"][next(iter(CFG["role_bindings"][spec["degraded_binding"]].values()))]["id"]]
+    for rt, spec in CFG["runtimes"].items()
+}
 TIER_OF = {m["id"]: m["capability_tier"] for m in CFG["models"].values()}
 NOMINAL_TIER = {role: TIER_OF[CFG["models"][key]["id"]]
                 for role, key in CFG["role_bindings"]["default"].items()}
@@ -74,6 +77,13 @@ FLAG_SETS = [
 
 # Scarcity is what forces roles onto shared models. Without it the degenerate
 # bindings are unreachable and every seat invariant passes vacuously.
+def _all_but(*keep):
+    """Withhold everything except `keep`. Index slices went stale the moment a
+    model was appended to the registry — the new id sorted last and no slice
+    reached it."""
+    return sorted(set(MODEL_IDS) - set(keep))
+
+
 SCARCITY = [
     [],
     [MODEL_IDS[0]],
@@ -81,16 +91,14 @@ SCARCITY = [
     MODEL_IDS[1:3],
     MODEL_IDS[2:5],
     MODEL_IDS[:3],
-    # Round 7: every seat defect found in rounds 3-7 — and both of that round's
-    # behavioural Criticals — lives at 4-5 models withheld, which the sweep did
-    # not reach. `test_every_swept_dimension_actually_varies` counted SCARCITY
-    # as varying and so gave false assurance about coverage DEPTH.
     MODEL_IDS[:5],
     MODEL_IDS[2:7],
-    [MODEL_IDS[0], MODEL_IDS[1], MODEL_IDS[3], MODEL_IDS[5], MODEL_IDS[6]],
+    _all_but("claude-opus-5", "gpt-5.6-sol", "grok-4.6"),
+    _all_but("grok-4.6"),
+    _all_but("claude-opus-5", "grok-4.6"),
 ]
 
-RUNTIMES = ["claude_code", "codex"]
+RUNTIMES = sorted(CFG["runtimes"])
 
 # Round 6: without this dimension `excluded_prior_failures` was empty on all
 # 8,712 routes, so the invariant that a failed model is never re-emitted
@@ -424,9 +432,10 @@ def test_bridge_down_never_names_an_unreachable_family():
     for out in routes():
         if "bridge down" not in out["rationale"]:
             continue
-        runtime = "codex" if "codex" in out["rationale"] else None
-        # The rationale names the degraded binding; derive the runtime from it.
-        local = "openai" if "openai_only" in out["rationale"] else "claude"
+        # The rationale names the degraded binding; derive the family from it
+        # rather than from a two-way guess that a third binding silently loses.
+        binding = next(b for b in CFG["role_bindings"] if f"binding degraded to {b}" in out["rationale"])
+        local = FAMILY_OF[CFG["models"][next(iter(CFG["role_bindings"][binding].values()))]["id"]]
         emitted = [m for m in parties(out) + [out["review"]["judge_model"]] if m]
         foreign = {m for m in emitted if FAMILY_OF[m] != local}
         assert not foreign, f"bridge down but emitted {sorted(foreign)} (local={local})"

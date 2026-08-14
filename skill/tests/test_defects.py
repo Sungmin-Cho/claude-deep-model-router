@@ -41,6 +41,12 @@ from route_task import (  # noqa: E402
 CFG = load_config()
 
 
+def _leave_only(*keep):
+    """Everything but the one model this probe is about. Enumerating five ids
+    meant the oracle went stale the moment the registry grew."""
+    return sorted({m["id"] for m in CFG["models"].values()} - set(keep))
+
+
 def _task(**kw):
     kw.setdefault("complexity", 0)
     kw.setdefault("uncertainty", 0)
@@ -102,7 +108,7 @@ def test_d1_no_fallback_returns_the_model_it_just_declared_unavailable():
     """The original defect: the degraded binding for a role often names the same
     model as the default binding, so the 'fallback' was a no-op that still
     recorded a downgrade in fallbacks_applied."""
-    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+    for runtime, (role, probe) in itertools.product(sorted(CFG["runtimes"]),
                                                     ROLE_FORCING_ROUTES.items()):
         out = r(**probe, runtime=runtime, unavailable_roles=[role])
         blocked = set(out["unavailable_models"])
@@ -117,7 +123,7 @@ def test_d1_fallback_note_is_only_recorded_when_the_model_actually_changed():
     """A recorded fallback that changed nothing is worse than no record — it
     reads as a managed degradation when none happened."""
     saw_a_real_fallback = False
-    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+    for runtime, (role, probe) in itertools.product(sorted(CFG["runtimes"]),
                                                     ROLE_FORCING_ROUTES.items()):
         out = r(**probe, runtime=runtime, unavailable_roles=[role])
         for note in out["fallbacks_applied"]:
@@ -129,12 +135,30 @@ def test_d1_fallback_note_is_only_recorded_when_the_model_actually_changed():
     assert saw_a_real_fallback, "the probe set never triggered a fallback — assertion was vacuous"
 
 
+# Hardcoded on purpose: this is the contract a runtime's degraded binding
+# must satisfy, not a restatement of it. Deriving it from `degraded_binding`
+# made the oracle agree with any binding the config named, including a
+# binding on the far side of the very bridge that is down.
+NATIVE_FAMILY = {"claude_code": "claude", "codex": "openai", "grok": "xai"}
+
+
 def test_d1_bridge_down_never_crosses_the_provider_boundary():
     """When the bridge is down the other family is unreachable by definition,
     so naming a model from it produces a route that cannot be executed."""
+    assert set(NATIVE_FAMILY) == set(CFG["runtimes"]), (
+        f"NATIVE_FAMILY covers {sorted(NATIVE_FAMILY)} but runtimes are "
+        f"{sorted(CFG['runtimes'])}; a new runtime must be pinned here")
     families = {m["id"]: m["family"] for m in CFG["models"].values()}
-    local = {"claude_code": "claude", "codex": "openai"}
-    for runtime, (role, probe) in itertools.product(("claude_code", "codex"),
+    for runtime, expected_family in NATIVE_FAMILY.items():
+        binding = CFG["runtimes"][runtime]["degraded_binding"]
+        bound = {CFG["models"][key]["family"]
+                 for key in CFG["role_bindings"][binding].values()}
+        assert bound == {expected_family}, (
+            f"{runtime}'s degraded binding {binding!r} resolves to "
+            f"{sorted(bound)}, not {expected_family}"
+        )
+    local = NATIVE_FAMILY
+    for runtime, (role, probe) in itertools.product(sorted(CFG["runtimes"]),
                                                     ROLE_FORCING_ROUTES.items()):
         for unavailable in ([], [role]):
             kw = dict(probe)
@@ -156,8 +180,17 @@ def test_d1_a_failed_model_is_never_re_emitted_under_a_new_role():
     # — a regression test for a shipped Critical executing zero assertions,
     # green. Concrete ids now, and the escape hatch has to prove it is honest.
     checked = 0
-    for runtime in ("claude_code", "codex"):
-        for prior in ("claude-sonnet-5", "claude-opus-5", "gpt-5.6-sol"):
+    # One concrete prior from every configured family. Two Claude ids stay
+    # because the original probe used them; grok-4.6 is the family that was
+    # missing. A family added to the registry without a prior here is a
+    # retry path nobody exercises.
+    priors = ("claude-sonnet-5", "claude-opus-5", "gpt-5.6-sol", "grok-4.6")
+    fam = {m["id"]: m["family"] for m in CFG["models"].values()}
+    assert {fam[p] for p in priors} == set(fam.values()), (
+        f"priors {priors} miss a configured family "
+        f"{sorted(set(fam.values()) - {fam[p] for p in priors})}")
+    for runtime in sorted(CFG["runtimes"]):
+        for prior in priors:
             out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=1, blast_radius=1,
                     runtime=runtime, flags=["bridge_down"],
                     prior_failures=1, prior_models=[prior])
@@ -572,15 +605,32 @@ def test_d9_parity_holds_including_the_native_effort_spelling():
     in its own docstring was never checked."""
     kw = dict(task_class="DEBUGGING", complexity=2, uncertainty=3,
               blast_radius=2, reversibility=1, flags=["auth_sensitive"])
-    a = r(runtime="claude_code", **kw)
-    b = r(runtime="codex", **kw)
-    assert a["selected_role"] == b["selected_role"]
-    assert a["selected_effort"] == b["selected_effort"]
-    assert a["review"]["band"] == b["review"]["band"]
-    claude_map = CFG["effort_map"]["claude_code"]
-    codex_map = CFG["effort_map"]["codex"]
-    assert a["selected_effort_native"] == claude_map[a["selected_effort"]]
-    assert b["selected_effort_native"] == codex_map[b["selected_effort"]]
+    outs = [r(runtime=rt, **kw) for rt in sorted(CFG["runtimes"])]
+    first = outs[0]
+    for other in outs[1:]:
+        assert other["selected_role"] == first["selected_role"]
+        assert other["selected_effort"] == first["selected_effort"]
+        assert other["review"]["band"] == first["review"]["band"]
+    # Keyed by the family of the model that runs, not by the host runtime.
+    # Native is map[family][effective], not map[family][requested].
+    fam = {m["id"]: m["family"] for m in CFG["models"].values()}
+    for out in outs:
+        expected = CFG["effort_map"][fam[out["selected_model"]]][
+            out["selected_effort_effective"]]
+        assert out["selected_effort_native"] == expected
+
+    # The route above happens to emit equal requested and effective, so the
+    # wrong key cannot fail. This one splits them: requested MAX, effective
+    # VERY_HIGH (the worker's ceiling).
+    split = r(task_class="DEBUGGING", complexity=2, uncertainty=2,
+              blast_radius=1, reversibility=0,
+              flags=["auth_sensitive", "unknown_root_cause"])
+    assert split["selected_effort"] == "MAX"
+    assert split["selected_effort_effective"] == "VERY_HIGH"
+    assert split["selected_effort"] != split["selected_effort_effective"]
+    expected = CFG["effort_map"][fam[split["selected_model"]]][
+        split["selected_effort_effective"]]
+    assert split["selected_effort_native"] == expected
 
 
 # ---------------------------------------------------------------------------
@@ -599,10 +649,9 @@ def test_d9_parity_holds_including_the_native_effort_spelling():
 
 DIMENSION_SWEEP = [(0, 0, 0, 0), (2, 2, 2, 0), (3, 2, 3, 1), (3, 3, 3, 3), (2, 2, 2, 2)]
 BINDING_SWEEP = [
-    dict(runtime="claude_code", flags=[]),
-    dict(runtime="claude_code", flags=["bridge_down"]),
-    dict(runtime="codex", flags=[]),
-    dict(runtime="codex", flags=["bridge_down"]),
+    dict(runtime=rt, flags=list(f))
+    for rt in sorted(CFG["runtimes"])
+    for f in ([], ["bridge_down"])
 ]
 
 # Scarcity is what forces roles onto shared models, and the previous sweep
@@ -617,6 +666,8 @@ SCARCITY_SWEEP = [
     _MODEL_IDS[:3],
     _MODEL_IDS[1:4],
     _MODEL_IDS[2:5],
+    sorted(set(_MODEL_IDS) - {"claude-opus-5", "gpt-5.6-sol", "grok-4.6"}),
+    sorted(set(_MODEL_IDS) - {"grok-4.6"}),
 ]
 
 
@@ -886,10 +937,16 @@ def test_d13_the_judge_retry_never_seats_the_implementer_as_its_own_reviewer():
     route traded a distinct, stronger reviewer for the implementer itself,
     recorded nothing (LOW's depth floor is 0, so the shortfall gate cannot fire
     either), and flipped requires_human_confirmation from true to false."""
+    keep = ("claude-opus-5", "gpt-5.6-terra")
     out = r(task_class="MIGRATION", flags=["review_disagreement"], runtime="claude_code",
-            unavailable_models=["gpt-5.6-luna", "claude-haiku-4-5-20251001",
-                                "claude-sonnet-5", "claude-fable-5", "gpt-5.6-sol"])
+            unavailable_models=_leave_only(*keep))
     rv = out["review"]
+    remaining = sorted({m["id"] for m in CFG["models"].values()} - set(out["unavailable_models"]))
+    seats = [out["selected_role"], *rv["reviewers"], rv["judge"]]
+    assert remaining == sorted(keep), (
+        f"precondition 'two models' drifted: remaining={remaining}")
+    assert len(seats) == 3, (
+        f"precondition 'three seats' drifted: seats={seats}")
     assert rv["band"] == "LOW" and out["route_path"] == "disagreement", "probe drifted"
     assert out["selected_model"] not in rv["reviewer_models"], (
         f"implementer {out['selected_model']} was re-seated as its own reviewer "
@@ -929,8 +986,10 @@ DOCUMENTED_BUT_UNREAD = {
                          "inert-flag test; the effect itself lives in `overrides`",
     "worker_promotions": "prose description of promotions implemented in "
                          "select_worker; kept as the human-readable statement",
-    "worker_balanced_selection": "documents that worker_balanced_alt is a "
-                                 "same-family fallback, which `fallbacks` implements",
+    "worker_balanced_selection": "documents that worker_balanced_alt is the "
+                                 "first-escalation fallback; the alt is now Claude "
+                                 "while worker_fast is OpenAI, so it is no longer "
+                                 "a same-family fallback. `fallbacks` implements it",
     "verification_ledger": "provenance of the identifiers, read by people",
     "router.default_worker": "states the policy's starting point; the table in "
                              "worker_selection is what executes",
@@ -960,9 +1019,16 @@ DOCUMENTED_BUT_UNREAD = {
     "review.MEDIUM.preferred_by_implementer.worker_balanced_alt": "see above",
     "effort_by_work": "per-work-kind guidance for the caller; the router's own "
                       "effort comes from effort_by_work entries that map to a band",
-    "effort_map.claude_code.MINIMAL": "vocabulary completeness — no band or "
-                                      "floor selects MINIMAL",
-    "effort_map.codex.MINIMAL": "same",
+    "effort_map.claude.MINIMAL": "vocabulary completeness — no band or "
+                                 "floor selects MINIMAL",
+    "effort_map.openai.MINIMAL": "same",
+    "effort_map.xai.MINIMAL": "same",
+    "effort_map.xai.MAX": "the clamp runs before the native lookup and the "
+                          "only xai model's ceiling is VERY_HIGH, so this leaf "
+                          "is unreachable rather than merely unvisited",
+    "effort_map.xai.LOW": "the probes below never pair the only xai seat with "
+                          "LOW effort — reachable via a prior-failure promotion "
+                          "on MECHANICAL/LOW, which this probe set does not build",
     "models": "ids/families/tiers are read; price_per_mtok and verified are "
               "cost and provenance documentation for people",
     "transports": "how the CALLER invokes each model; the router names models, "
@@ -1033,7 +1099,7 @@ def test_d14_every_config_rule_has_a_consumer_or_a_recorded_reason():
                   ["long_horizon"], ["migration", "data_integrity_sensitive"],
                   ["unknown_root_cause"], ["production_hotfix"], ["public_api_change"],
                   ["concurrency_sensitive"], ["auth_sensitive", "review_disagreement"])
-        for rt in ("claude_code", "codex")
+        for rt in sorted(CFG["runtimes"])
         for pf, pm in ((0, []), (1, ["senior_engineer"]), (2, []), (5, []))
         for um in ([], ["claude-fable-5"], ["claude-opus-5", "gpt-5.6-sol"])
         for iso in (None, True, False)
@@ -1191,7 +1257,8 @@ def test_d15_every_human_control_action_is_validated_and_load_bearing():
     # producing the same route, because the cap is a safety limit rather than a
     # policy choice. A key whose values cannot differ is not configuration.
     keys = ("on_independence_unachievable", "on_any_critical_review",
-            "on_judge_unavailable", "on_review_depth_reduced")
+            "on_judge_unavailable", "on_review_depth_reduced",
+            "on_effort_below_floor")
     for key in keys:
         for bad in ("require_human_confirmaton", "", None, 1, "TERMINAL", "gate"):
             altered = {**CFG, "human_in_the_loop": {**CFG["human_in_the_loop"], key: bad}}
@@ -1230,6 +1297,31 @@ def test_d15_every_human_control_action_is_validated_and_load_bearing():
         assert seen["require_human_confirmation"][1], f"{key}: no gate"
         assert len(set(seen.values())) >= 2, (
             f"{key}: every action produces the same outcome {seen} — read, but inert")
+
+    # `on_effort_below_floor` needs a model that cannot reach the band's review
+    # effort. Injected here rather than assumed from the registry, so the probe
+    # states its own precondition.
+    capped_cfg = {**CFG, "models": {**CFG["models"], "claude_senior": {
+        **CFG["models"]["claude_senior"], "effort_ceiling": "HIGH"}}}
+    seen = {}
+    probe = dict(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+                 blast_radius=3, reversibility=2, flags=["auth_sensitive"])
+    for action in ("terminal", "require_human_confirmation", "notify_human"):
+        cfg = {**capped_cfg, "human_in_the_loop": {
+            **capped_cfg["human_in_the_loop"], "on_effort_below_floor": action}}
+        out = route(_task(**probe), cfg)
+        seen[action] = (out["terminal"] is not None,
+                        out["requires_human_confirmation"])
+    assert seen["terminal"][0], "on_effort_below_floor: 'terminal' produced no terminal state"
+    assert seen["require_human_confirmation"][1], "on_effort_below_floor: no gate"
+    assert len(set(seen.values())) >= 2, (
+        f"on_effort_below_floor: every action produces the same outcome {seen}")
+
+    for bad in ("require_human_confirmaton", "", None, 1, "TERMINAL", "gate"):
+        altered = {**CFG, "human_in_the_loop": {
+            **CFG["human_in_the_loop"], "on_effort_below_floor": bad}}
+        with pytest.raises(ConfigError):
+            Policy(altered)
 
 
 def test_d15_every_reference_skill_md_names_actually_exists():
@@ -1435,8 +1527,11 @@ def test_d20_a_shortage_never_buries_a_reason_the_caller_can_act_on():
     # subject of a test must never be its own precondition. It is also the only
     # positive coverage `SUPPLY_EXHAUSTED` has, so it asserts the terminal.
     produced = r(task_class="MECHANICAL", flags=["auth_sensitive"],
-                 unavailable_models=["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
-                                     "gpt-5.6-luna", "gpt-5.6-sol"])
+                 unavailable_models=_leave_only("claude-haiku-4-5-20251001"))
+    remaining = sorted({m["id"] for m in CFG["models"].values()}
+                       - set(produced["unavailable_models"]))
+    assert remaining == ["claude-haiku-4-5-20251001"], (
+        f"precondition 'one model left' drifted: remaining={remaining}")
     assert produced["terminal"] == "SUPPLY_EXHAUSTED", (
         f"a route with one model left emitted {produced['terminal']}")
     assert produced["review"]["independence_compromised"], (
@@ -1453,9 +1548,15 @@ def test_d21_the_promotion_decision_sees_the_confidence_that_ships():
     raises the review band one level" quietly did not apply. The fixed point
     exists precisely so the promotion sees the final number."""
     threshold = CFG["router"]["confidence"]["extra_review_below"]
+    # Same remaining pair the five-id withhold used to leave: haiku + terra.
+    # The promotion fires because that pair is thin, not because five names
+    # were listed.
+    keep = ("claude-haiku-4-5-20251001", "gpt-5.6-terra")
     out = r(task_class="MECHANICAL", flags=["review_disagreement", "unknown_root_cause"],
-            unavailable_models=["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
-                                "gpt-5.6-luna", "gpt-5.6-sol"])
+            unavailable_models=_leave_only(*keep))
+    remaining = sorted({m["id"] for m in CFG["models"].values()} - set(out["unavailable_models"]))
+    assert remaining == sorted(keep), (
+        f"precondition 'thin remaining pair' drifted: remaining={remaining}")
     assert out["routing_confidence"] < threshold, "probe drifted"
     assert any("low_routing_confidence" in o for o in out["band_overrides_applied"]), (
         f"confidence {out['routing_confidence']} is below {threshold} and the review "
@@ -1467,8 +1568,7 @@ def test_d21_the_promotion_decision_sees_the_confidence_that_ships():
     for task_class in ("MECHANICAL", "IMPLEMENTATION", "DEBUGGING"):
         for flags in ([], ["review_disagreement"], ["review_disagreement", "unknown_root_cause"]):
             for scarce in ([], ["claude-fable-5"],
-                           ["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
-                            "gpt-5.6-luna", "gpt-5.6-sol"]):
+                           _leave_only("claude-haiku-4-5-20251001", "gpt-5.6-terra")):
                 o = r(task_class=task_class, flags=list(flags), unavailable_models=list(scarce))
                 if o["terminal"]:
                     continue
@@ -1566,6 +1666,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
         "critical_review_band": "a CRITICAL review cannot be accepted automatically",
         "no_adjudicator": "no adjudicator is available",
         "review_below_band": "the review is staffed below its band",
+        "effort_below_floor":
+            "the selected model cannot reach the effort a floor required",
     }
     from route_task import CAUSE_REASONS
     assert CAUSE_REASONS == EXPECTED_WORDING, (
@@ -1586,6 +1688,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
             "critical_review_band": rv["band"] == "CRITICAL",
             "no_adjudicator": bool(rv["judge_unavailable"]),
             "review_below_band": bool(rv["review_depth_reduced"]),
+            "effort_below_floor": any(
+                r["floor_broken"] for r in out["effort_ceiling_applied"]),
         }
 
     # The oracle must cover exactly the causes the router declares. A control
@@ -1895,7 +1999,7 @@ def _disagreement_sweep():
     for task_class in TASK_CLASSES:
         for c, u, b, rev in DIMENSION_SWEEP:
             for flags in DISAGREEMENT_SWEEP:
-                for runtime in ("claude_code", "codex"):
+                for runtime in sorted(CFG["runtimes"]):
                     for scarce in SCARCITY_SWEEP:
                         try:
                             yield r(task_class=task_class, complexity=c, uncertainty=u,
@@ -1954,3 +2058,304 @@ def test_d12_judge_reclaims_a_tier_a_reviewer_did_not_need():
     assert rv["judge_model"] is not None
     parties = {out["selected_model"], *(m for m in rv["reviewer_models"] if m)}
     assert rv["judge_model"] not in parties
+
+
+def test_d23_an_effort_ceiling_must_name_a_real_effort_level():
+    """A ceiling is compared against conceptual effort levels. A typo would
+    either raise deep inside `efforts.index()` or be silently skipped — and a
+    ceiling that is silently skipped is a route promising an effort the model
+    refuses.
+
+    `None` is deliberately absent from the bad list: a model with no ceiling and
+    a model whose ceiling is explicitly null are the same thing, and `.get()`
+    cannot tell them apart anyway.
+    """
+    from route_task import Policy, ConfigError
+    key = next(iter(CFG["models"]))
+    for bad in ("XHIGH", "very_high", "", 3, "MAXIMUM"):
+        altered = {**CFG, "models": {**CFG["models"],
+                                     key: {**CFG["models"][key], "effort_ceiling": bad}}}
+        with pytest.raises(ConfigError):
+            Policy(altered)
+
+    # And a real level is accepted, with the ceiling readable per model id.
+    ok = {**CFG, "models": {**CFG["models"],
+                            key: {**CFG["models"][key], "effort_ceiling": "HIGH"}}}
+    policy = Policy(ok)
+    assert policy.ceiling_of[CFG["models"][key]["id"]] == "HIGH"
+    other = next(k for k in CFG["models"] if k != key)
+    assert policy.ceiling_of[CFG["models"][other]["id"]] is None
+
+
+# Independent of `effort_map`, on purpose. Probed against each CLI on
+# 2026-08-14; see the config's verification_ledger. If a CLI's vocabulary
+# changes, this table and the map both have to move, and that is the point:
+# an oracle that reads the map cannot tell you the map is wrong.
+# The whole mapping, by hand, independent of `effort_map` — not just the set of
+# tokens each CLI will take. A membership check catches a token a CLI rejects; it
+# cannot catch a token the CLI ACCEPTS at the wrong level, and "quietly
+# under-delivers" is half of what this test claims to guard. Probed against each
+# CLI on 2026-08-14; the config's verification_ledger records the round-trips.
+#
+# Yes, this duplicates `effort_map`. That is the point, and it is the same
+# bargain `EXPECTED_WORDING` makes: an oracle that reads the table under test
+# can only tell you the router is self-consistent, never that the table is
+# right. Changing a spelling now takes two edits, and the second one is a
+# decision rather than a consequence.
+EXPECTED_NATIVE = {
+    "claude": {"MINIMAL": "low",  "LOW": "low", "MEDIUM": "medium",
+               "HIGH": "high", "VERY_HIGH": "xhigh", "MAX": "max"},
+    "openai": {"MINIMAL": "none", "LOW": "low", "MEDIUM": "medium",
+               "HIGH": "high", "VERY_HIGH": "xhigh", "MAX": "max"},
+    # `max` and `none` are rejected outright; MAX has nowhere to go but xhigh,
+    # and the clamp means no route reaches that entry anyway.
+    "xai":    {"MINIMAL": "low",  "LOW": "low", "MEDIUM": "medium",
+               "HIGH": "high", "VERY_HIGH": "xhigh", "MAX": "xhigh"},
+}
+ACCEPTED_CLI_TOKENS = {f: set(m.values()) for f, m in EXPECTED_NATIVE.items()}
+
+
+def test_d23_the_native_spelling_is_always_a_token_that_model_accepts():
+    """Both directions. A route that names an effort the model's CLI rejects is
+    not executable, and one that quietly under-delivers is the same defect
+    pointed the other way.
+
+    The second direction needs `EXPECTED_NATIVE`, not a token set: setting
+    `effort_map.openai.HIGH` to `low` emits a token Codex happily accepts, at an
+    effort level below the one the band asked for, and a membership check waves
+    it through."""
+    from route_task import Policy
+    policy = Policy(CFG)
+    fam = {m["id"]: m["family"] for m in CFG["models"].values()}
+    assert set(ACCEPTED_CLI_TOKENS) == set(fam.values()), (
+        f"ACCEPTED_CLI_TOKENS covers {sorted(ACCEPTED_CLI_TOKENS)} but "
+        f"the registry holds {sorted(set(fam.values()))}")
+    levels = CFG["effort_levels"]
+    seen = 0
+    for out in _sweep():
+        if out["terminal"]:
+            assert out["selected_effort_effective"] is None
+            continue
+        model = out["selected_model"]
+        effective, requested = out["selected_effort_effective"], out["selected_effort"]
+        ceiling = policy.ceiling_of[model]
+        if ceiling is None:
+            assert effective == requested, (
+                f"{model} has no ceiling but effort was reduced "
+                f"{requested} -> {effective}")
+        else:
+            assert levels.index(effective) <= levels.index(ceiling), (
+                f"{model} cannot receive {effective} (ceiling {ceiling})")
+            assert levels.index(effective) <= levels.index(requested)
+        native = out["selected_effort_native"]
+        # Against the hand table, not against the map the router just read.
+        assert native == EXPECTED_NATIVE[fam[model]][effective], (
+            f"{model} ({fam[model]}) at {effective} emitted native {native!r}; "
+            f"that family's CLI spells it "
+            f"{EXPECTED_NATIVE[fam[model]][effective]!r}"
+        )
+        assert native in ACCEPTED_CLI_TOKENS[fam[model]], (
+            f"{model} ({fam[model]}) emitted native {native!r}, which that "
+            f"family's CLI does not accept; accepted={sorted(ACCEPTED_CLI_TOKENS[fam[model]])}"
+        )
+        seen += 1
+    assert seen, "no executable route in the sweep — the assertion was vacuous"
+
+
+def test_d23_native_is_looked_up_from_the_effort_that_ships():
+    """Since the request/effective split, native is `map[family][effective]`.
+    Nothing on the shipped registry can prove that: the only capped family maps
+    MAX and VERY_HIGH to the same token, so indexing the requested level instead
+    emits the identical string and every assertion stays green.
+
+    So the discriminating case is built rather than found. A Claude model capped
+    at HIGH separates the two lookups — `claude.MAX` is `max` and `claude.HIGH`
+    is `high` — and a route that requests MAX must then emit `high`. Reverting
+    the index to `selected_effort` fails here and nowhere else, which is the
+    only reason this test exists.
+    """
+    import copy
+    cfg = copy.deepcopy(CFG)
+    cfg["models"]["claude_senior"]["effort_ceiling"] = "HIGH"
+    m = cfg["effort_map"]["claude"]
+    assert m["MAX"] != m["HIGH"], (
+        "the probe rests on these two spellings differing; if the map changed, "
+        "this test no longer discriminates and must be rebuilt")
+
+    out = route(_task(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+                      blast_radius=3, reversibility=2, flags=["auth_sensitive"],
+                      unavailable_models=["claude-fable-5"]), cfg)
+    assert out["selected_model"] == "claude-opus-5", "probe drifted"
+    assert out["selected_effort"] == "MAX", "probe drifted"
+    assert out["selected_effort_effective"] == "HIGH", (
+        f"the cap did not apply: {out['selected_effort_effective']}")
+    assert out["selected_effort_native"] == m["HIGH"], (
+        f"native is {out['selected_effort_native']!r}; it must come from the "
+        f"effort that ships ({m['HIGH']!r}), not the one that was asked for "
+        f"({m['MAX']!r})")
+
+
+def test_d23_a_merged_ceiling_row_reads_coherently():
+    """One role can hold two seats, and the single row it gets has to be true of
+    both asks.
+
+    Two ways in, and the first review of this merge found only the second:
+
+    - LOW seats `worker_fast` as its own reviewer BY DESIGN (`independent:
+      false`, so `_deconflict` never runs). The route stays EXECUTABLE. Three
+      separate probes of mine missed this because they all swept dimensions that
+      land above LOW, and each reported "no problems" from a path it never
+      entered.
+    - `_deconflict` failing to substitute leaves the worker among the reviewers.
+      That also compromises independence, so those routes are terminal.
+
+    The row reports the HIGHER of the two asks, because that is the level any
+    named floor is measured against. Before this, a LOW route shipped
+    `requested: LOW` beside `floor_requires: MEDIUM` — two numbers that cannot
+    both describe one seat.
+    """
+    import copy
+
+    # (a) executable, by design, no independence failure anywhere near it.
+    cfg = copy.deepcopy(CFG)
+    cfg["models"]["openai_worker_fast"]["effort_ceiling"] = "MINIMAL"
+    out = route(_task(task_class="MECHANICAL"), cfg)
+    assert out["terminal"] is None, "the executable merge path went terminal"
+    assert out["review"]["reviewers"] == [out["selected_role"]], (
+        "probe drifted: this case exists because the worker reviews itself")
+    assert not out["review"]["independence_required"]
+    rows = out["effort_ceiling_applied"]
+    assert len(rows) == 1, f"one seat, one row: {rows}"
+    row = rows[0]
+    assert row["requested"] == row["floor_requires"], (
+        f"the row asks for {row['requested']} while naming a floor that "
+        f"requires {row['floor_requires']}: {row}")
+    assert row["floor_broken"] == "review.LOW.effort"
+
+    # (b) both floors broken on one seat: the stricter one is what ships.
+    cfg = copy.deepcopy(CFG)
+    cfg["models"]["xai_frontier"]["effort_ceiling"] = "HIGH"
+    ids = sorted(m["id"] for m in cfg["models"].values())
+    out = route(_task(task_class="MECHANICAL", complexity=3, uncertainty=3,
+                      blast_radius=3, reversibility=3,
+                      unavailable_models=sorted(set(ids) - {"grok-4.6"})), cfg)
+    assert out["review"]["independence_compromised"], "probe drifted"
+    shared = [r for r in out["effort_ceiling_applied"]
+              if r["floor_broken"] == "review.CRITICAL.effort"]
+    assert len(shared) == len(out["effort_ceiling_applied"]), (
+        f"a seat broke the review floor and reported a weaker one: "
+        f"{out['effort_ceiling_applied']}")
+    assert all(r["floor_requires"] == "MAX" for r in shared), (
+        "the stricter of two broken floors is what the human has to satisfy")
+
+
+def test_d23_a_ceiling_record_appears_exactly_when_a_seat_was_capped():
+    """The record is the disclosure. Emitting it when nothing was capped makes
+    a managed decision out of a non-event; omitting it when something was makes
+    the route claim an effort it does not deliver."""
+    for out in _sweep():
+        records = out["effort_ceiling_applied"]
+        for rec in records:
+            assert rec["capped_at"] != rec["requested"], (
+                f"a record with nothing capped: {rec}")
+        roles = [rec["role"] for rec in records]
+        assert len(roles) == len(set(roles)), f"same seat twice: {records}"
+        if not out["terminal"] and out["selected_effort_effective"] != out["selected_effort"]:
+            assert any(r["role"] == out["selected_role"] for r in records), (
+                f"worker effort moved {out['selected_effort']} -> "
+                f"{out['selected_effort_effective']} with no record: {records}")
+
+
+def test_d23_a_capped_reviewer_seat_gates_on_a_live_route():
+    """The path the ceiling control actually fires on.
+
+    Not `xai_only` + CRITICAL: one model fills every seat there, so
+    de-confliction fails and the route is INDEPENDENCE_UNAVAILABLE before any
+    ceiling matters. The live path is the default binding under scarcity —
+    withholding the architect makes `_deconflict` seat `worker_balanced` in a
+    CRITICAL reviewer slot, where the band asks for MAX and the model tops out
+    one level below.
+
+    DOCUMENTATION/CRITICAL looks like the obvious probe and is not: its worker
+    IS `worker_balanced`, but the worker's ceiling equals `band_CRITICAL`'s
+    floor, so nothing breaks.
+    """
+    out = r(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+            blast_radius=3, reversibility=2, flags=["auth_sensitive"],
+            unavailable_models=["claude-fable-5"])
+    assert out["terminal"] is None, f"probe went terminal: {out['terminal']}"
+    assert out["review"]["band"] == "CRITICAL"
+    assert "grok-4.6" in out["review"]["reviewer_models"], (
+        f"probe drifted; reviewers are {out['review']['reviewer_models']}")
+
+    capped = [rec for rec in out["effort_ceiling_applied"] if rec["floor_broken"]]
+    assert capped, f"no floor broken: {out['effort_ceiling_applied']}"
+    assert all(rec["floor_broken"] == "review.CRITICAL.effort" for rec in capped)
+    assert all(rec["capped_at"] == "VERY_HIGH" and rec["requested"] == "MAX"
+               for rec in capped)
+
+    # Inclusion, not equality. The same withhold also drops the architect, so
+    # the judge cannot be seated and the compensation adds a third reviewer.
+    assert "effort_below_floor" in out["human_control_causes"]
+    assert out["requires_human_confirmation"]
+
+    # And the counter-case: a route with no capped seat never claims the cause.
+    clean = r(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+              blast_radius=3, reversibility=2, flags=["auth_sensitive"])
+    assert not [rec for rec in clean["effort_ceiling_applied"] if rec["floor_broken"]]
+    assert "effort_below_floor" not in clean["human_control_causes"]
+
+
+def test_d23_a_terminal_route_keeps_the_ceiling_record_without_the_model():
+    """`review_depth_reduced`'s rule, applied to the new record: the human still
+    needs to know a seat was capped, and a terminal route still names no model.
+    Emptying the list instead would make the d19 oracle disagree with the
+    dispatcher, which emitted the cause before emit ran."""
+    out = r(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+            blast_radius=3, reversibility=2, flags=["auth_sensitive"],
+            unavailable_models=["claude-fable-5"], isolation_available=False)
+    assert out["terminal"] == "INDEPENDENCE_UNAVAILABLE", "probe drifted"
+    assert out["effort_ceiling_applied"], "the disclosure was dropped on terminal"
+    assert all(rec["model"] is None for rec in out["effort_ceiling_applied"])
+    assert out["selected_effort_effective"] is None
+
+
+def test_d23_worker_clamp_reads_peek_not_the_provisional_resolved_map():
+    """`resolve()` is all-or-nothing: a judge shortage empties `resolved` for
+    the whole pass. `_seat_judge` can then drop the judge so the FINAL
+    resolution succeeds, but a clamp that read `resolved.get` already ran
+    against `{}` and shipped an effort the worker cannot receive."""
+    cfg = {**CFG, "models": {**CFG["models"], "claude_worker_balanced": {
+        **CFG["models"]["claude_worker_balanced"], "effort_ceiling": "LOW"}}}
+    out = route(_task(task_class="MIGRATION", flags=["review_disagreement"],
+                      unavailable_models=_leave_only("claude-sonnet-5")), cfg)
+    assert out["terminal"] is None, f"probe went terminal: {out['terminal']}"
+    assert out["selected_model"] == "claude-sonnet-5"
+    assert out["selected_effort"] == "HIGH"
+    assert out["selected_effort_effective"] == "LOW", (
+        f"worker clamp missed a LOW ceiling: effective={out['selected_effort_effective']} "
+        f"records={out['effort_ceiling_applied']}")
+    assert out["selected_effort_native"] == "low"
+    worker_recs = [rec for rec in out["effort_ceiling_applied"]
+                   if rec["role"] == out["selected_role"]]
+    assert worker_recs, f"worker clamp wrote nothing: {out['effort_ceiling_applied']}"
+    assert worker_recs[0]["model"] == "claude-sonnet-5"
+    assert worker_recs[0]["requested"] == "HIGH"
+    assert worker_recs[0]["capped_at"] == "LOW"
+
+
+def test_d23_the_same_role_writes_one_ceiling_row():
+    """When `_deconflict` cannot substitute, the worker stays in
+    `review["reviewers"]` and both clamps would write it. Design §4.3.3:
+    the same seat appears once. The broken floor must survive the merge."""
+    out = r(task_class="MECHANICAL", complexity=3, uncertainty=3,
+            blast_radius=3, reversibility=3,
+            unavailable_models=_leave_only("grok-4.6"))
+    roles = [rec["role"] for rec in out["effort_ceiling_applied"]]
+    assert len(roles) == len(set(roles)), (
+        f"same seat twice: {out['effort_ceiling_applied']}")
+    senior = [rec for rec in out["effort_ceiling_applied"]
+              if rec["role"] == "senior_engineer"]
+    assert len(senior) == 1, f"expected one senior_engineer row: {senior}"
+    assert senior[0]["floor_broken"] == "review.CRITICAL.effort"
+    assert senior[0]["floor_requires"] == "MAX"

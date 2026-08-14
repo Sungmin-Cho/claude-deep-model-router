@@ -11,6 +11,7 @@ Those live in `config/model-routing.yaml` and `adapters.md`.
 - [Flags](#flags)
 - [Bands and overrides](#bands-and-overrides)
 - [Implementation tiers](#implementation-tiers)
+- [Effort ceilings](#effort-ceilings)
 - [Architecture routing](#architecture-routing)
 - [Debugging policy](#debugging-policy)
 - [The remaining classes](#the-remaining-classes)
@@ -173,6 +174,20 @@ The band table gives the answer; these tiers explain the shape of it.
 
 At Tier 3, `reasoning_centric` picks the lane: `false` → `worker_balanced` or
 `senior_engineer`; `true` → `reasoning_specialist`.
+
+## Effort ceilings
+
+A model may declare an `effort_ceiling`: the highest conceptual level its CLI
+will accept. The router does not rewrite the request. It keeps
+`selected_effort` as the level the policy asked for, writes
+`selected_effort_effective` as the level the worker will receive, and records
+every seat that was actually capped in `effort_ceiling_applied`.
+
+A cap that lands below a floor — `effort_floors.*` for the worker (against
+the risk band), `review.<band>.effort` for a reviewer or judge (against the
+promoted review band) — keeps the route executable and asks a human
+(`effort_below_floor`). A level that came from the effort table alone is a
+preference, not a floor, so capping it does not gate.
 
 ## Architecture routing
 

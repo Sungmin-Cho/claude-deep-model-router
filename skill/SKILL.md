@@ -116,7 +116,7 @@ Other inputs worth knowing:
 | Flag | Use |
 |---|---|
 | `--format json` | machine-readable route |
-| `--runtime codex` | the Codex effort spelling |
+| `--runtime claude_code\|codex\|grok` | the host, and the degraded binding that survives when that host's cross-provider bridge is down. Effort spelling comes from the selected model's family, not from this flag |
 | `--prior-failures N` | after a failed attempt; `--prior-models` must then name **one concrete model id per failure** |
 | `--unavailable <role>` / `--unavailable-models <id>` | a specific role or model does not resolve |
 | `--flags bridge_down` | the whole cross-provider transport is unreachable — switches to the degraded single-provider binding |
@@ -181,7 +181,9 @@ neither by demoting a reviewer below the band nor by re-seating one onto the
 implementer's own model; the adjudicator is reported unavailable instead.
 `band_floor_unsatisfiable` marks a shortage that will *not* clear by retrying,
 and a compensation's bonus seat never upgrades the band's own independence
-requirement. `references/review-policy.md` has the seating rules.
+requirement. `effort_below_floor` fires when a seated model's ceiling is below
+the effort a floor required; the route stays executable and asks a human.
+`references/review-policy.md` has the seating rules.
 
 If you cannot run the script, compute it by hand from the tables below — the
 script reads `config/model-routing.yaml`, and this file describes the same
@@ -307,6 +309,13 @@ band CRITICAL             → effort ≥ VERY_HIGH
 any critical-domain flag  → effort ≥ HIGH
 ```
 
+`selected_effort` is what the policy asked for and never changes meaning.
+`selected_effort_effective` is what the worker's model actually receives —
+equal to the ask when the model has no ceiling, lower when it does. A cap that
+breaks a floor (`effort_below_floor`) keeps the route executable and asks a
+human. The native CLI token is the effective level looked up under the worker
+model's family.
+
 **As orchestrator, default to `worker_fast` at `HIGH`.** Classifying, building
 the task graph, and detecting escalation conditions are well served by high
 effort; `MAX` is for when the dependency graph is genuinely complex, five or
@@ -325,6 +334,10 @@ weaken the review.
 | `MEDIUM` | one stronger role, cross-family preferred | `HIGH` | yes |
 | `HIGH` | senior_engineer + reasoning_specialist | `HIGH` | yes |
 | `CRITICAL` | senior_engineer + reasoning_specialist | `MAX` | yes |
+
+A reviewer's effective effort is its `effort_ceiling_applied` entry's
+`capped_at` when one exists, otherwise `review.effort`. The CLI token is that
+level looked up in `effort_map` under the reviewer model's family.
 
 `CRITICAL` additionally requires every one of these to appear as an explicit
 finding category — including when the answer is "checked, nothing found":
@@ -422,7 +435,8 @@ risk_score:  risk_band:   band_overrides_applied: []   critical_flags: []
 band_overrides_redundant: []   # fired, but another rule had already got there
 route_path:                    # null, or "disagreement"
 terminal:                      # null, or one of the four in the table above
-selected_role:  selected_model:  selected_effort:  selected_effort_native:
+selected_role:  selected_model:  selected_effort:  selected_effort_effective:
+selected_effort_native:
 review:
   band:  reviewers: []  reviewer_models: []  effort:
   independence_required:       # what the band asks for
@@ -438,6 +452,9 @@ review:
   judge:  judge_model:         # null when judge_unavailable — a human adjudicates
 cross_family_review: true | false
 fallbacks_applied: []          # only recorded when the model actually changed
+effort_ceiling_applied: []     # [{role, model, requested, capped_at,
+                               # floor_broken, floor_requires}]; a seat whose
+                               # model cannot receive the effort asked for
 fallback_compensations_applied: []
 unavailable_models: []
 excluded_prior_failures: []    # models withheld because they already failed

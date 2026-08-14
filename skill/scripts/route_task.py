@@ -83,6 +83,8 @@ CAUSE_REASONS = {
     "critical_review_band": "a CRITICAL review cannot be accepted automatically",
     "no_adjudicator": "no adjudicator is available",
     "review_below_band": "the review is staffed below its band",
+    "effort_below_floor":
+        "the selected model cannot reach the effort a floor required",
 }
 
 
@@ -170,10 +172,32 @@ class Policy:
         self.task_classes: list[str] = list(cfg["worker_selection"])
         self.critical_domain_flags: tuple[str, ...] = tuple(cfg["flags"]["critical_domain"])
         self.known_flags: frozenset[str] = frozenset(f for g in cfg["flags"].values() for f in g)
-        self.runtimes: frozenset[str] = frozenset(cfg["effort_map"])
+        self.runtimes: frozenset[str] = frozenset(cfg["runtimes"])
         self.model_ids: frozenset[str] = frozenset(m["id"] for m in cfg["models"].values())
         self.id_to_key: dict[str, str] = {m["id"]: k for k, m in cfg["models"].items()}
         self.family_of: dict[str, str] = {m["id"]: m["family"] for m in cfg["models"].values()}
+
+        # The two blocks describe different axes and must both be complete:
+        # a runtime with no degraded binding cannot survive a downed bridge,
+        # and a family with no effort map cannot have its effort spelled.
+        for runtime, spec in cfg["runtimes"].items():
+            binding = spec["degraded_binding"]
+            if binding not in cfg["role_bindings"]:
+                raise ConfigError(
+                    f"runtimes.{runtime}.degraded_binding names {binding!r}, "
+                    f"which is not a role binding")
+            fams = {cfg["models"][k]["family"] for k in cfg["role_bindings"][binding].values()}
+            if len(fams) != 1:
+                raise ConfigError(
+                    f"role_bindings.{binding} spans {sorted(fams)}; a degraded "
+                    f"binding is what survives when the bridge is down, so it "
+                    f"must name exactly one family")
+        families = set(self.family_of.values())
+        if set(cfg["effort_map"]) != families:
+            raise ConfigError(
+                f"effort_map is keyed by model family; it covers "
+                f"{sorted(cfg['effort_map'])} but the registry holds "
+                f"{sorted(families)}")
 
         # Strength, measured on the model rather than on the role holding it.
         # Every comparison that used `roles.index(...)` as a proxy for capability
@@ -182,6 +206,20 @@ class Policy:
         self.tier_of: dict[str, int] = {
             m["id"]: m["capability_tier"] for m in cfg["models"].values()
         }
+
+        # The highest conceptual effort this model's CLI will accept, or None
+        # when it accepts every level. Optional: absence means no ceiling, so
+        # existing models need no entry. Validated here because a ceiling that
+        # does not name a real level is a control that silently does nothing.
+        self.ceiling_of: dict[str, str | None] = {}
+        for key, model in cfg["models"].items():
+            ceiling = model.get("effort_ceiling")
+            if ceiling is not None and ceiling not in self.efforts:
+                raise ConfigError(
+                    f"models.{key}.effort_ceiling = {ceiling!r} is not one of "
+                    f"{self.efforts}; a ceiling naming no real level cannot be "
+                    f"compared and would be skipped in silence")
+            self.ceiling_of[model["id"]] = ceiling
 
         # What each band demands of a reviewer, expressed as a model tier and
         # derived from the band's own configured reviewer roles under the
@@ -212,7 +250,8 @@ class Policy:
         # incident response it exists to serve).
         per_key = dict.fromkeys((
             "on_independence_unachievable", "on_any_critical_review",
-            "on_judge_unavailable", "on_review_depth_reduced"), implemented)
+            "on_judge_unavailable", "on_review_depth_reduced",
+            "on_effort_below_floor"), implemented)
         per_key["on_production_hotfix"] = {
             "require_human_confirmation", "defer_human_confirmation"}
         for key, allowed in per_key.items():
@@ -252,10 +291,18 @@ class Policy:
                     f"default binding; its reviewer floor is undefined")
             self.band_reviewer_floor[band] = min(nominal[r] for r in roles)
 
-        # Which family survives when the cross-provider bridge is down.
+        # Which family survives when the cross-provider bridge is down. Read
+        # from the config rather than a hardcoded pair: a third runtime used to
+        # mean editing three separate two-way branches, and the one that used an
+        # `else` silently sent an unknown runtime to the wrong binding.
+        # `degraded_binding` is validated single-family above, so any role in it
+        # names the same family.
+        self.degraded_binding: dict[str, str] = {
+            runtime: spec["degraded_binding"] for runtime, spec in cfg["runtimes"].items()
+        }
         self.local_family: dict[str, str] = {
-            runtime: cfg["models"][cfg["role_bindings"][binding]["worker_fast"]]["family"]
-            for runtime, binding in (("claude_code", "claude_only"), ("codex", "openai_only"))
+            runtime: cfg["models"][next(iter(cfg["role_bindings"][binding].values()))]["family"]
+            for runtime, binding in self.degraded_binding.items()
         }
 
     @classmethod
@@ -1022,7 +1069,7 @@ class Resolver:
         self.binding_name = "default"
         self.notes: list[str] = []
         if self.bridge_down:
-            self.binding_name = "claude_only" if task.runtime == "claude_code" else "openai_only"
+            self.binding_name = policy.degraded_binding[task.runtime]
             self.notes.append(f"binding degraded to {self.binding_name} (cross-provider bridge down)")
         self.binding = cfg["role_bindings"][self.binding_name]
 
@@ -1059,7 +1106,7 @@ class Resolver:
         if (primary := self.binding.get(role)):
             ordered.append(primary)
         ordered.extend(cfg["fallbacks"].get(self.task.runtime, {}).get(role, []))
-        degraded_name = "claude_only" if self.task.runtime == "claude_code" else "openai_only"
+        degraded_name = self.policy.degraded_binding[self.task.runtime]
         if (d := cfg["role_bindings"][degraded_name].get(role)):
             ordered.append(d)
         index = self.policy.roles.index(role)
@@ -1188,6 +1235,33 @@ def routing_confidence(task: Task, fallbacks: list[str]) -> float:
 # Stage 8 — emit
 # --------------------------------------------------------------------------
 
+def _worker_effort_floor(task: Task, band: str, policy: Policy) -> tuple[str, str] | None:
+    """The strongest floor `select_effort` applied to the worker, as
+    (rule name, level), or None when no floor applied.
+
+    The risk band, not the promoted review band: `select_effort` is called with
+    the risk band, and comparing against a band it never saw would invent a
+    floor the code did not apply. A level that came from `effort_by_work` alone
+    is a preference, not a requirement, so it is not a floor.
+    """
+    floors = policy.cfg["effort_floors"]
+    applied = [(f"effort_floors.{name}", floors[name]) for condition, name in (
+        (band == "HIGH", "band_HIGH"),
+        (band == "CRITICAL", "band_CRITICAL"),
+        (bool(task.critical_flags(policy)), "any_critical_domain"),
+    ) if condition]
+    return max(applied, key=lambda pair: policy.efforts.index(pair[1]), default=None)
+
+
+def _clamp(policy: Policy, effort: str, model: str | None) -> str:
+    """The highest level at or below `effort` that `model` will accept."""
+    ceiling = policy.ceiling_of.get(model) if model else None
+    if ceiling is None:
+        return effort
+    return policy.efforts[min(policy.efforts.index(effort),
+                              policy.efforts.index(ceiling))]
+
+
 def route(task: Task, cfg: dict | None = None) -> dict:
     cfg = cfg if cfg is not None else default_config()
     policy = Policy.of(cfg)
@@ -1241,8 +1315,13 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # shipped with the notes, the record and the effort all disagreeing, one of
     # them reporting no compensation at all.
     base_effort, base_effort_notes = effort, list(effort_notes)
+    ceiling_records: list[dict] = []
     for _ in range(MAX_PROMOTION_PASSES):
         effort, effort_notes = base_effort, list(base_effort_notes)
+        # Rebuilt with everything else the body mutates. A fixed point whose
+        # body is not idempotent is a fold, and a ceiling record accumulated
+        # across passes would report a cap the emitted plan never applied.
+        ceiling_records = []
         review = select_review(review_band, worker, policy, resolver)
         try:
             resolved, fallbacks, compensations = resolver.resolve(roles_for(review))
@@ -1309,6 +1388,33 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                     f"implements; it would be reported as applied while doing nothing"
                 )
         compensations = applied_compensations
+
+        # The worker's effective effort, capped to what its model can receive.
+        # Here rather than after the loop because the compensation above is what
+        # raises the requested value, and here rather than before it for the
+        # same reason. The requested value and its notes are untouched: the
+        # compensation really did raise what was asked for, and `selected_effort`
+        # is what was asked for.
+        #
+        # `peek`, not the provisional `resolved` map. `resolve()` is
+        # all-or-nothing: a shortage on any role empties the map for the whole
+        # pass. `_seat_judge` can then drop the judge so the FINAL resolve
+        # succeeds, and a clamp that already ran against `{}` ships the
+        # uncapped effort. `peek` is pure, depends on no other role, and
+        # equals the final `resolved[worker]` whenever resolution succeeds.
+        # Reviewer seating still moves below, so a reviewer clamp here would
+        # still read a roster that does not ship.
+        worker_model = resolver.peek(worker)
+        worker_effective = _clamp(policy, effort, worker_model)
+        if worker_effective != effort:
+            floor = _worker_effort_floor(task, band, policy)
+            broken = floor and policy.efforts.index(worker_effective) < policy.efforts.index(floor[1])
+            ceiling_records.append({
+                "role": worker, "model": worker_model,
+                "requested": effort, "capped_at": worker_effective,
+                "floor_broken": floor[0] if broken else None,
+                "floor_requires": floor[1] if broken else None,
+            })
 
         # Final de-confliction, at the emit boundary rather than mid-pipeline.
         #
@@ -1509,6 +1615,49 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # cannot be checked; a cause code can, and
     # `test_d19_every_control_fires_exactly_on_its_declared_cause` asserts that
     # each control's predicate partitions the sweep exactly as its cause says.
+    # Reviewer and judge seats, now that the roster is final. Their floor is
+    # the review band's own effort — the promoted band, because that is the
+    # review that will run. Unlike the worker there is no table/floor split
+    # here: what the band names IS the requirement.
+    review_floor = cfg["review"][review["band"]]["effort"]
+    for role in list(review["reviewers"]) + ([judge] if judge else []):
+        model = resolved.get(role)
+        capped = _clamp(policy, review_floor, model)
+        if capped != review_floor:
+            record = {
+                "role": role, "model": model,
+                "requested": review_floor, "capped_at": capped,
+                "floor_broken": f"review.{review['band']}.effort",
+                "floor_requires": review_floor,
+            }
+            # Same seat, once. One role can hold two seats two different ways:
+            # `_deconflict` may fail to substitute and leave the worker among
+            # the reviewers (terminal, since that also compromises
+            # independence), and LOW seats `worker_fast` as its own reviewer by
+            # design (`independent: false`, so `_deconflict` never runs and the
+            # route stays executable). Both reach here.
+            existing = next((r for r in ceiling_records if r["role"] == role), None)
+            if existing is None:
+                ceiling_records.append(record)
+                continue
+            # One row, and it must read coherently. The seat was asked for two
+            # different levels — its own and the review band's — so the row
+            # reports the HIGHER ask, which is the one any named floor is
+            # measured against. Keeping the worker's lower `requested` beside a
+            # review floor produced rows saying "requested LOW" next to
+            # "requires MEDIUM", which is not a fact about anything.
+            if policy.efforts.index(record["requested"]) > policy.efforts.index(existing["requested"]):
+                existing["requested"] = record["requested"]
+            # A floor that broke is never erased, and when BOTH broke the
+            # stricter one is what the human has to satisfy — reporting the
+            # weaker would understate what the seat owes.
+            if record["floor_broken"] and (
+                    not existing["floor_broken"]
+                    or policy.efforts.index(record["floor_requires"])
+                    > policy.efforts.index(existing["floor_requires"])):
+                existing["floor_broken"] = record["floor_broken"]
+                existing["floor_requires"] = record["floor_requires"]
+
     hitl = cfg["human_in_the_loop"]
     controls = [
         Control("on_independence_unachievable", "caller_declared_isolation_gap",
@@ -1522,6 +1671,9 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                 "HUMAN_REQUIRED"),
         Control("on_review_depth_reduced", "review_below_band",
                 bool(review.get("review_depth_reduced")),
+                "HUMAN_REQUIRED"),
+        Control("on_effort_below_floor", "effort_below_floor",
+                any(r["floor_broken"] for r in ceiling_records),
                 "HUMAN_REQUIRED"),
     ]
 
@@ -1660,7 +1812,8 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     if (task.has("production_hotfix") and requires_human and not terminal
             and hitl["on_production_hotfix"] == "defer_human_confirmation"
             and not review.get("independence_compromised")
-            and not review.get("review_depth_reduced")):
+            and not review.get("review_depth_reduced")
+            and not any(r["floor_broken"] for r in ceiling_records)):
         deferred = True
         requires_human = False
         effort_notes.append(
@@ -1705,7 +1858,15 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "selected_role": worker if executable else None,
         "selected_model": resolved.get(worker) if executable else None,
         "selected_effort": effort if executable else None,
-        "selected_effort_native": cfg["effort_map"][task.runtime][effort] if executable else None,
+        # What the worker's model will actually receive. Equal to
+        # `selected_effort` when it has no ceiling. The pair is deliberately not
+        # collapsed: the first is what the policy asked for, the second is what
+        # runs, and reporting the ask as the outcome is how a control becomes a
+        # false assurance.
+        "selected_effort_effective": worker_effective if executable else None,
+        "selected_effort_native": (
+            cfg["effort_map"][policy.family_of[resolved[worker]]][worker_effective]
+            if executable else None),
         "review": {
             "band": review["band"],
             "reviewers": review["reviewers"],
@@ -1740,6 +1901,12 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             else [f.split(":")[0] + ": binding withheld (terminal route)"
                   if ":" in f and "->" in f else f for f in fallbacks]
         ),
+        # Scrubbed the way `review_depth_reduced` is: the cap is still
+        # disclosed on a terminal route — a human deciding what went wrong
+        # needs it — but with the binding withheld.
+        "effort_ceiling_applied": [
+            r if executable else {**r, "model": None} for r in ceiling_records
+        ],
         "fallback_compensations_applied": compensations,
         "unavailable_models": sorted(resolver.blocked),
         "excluded_prior_failures": sorted(resolver.failed),
@@ -1780,7 +1947,13 @@ def explain(task: Task, r: dict) -> str:
             "human with what was tried, what evidence accumulated, and the blocking uncertainty."
         )
     else:
-        parts.append(f"Worker {r['selected_role']} at {r['selected_effort']} effort.")
+        effective = r["selected_effort_effective"]
+        if effective != r["selected_effort"]:
+            parts.append(
+                f"Worker {r['selected_role']} at {effective} effort "
+                f"({r['selected_effort']} was requested; the model's ceiling is lower).")
+        else:
+            parts.append(f"Worker {r['selected_role']} at {r['selected_effort']} effort.")
     rv = r["review"]
     parts.append(f"Review band {rv['band']}: {', '.join(rv['reviewers'])}, "
                  f"independence_required={rv['independence_required']}, "
@@ -1951,7 +2124,10 @@ def _print_text(r: dict) -> None:
         print(f"TERMINAL:    {r['terminal']}  — no executable bindings emitted")
     else:
         print(f"worker:      {r['selected_role']}  ->  {r['selected_model']}")
-        print(f"effort:      {r['selected_effort']}  (native: {r['selected_effort_native']})")
+        effective = r["selected_effort_effective"]
+        capped = f" -> {effective}" if effective != r["selected_effort"] else ""
+        print(f"effort:      {r['selected_effort']}{capped}  "
+              f"(native: {r['selected_effort_native']})")
     rv = r["review"]
     label = "review (policy only — not dispatchable)" if r["terminal"] else "review"
     print(f"{label}:")

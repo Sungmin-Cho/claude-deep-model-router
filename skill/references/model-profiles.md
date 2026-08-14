@@ -95,9 +95,15 @@ treat the second review as weaker than it looks.
 ## Current bindings
 
 One binding table, not one per runtime. Roles are filled by whichever model
-best fits the job regardless of provider, because both cross-provider bridges
-are verified working. Provider choice is nearly free at delegation time — you
-have already paid for a fresh context window — so it should be made on merit.
+best fits the job regardless of provider. Provider choice is nearly free at
+delegation time — you have already paid for a fresh context window — so it
+should be made on merit.
+
+Not every bridge is verified in every direction. Claude Code → openai,
+Codex → claude, and Claude Code → xai have been probed. Codex → xai, grok →
+claude, and grok → openai use the same commands and are recorded as assumed.
+A route that depends on an assumed edge still has to be invocable in the
+session that emits it — see `adapters.md`.
 
 Registry keys, not model ids. Resolve them through
 `config/model-routing.yaml` — concrete identifiers appear there and nowhere
@@ -105,23 +111,24 @@ else, so this table cannot drift out of date when the registry changes:
 
 ```
 worker_fast           openai_worker_fast       (openai)
-worker_balanced       claude_worker_balanced   (claude)
-worker_balanced_alt   openai_worker_balanced   (openai)  — same-family fallback only
+worker_balanced       xai_frontier             (xai)
+worker_balanced_alt   claude_worker_balanced   (claude)
 senior_engineer       claude_senior            (claude)
 reasoning_specialist  openai_reasoning         (openai)
 principal_architect   claude_architect         (claude)
 ```
 
-The escalation ladder alternates families by construction — openai → claude →
-claude → openai → claude. The first escalation crossing a family boundary is
-deliberate: if the cheap worker's failure mode is family-specific, staying in
-the family reproduces it.
+The escalation ladder alternates families by construction — openai → xai →
+claude → openai → claude. The first escalation used to repeat a family
+(openai → claude → claude → …). Binding the balanced worker to the xai
+frontier model restores a family change on that first step. HIGH and CRITICAL
+dual-review seats stay on the two frontier families, so review depth does not
+move.
 
-**`worker_balanced_alt` exists for bridge failures, not to shorten the ladder.**
-Use the OpenAI middle tier for the first escalation only when the Claude
-balanced worker is unreachable. Reaching for it by default would put
-`worker_fast` and `worker_balanced` in the same family and throw away the
-diversity that makes the first escalation worth taking.
+**`worker_balanced_alt` is the Claude balanced model, and it is not a
+same-family fallback.** `worker_fast` is openai. The alt exists so the first
+escalation still has a seat when `xai_frontier` is unreachable. Reaching for
+it by default would skip the xai step the ladder was just given.
 
 Degraded bindings for when a bridge is down are in `adapters.md`.
 
@@ -152,3 +159,25 @@ one line in the registry; the policy does not move.
 
 The Claude fast tier (`claude_worker_fast`) remains bound as the `claude_only`
 fallback, so a dead bridge costs latency and money, not capability.
+
+## Why `worker_balanced` is bound to the xai frontier model
+
+The same posture as `worker_fast`, pointed at the first escalation.
+
+**Price — verified.** The xai frontier model is priced as a balanced-tier
+seat ($2.00 / $6.00 per million input/output tokens) against the Claude
+balanced model's $3.00 / $15.00, and against a claimed frontier tier. For the
+first escalation that difference is the point of the binding.
+
+**Quality — not established.** No head-to-head was run here. A frontier claim
+is not a measured peer of the tier-2 seats.
+
+**`capability_tier` is 1 on purpose.** Honesty first: without a measured
+comparison, promoting the model to tier 2 would treat a claim as a result.
+Side-effect second: MEDIUM's reviewer floor is the minimum nominal tier among
+`worker_balanced`, `senior_engineer`, and `reasoning_specialist` in the
+default binding. That minimum is currently 1. Raising this model to 2 would
+lift the floor to 2 and start marking MEDIUM reviews as below band — a
+band-policy change with nothing to do with adding a model. If a harder eval
+later supports a raise, change the registry line and decide the floor
+question at the same time.

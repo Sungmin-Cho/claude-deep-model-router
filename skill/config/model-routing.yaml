@@ -12,7 +12,7 @@
 # Verification status of every identifier is recorded in `verification_ledger`
 # at the bottom. Keep it honest: "assumed" and "verified" must not blur.
 
-version: 2
+version: 3
 
 # ---------------------------------------------------------------------------
 # Router defaults
@@ -349,6 +349,10 @@ human_in_the_loop:
   # the JSON: a caller that reads success as authorisation walks through a gate
   # it cannot see. Terminal states stay 1; invalid input stays 2.
   on_review_depth_reduced:      require_human_confirmation
+  # A seat whose model cannot reach the effort a floor required. Same family of
+  # fact as `review_depth_reduced` — the review does not run at the depth the
+  # band asked for — so a hotfix does not defer it either.
+  on_effort_below_floor:        require_human_confirmation
   human_gate_exit_status:       3
   # `on_routing_confidence_below` used to sit here holding 0.60 — the same
   # number as `router.confidence.escalate_below`, which is the one the router
@@ -423,20 +427,35 @@ models:
     verified: true
     price_per_mtok: { input: 5.00, output: 30.00 }
 
+  # Balanced-tier price with frontier-tier claims. `capability_tier: 1` is the
+  # honest reading, not a measured one: no head-to-head was run here, and
+  # raising it to 2 would move MEDIUM's reviewer floor — a band change with
+  # nothing to do with adding a model.
+  xai_frontier:
+    id: grok-4.6
+    family: xai
+    capability_tier: 1
+    effort_ceiling: VERY_HIGH   # probed: the CLI rejects `max`
+    verified: true
+    price_per_mtok: { input: 2.00, output: 6.00, cached_input: 0.50 }
+
 # ---------------------------------------------------------------------------
 # Role bindings
 # ---------------------------------------------------------------------------
 #
-# One binding, not one per runtime. Roles are filled by whichever model is best
-# for the job regardless of provider, because both cross-provider bridges are
-# verified working. The per-provider bindings below are degraded fallbacks for
-# when a bridge is down — not alternate defaults.
+# One binding, not one per runtime. Roles are filled by whichever model is
+# best for the job regardless of provider. Not every bridge is verified in
+# every direction. Claude Code → openai, Codex → claude, and Claude Code →
+# xai have been probed. Codex → xai, grok → claude, and grok → openai use
+# the same commands and are recorded as assumed. The per-provider bindings
+# below are degraded fallbacks for when a bridge is down — not alternate
+# defaults.
 
 role_bindings:
   default:
     worker_fast:          openai_worker_fast       # cheapest capable volume worker
-    worker_balanced:      claude_worker_balanced   # first escalation, crosses family
-    worker_balanced_alt:  openai_worker_balanced   # same-family fallback only
+    worker_balanced:      xai_frontier             # first escalation, crosses family
+    worker_balanced_alt:  claude_worker_balanced   # first-escalation fallback
     senior_engineer:      claude_senior
     reasoning_specialist: openai_reasoning
     principal_architect:  claude_architect
@@ -457,6 +476,17 @@ role_bindings:
     reasoning_specialist: openai_reasoning
     principal_architect:  openai_reasoning         # MAX effort + second review
 
+  # Degraded: only the xAI CLI is reachable. One model fills every role, so any
+  # band that requires independent review is INDEPENDENCE_UNAVAILABLE here —
+  # terminal, not merely thin. That is the honest answer: there is no way to
+  # run an independent review against a single model.
+  xai_only:
+    worker_fast:          xai_frontier
+    worker_balanced:      xai_frontier
+    senior_engineer:      xai_frontier
+    reasoning_specialist: xai_frontier
+    principal_architect:  xai_frontier
+
 # The alt tier exists to keep an escalation path open when the bridge dies,
 # not to shorten the ladder. Crossing families on the first escalation is the
 # point of the first escalation.
@@ -468,21 +498,46 @@ worker_balanced_selection:
 # Runtime adapters
 # ---------------------------------------------------------------------------
 
+# Which runtimes this router can be asked to route for, and which
+# single-provider binding survives when that runtime's cross-provider bridge
+# is down. Round 21: the runtime vocabulary used to be derived from
+# `effort_map`'s keys, and the degraded binding was a two-way `if` in three
+# places in the script. Both are policy, so both live here.
+runtimes:
+  claude_code: { degraded_binding: claude_only }
+  codex:       { degraded_binding: openai_only }
+  grok:        { degraded_binding: xai_only }
+
+# Conceptual effort level -> the token that family's CLI accepts.
+#
+# Keyed by model FAMILY, not by host runtime. The value describes what the
+# TARGET model's CLI will accept, and the default binding is shared across
+# runtimes — so a router running under one host routinely dispatches a model
+# of another family. Keying this by host meant the emitted spelling described
+# a CLI that was not going to receive it.
 effort_map:
-  claude_code:
+  claude:
     MINIMAL:   low        # no distinct minimal tier exists; collapses to low
     LOW:       low
     MEDIUM:    medium
     HIGH:      high
     VERY_HIGH: xhigh
     MAX:       max
-  codex:
+  openai:
     MINIMAL:   none       # verified: `minimal` is rejected, `none` is accepted
     LOW:       low
     MEDIUM:    medium
     HIGH:      high
     VERY_HIGH: xhigh
     MAX:       max
+  xai:
+    MINIMAL:   low        # grok has no minimal/none — reasoning cannot be disabled
+    LOW:       low
+    MEDIUM:    medium
+    HIGH:      high
+    VERY_HIGH: xhigh
+    MAX:       xhigh      # unreachable: the clamp runs before this lookup and
+                          # the only xai model's ceiling is VERY_HIGH
 
 transports:
   claude_code:
@@ -491,12 +546,30 @@ transports:
       mechanism: "codex exec -m <id> -c model_reasoning_effort=<effort> -s <sandbox>"
       isolation: separate_process
       verified: true
+    to_xai:
+      mechanism: "grok --no-auto-update -p <prompt> -m <id> --effort <low|medium|high|xhigh> --output-format plain -s <fresh-uuid>"
+      isolation: separate_process
+      verified: true
   codex:
     native: { mechanism: multi_agent_subagent, isolation: unverified }
     to_claude:
-      mechanism: "claude -p --model <id>"
+      mechanism: "claude -p --model <id> --effort <effort> --permission-mode <mode>"
       isolation: separate_process
       verified: true
+    to_xai:
+      mechanism: "grok --no-auto-update -p <prompt> -m <id> --effort <low|medium|high|xhigh> --output-format plain -s <fresh-uuid>"
+      isolation: separate_process
+      verified: false
+  grok:
+    native: { mechanism: subagent, isolation: unverified }
+    to_claude:
+      mechanism: "claude -p --model <id> --effort <effort> --permission-mode <mode>"
+      isolation: separate_process
+      verified: false
+    to_openai:
+      mechanism: "codex exec -m <id> -c model_reasoning_effort=<effort>"
+      isolation: separate_process
+      verified: false
 
 # Ordered replacement candidates, consulted when a role's bound model is
 # unavailable. Entries are registry keys, tried in order; the resolver skips
@@ -510,16 +583,22 @@ transports:
 fallbacks:
   claude_code:
     worker_fast:          [claude_worker_fast, claude_worker_balanced]
-    worker_balanced:      [openai_worker_balanced, claude_senior]
+    worker_balanced:      [claude_worker_balanced, openai_worker_balanced, claude_senior]
     senior_engineer:      [openai_reasoning, claude_architect]
     reasoning_specialist: [claude_senior, claude_architect]
     principal_architect:  [claude_senior, openai_reasoning]
   codex:
     worker_fast:          [openai_worker_balanced, claude_worker_fast]
-    worker_balanced:      [openai_worker_balanced, openai_reasoning]
+    worker_balanced:      [claude_worker_balanced, openai_worker_balanced, openai_reasoning]
     senior_engineer:      [openai_reasoning, claude_senior]
     reasoning_specialist: [openai_reasoning, claude_senior]
     principal_architect:  [openai_reasoning, claude_architect]
+  grok:
+    worker_fast:          [claude_worker_fast, openai_worker_balanced]
+    worker_balanced:      [claude_worker_balanced, openai_worker_balanced]
+    senior_engineer:      [claude_senior, openai_reasoning]
+    reasoning_specialist: [openai_reasoning, claude_senior]
+    principal_architect:  [claude_architect, claude_senior]
 
 # Compensations that apply when a fallback lands on a weaker or same-family
 # model. The resolver records these; it does not silently absorb them.
@@ -546,36 +625,43 @@ fallback_compensations:
 # building on sand. Do not promote a row without running the probe.
 
 verification_ledger:
-  probed_on: 2026-08-11
+  probed_on: 2026-08-14
   entries:
     - item: "Claude model ids (haiku-4-5-20251001, sonnet-5, opus-5, fable-5)"
       status: verified
+      probed_on: 2026-08-11
       evidence: "claude -p --model <id> round-trip returned OK for all four"
 
     - item: "OpenAI model ids (gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol)"
       status: verified
+      probed_on: 2026-08-11
       evidence: "codex exec -m <id> round-trip returned OK for all three"
 
     - item: "Codex reasoning-effort values"
       status: verified
+      probed_on: 2026-08-11
       evidence: >
         none/low/medium/high/xhigh/max accepted; `minimal` rejected with an
         API error. Probed via codex exec -c model_reasoning_effort=<v>.
 
     - item: "Claude Code effort values"
       status: verified
+      probed_on: 2026-08-11
       evidence: "low/medium/high/xhigh/max accepted by the subagent interface"
 
     - item: "Claude Code -> OpenAI transport (codex exec)"
       status: verified
+      probed_on: 2026-08-11
       evidence: "trivial round-trip succeeded; runs as a separate process"
 
     - item: "Codex -> Claude transport (claude -p)"
       status: verified
+      probed_on: 2026-08-11
       evidence: "trivial round-trip succeeded; runs as a separate process"
 
     - item: "Codex native subagent isolation"
       status: flag_verified_semantics_unverified
+      probed_on: 2026-08-11
       evidence: >
         `codex features list` reports multi_agent as stable/true. Whether its
         context isolation matches the Claude Agent tool's has NOT been tested.
@@ -584,12 +670,14 @@ verification_ledger:
 
     - item: "Claude Code subagent context isolation"
       status: assumed
+      probed_on: 2026-08-11
       evidence: >
         Documented behaviour of the Agent tool; not empirically probed here.
         Confirm before claiming independent review.
 
     - item: "worker_fast binding: gpt-5.6-luna over claude-haiku-4-5"
       status: price_verified_quality_unverified
+      probed_on: 2026-08-11
       evidence: >
         PRICE: verified from published rates — luna $0.20/$1.20 per MTok vs
         haiku $1.00/$5.00, i.e. 5x cheaper input and 4.2x cheaper output.
@@ -600,3 +688,60 @@ verification_ledger:
         not discriminate. No primary source puts both models on the same
         benchmark. The binding rests on the verified price advantage, not on
         a demonstrated quality advantage.
+
+    - item: "grok-4.6 model id"
+      status: verified
+      probed_on: 2026-08-14
+      evidence: "grok -p -m grok-4.6 round-trip returned OK"
+
+    - item: "Grok reasoning-effort values"
+      status: verified
+      probed_on: 2026-08-14
+      evidence: >
+        low/medium/high/xhigh accepted; minimal/none/max rejected. grok-4.5
+        also rejects xhigh, which contradicts the published docs (those say
+        xhigh is treated as high). This ledger follows the CLI.
+
+    - item: "Claude Code -> xAI transport (grok -p)"
+      status: verified
+      probed_on: 2026-08-14
+      evidence: "trivial round-trip succeeded; runs as a separate process"
+
+    - item: "claude -p --effort flag"
+      status: verified
+      probed_on: 2026-08-14
+      evidence: "claude --help lists --effort <low|medium|high|xhigh|max>"
+
+    - item: "Codex -> xAI transport"
+      status: assumed
+      probed_on: 2026-08-14
+      evidence: "same grok -p mechanism as the verified Claude Code -> xAI edge; not probed from Codex"
+
+    - item: "grok -> Claude transport"
+      status: assumed
+      probed_on: 2026-08-14
+      evidence: "claude -p --effort is verified to exist; the grok-hosted direction was not probed"
+
+    - item: "grok -> OpenAI transport"
+      status: assumed
+      probed_on: 2026-08-14
+      evidence: "codex exec mechanism is verified from Claude Code; the grok-hosted direction was not probed"
+
+    - item: "grok native subagent isolation"
+      status: flag_verified_semantics_unverified
+      probed_on: 2026-08-14
+      evidence: >
+        grok exposes --agents / --no-subagents. Whether those isolate context
+        the way independent review requires has NOT been tested. Until it is,
+        treat a grok-native dual review as degraded unless both reviewers run
+        as separate processes.
+
+    - item: "worker_balanced binding: grok-4.6 over claude-sonnet-5"
+      status: price_verified_quality_unverified
+      probed_on: 2026-08-14
+      evidence: >
+        PRICE: verified from published rates — grok-4.6 $2.00/$6.00 per MTok
+        vs sonnet-5 $3.00/$15.00. QUALITY: NOT established. No head-to-head
+        was run here. The binding rests on the verified price advantage
+        against a claimed frontier tier, not on a demonstrated quality
+        advantage. capability_tier stays 1 for that reason.
