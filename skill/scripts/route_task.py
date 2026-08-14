@@ -1630,14 +1630,31 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                 "floor_broken": f"review.{review['band']}.effort",
                 "floor_requires": review_floor,
             }
-            # Same seat, once. When `_deconflict` cannot substitute, the
-            # worker stays in `review["reviewers"]` and both clamps would
-            # write it. A floor that broke must not be erased by a row that
-            # did not break one.
+            # Same seat, once. One role can hold two seats two different ways:
+            # `_deconflict` may fail to substitute and leave the worker among
+            # the reviewers (terminal, since that also compromises
+            # independence), and LOW seats `worker_fast` as its own reviewer by
+            # design (`independent: false`, so `_deconflict` never runs and the
+            # route stays executable). Both reach here.
             existing = next((r for r in ceiling_records if r["role"] == role), None)
             if existing is None:
                 ceiling_records.append(record)
-            elif record["floor_broken"] and not existing["floor_broken"]:
+                continue
+            # One row, and it must read coherently. The seat was asked for two
+            # different levels — its own and the review band's — so the row
+            # reports the HIGHER ask, which is the one any named floor is
+            # measured against. Keeping the worker's lower `requested` beside a
+            # review floor produced rows saying "requested LOW" next to
+            # "requires MEDIUM", which is not a fact about anything.
+            if policy.efforts.index(record["requested"]) > policy.efforts.index(existing["requested"]):
+                existing["requested"] = record["requested"]
+            # A floor that broke is never erased, and when BOTH broke the
+            # stricter one is what the human has to satisfy — reporting the
+            # weaker would understate what the seat owes.
+            if record["floor_broken"] and (
+                    not existing["floor_broken"]
+                    or policy.efforts.index(record["floor_requires"])
+                    > policy.efforts.index(existing["floor_requires"])):
                 existing["floor_broken"] = record["floor_broken"]
                 existing["floor_requires"] = record["floor_requires"]
 

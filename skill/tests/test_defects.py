@@ -2091,17 +2091,39 @@ def test_d23_an_effort_ceiling_must_name_a_real_effort_level():
 # 2026-08-14; see the config's verification_ledger. If a CLI's vocabulary
 # changes, this table and the map both have to move, and that is the point:
 # an oracle that reads the map cannot tell you the map is wrong.
-ACCEPTED_CLI_TOKENS = {
-    "claude": {"low", "medium", "high", "xhigh", "max"},
-    "openai": {"none", "low", "medium", "high", "xhigh", "max"},
-    "xai":    {"low", "medium", "high", "xhigh"},   # `max` and `none` rejected
+# The whole mapping, by hand, independent of `effort_map` — not just the set of
+# tokens each CLI will take. A membership check catches a token a CLI rejects; it
+# cannot catch a token the CLI ACCEPTS at the wrong level, and "quietly
+# under-delivers" is half of what this test claims to guard. Probed against each
+# CLI on 2026-08-14; the config's verification_ledger records the round-trips.
+#
+# Yes, this duplicates `effort_map`. That is the point, and it is the same
+# bargain `EXPECTED_WORDING` makes: an oracle that reads the table under test
+# can only tell you the router is self-consistent, never that the table is
+# right. Changing a spelling now takes two edits, and the second one is a
+# decision rather than a consequence.
+EXPECTED_NATIVE = {
+    "claude": {"MINIMAL": "low",  "LOW": "low", "MEDIUM": "medium",
+               "HIGH": "high", "VERY_HIGH": "xhigh", "MAX": "max"},
+    "openai": {"MINIMAL": "none", "LOW": "low", "MEDIUM": "medium",
+               "HIGH": "high", "VERY_HIGH": "xhigh", "MAX": "max"},
+    # `max` and `none` are rejected outright; MAX has nowhere to go but xhigh,
+    # and the clamp means no route reaches that entry anyway.
+    "xai":    {"MINIMAL": "low",  "LOW": "low", "MEDIUM": "medium",
+               "HIGH": "high", "VERY_HIGH": "xhigh", "MAX": "xhigh"},
 }
+ACCEPTED_CLI_TOKENS = {f: set(m.values()) for f, m in EXPECTED_NATIVE.items()}
 
 
 def test_d23_the_native_spelling_is_always_a_token_that_model_accepts():
     """Both directions. A route that names an effort the model's CLI rejects is
     not executable, and one that quietly under-delivers is the same defect
-    pointed the other way."""
+    pointed the other way.
+
+    The second direction needs `EXPECTED_NATIVE`, not a token set: setting
+    `effort_map.openai.HIGH` to `low` emits a token Codex happily accepts, at an
+    effort level below the one the band asked for, and a membership check waves
+    it through."""
     from route_task import Policy
     policy = Policy(CFG)
     fam = {m["id"]: m["family"] for m in CFG["models"].values()}
@@ -2126,7 +2148,12 @@ def test_d23_the_native_spelling_is_always_a_token_that_model_accepts():
                 f"{model} cannot receive {effective} (ceiling {ceiling})")
             assert levels.index(effective) <= levels.index(requested)
         native = out["selected_effort_native"]
-        assert native == CFG["effort_map"][fam[model]][effective]
+        # Against the hand table, not against the map the router just read.
+        assert native == EXPECTED_NATIVE[fam[model]][effective], (
+            f"{model} ({fam[model]}) at {effective} emitted native {native!r}; "
+            f"that family's CLI spells it "
+            f"{EXPECTED_NATIVE[fam[model]][effective]!r}"
+        )
         assert native in ACCEPTED_CLI_TOKENS[fam[model]], (
             f"{model} ({fam[model]}) emitted native {native!r}, which that "
             f"family's CLI does not accept; accepted={sorted(ACCEPTED_CLI_TOKENS[fam[model]])}"
@@ -2166,6 +2193,60 @@ def test_d23_native_is_looked_up_from_the_effort_that_ships():
         f"native is {out['selected_effort_native']!r}; it must come from the "
         f"effort that ships ({m['HIGH']!r}), not the one that was asked for "
         f"({m['MAX']!r})")
+
+
+def test_d23_a_merged_ceiling_row_reads_coherently():
+    """One role can hold two seats, and the single row it gets has to be true of
+    both asks.
+
+    Two ways in, and the first review of this merge found only the second:
+
+    - LOW seats `worker_fast` as its own reviewer BY DESIGN (`independent:
+      false`, so `_deconflict` never runs). The route stays EXECUTABLE. Three
+      separate probes of mine missed this because they all swept dimensions that
+      land above LOW, and each reported "no problems" from a path it never
+      entered.
+    - `_deconflict` failing to substitute leaves the worker among the reviewers.
+      That also compromises independence, so those routes are terminal.
+
+    The row reports the HIGHER of the two asks, because that is the level any
+    named floor is measured against. Before this, a LOW route shipped
+    `requested: LOW` beside `floor_requires: MEDIUM` — two numbers that cannot
+    both describe one seat.
+    """
+    import copy
+
+    # (a) executable, by design, no independence failure anywhere near it.
+    cfg = copy.deepcopy(CFG)
+    cfg["models"]["openai_worker_fast"]["effort_ceiling"] = "MINIMAL"
+    out = route(_task(task_class="MECHANICAL"), cfg)
+    assert out["terminal"] is None, "the executable merge path went terminal"
+    assert out["review"]["reviewers"] == [out["selected_role"]], (
+        "probe drifted: this case exists because the worker reviews itself")
+    assert not out["review"]["independence_required"]
+    rows = out["effort_ceiling_applied"]
+    assert len(rows) == 1, f"one seat, one row: {rows}"
+    row = rows[0]
+    assert row["requested"] == row["floor_requires"], (
+        f"the row asks for {row['requested']} while naming a floor that "
+        f"requires {row['floor_requires']}: {row}")
+    assert row["floor_broken"] == "review.LOW.effort"
+
+    # (b) both floors broken on one seat: the stricter one is what ships.
+    cfg = copy.deepcopy(CFG)
+    cfg["models"]["xai_frontier"]["effort_ceiling"] = "HIGH"
+    ids = sorted(m["id"] for m in cfg["models"].values())
+    out = route(_task(task_class="MECHANICAL", complexity=3, uncertainty=3,
+                      blast_radius=3, reversibility=3,
+                      unavailable_models=sorted(set(ids) - {"grok-4.6"})), cfg)
+    assert out["review"]["independence_compromised"], "probe drifted"
+    shared = [r for r in out["effort_ceiling_applied"]
+              if r["floor_broken"] == "review.CRITICAL.effort"]
+    assert len(shared) == len(out["effort_ceiling_applied"]), (
+        f"a seat broke the review floor and reported a weaker one: "
+        f"{out['effort_ceiling_applied']}")
+    assert all(r["floor_requires"] == "MAX" for r in shared), (
+        "the stricter of two broken floors is what the human has to satisfy")
 
 
 def test_d23_a_ceiling_record_appears_exactly_when_a_seat_was_capped():
