@@ -1955,3 +1955,30 @@ def test_d12_judge_reclaims_a_tier_a_reviewer_did_not_need():
     assert rv["judge_model"] is not None
     parties = {out["selected_model"], *(m for m in rv["reviewer_models"] if m)}
     assert rv["judge_model"] not in parties
+
+
+def test_d23_an_effort_ceiling_must_name_a_real_effort_level():
+    """A ceiling is compared against conceptual effort levels. A typo would
+    either raise deep inside `efforts.index()` or be silently skipped — and a
+    ceiling that is silently skipped is a route promising an effort the model
+    refuses.
+
+    `None` is deliberately absent from the bad list: a model with no ceiling and
+    a model whose ceiling is explicitly null are the same thing, and `.get()`
+    cannot tell them apart anyway.
+    """
+    from route_task import Policy, ConfigError
+    key = next(iter(CFG["models"]))
+    for bad in ("XHIGH", "very_high", "", 3, "MAXIMUM"):
+        altered = {**CFG, "models": {**CFG["models"],
+                                     key: {**CFG["models"][key], "effort_ceiling": bad}}}
+        with pytest.raises(ConfigError):
+            Policy(altered)
+
+    # And a real level is accepted, with the ceiling readable per model id.
+    ok = {**CFG, "models": {**CFG["models"],
+                            key: {**CFG["models"][key], "effort_ceiling": "HIGH"}}}
+    policy = Policy(ok)
+    assert policy.ceiling_of[CFG["models"][key]["id"]] == "HIGH"
+    other = next(k for k in CFG["models"] if k != key)
+    assert policy.ceiling_of[CFG["models"][other]["id"]] is None

@@ -205,6 +205,20 @@ class Policy:
             m["id"]: m["capability_tier"] for m in cfg["models"].values()
         }
 
+        # The highest conceptual effort this model's CLI will accept, or None
+        # when it accepts every level. Optional: absence means no ceiling, so
+        # existing models need no entry. Validated here because a ceiling that
+        # does not name a real level is a control that silently does nothing.
+        self.ceiling_of: dict[str, str | None] = {}
+        for key, model in cfg["models"].items():
+            ceiling = model.get("effort_ceiling")
+            if ceiling is not None and ceiling not in self.efforts:
+                raise ConfigError(
+                    f"models.{key}.effort_ceiling = {ceiling!r} is not one of "
+                    f"{self.efforts}; a ceiling naming no real level cannot be "
+                    f"compared and would be skipped in silence")
+            self.ceiling_of[model["id"]] = ceiling
+
         # What each band demands of a reviewer, expressed as a model tier and
         # derived from the band's own configured reviewer roles under the
         # canonical binding. Computed, never written down twice: a floor kept
