@@ -119,3 +119,26 @@ def test_control_loop_escalates_on_silent_seats_and_decides_the_accounting():
     # CANCELLED joins the NO_RESPONSE/accounting vocabulary without becoming
     # an escalation trigger of its own
     assert "CANCELLED` never enters the ladder" in text
+
+
+# ---------------------------------------------------------------------------
+# DD-9 / DD-11 — the dispatch contract is documented where Layer B lives
+# ---------------------------------------------------------------------------
+
+def test_adapters_owns_a_dispatch_contract_section():
+    text = (SKILL / "references" / "adapters.md").read_text()
+    assert "## Dispatch contract" in text
+    for required in ("dispatch_agent.py", "TERMINATION_UNCONFIRMED",
+                     "Launch is not completion", "--prompt-file",
+                     "deadline"):
+        assert required in text, required
+
+
+def test_skill_md_points_at_the_dispatch_layer():
+    text = (SKILL / "SKILL.md").read_text()
+    assert "## Dispatching the route" in text
+    assert "verify-evidence" in text
+    assert "termination_unconfirmed" in text
+    # the frontmatter description gained the background triggers
+    frontmatter = text.split("---")[1]
+    assert "background" in frontmatter

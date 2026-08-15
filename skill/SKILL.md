@@ -1,6 +1,6 @@
 ---
 name: model-router
-description: Choose which model and reasoning-effort level should do a piece of software-engineering work, and how thoroughly that work must be reviewed, based on complexity, uncertainty, blast radius, reversibility, task type, and prior failures. Use this whenever you are about to delegate implementation, debugging, refactoring, architecture, migration, investigation, or review work to a subagent or another model — and especially before touching authentication, authorization, payments, database schemas, data migrations, concurrency, or anything else where a mistake is expensive or hard to undo. Also use it when a first attempt has failed and you are deciding whether to retry or escalate, when two reviewers disagree, or when someone asks which model to use for a task.
+description: Choose which model and reasoning-effort level should do a piece of software-engineering work, and how thoroughly that work must be reviewed, based on complexity, uncertainty, blast radius, reversibility, task type, and prior failures. Use this whenever you are about to delegate implementation, debugging, refactoring, architecture, migration, investigation, or review work to a subagent or another model — and especially before touching authentication, authorization, payments, database schemas, data migrations, concurrency, or anything else where a mistake is expensive or hard to undo. Also use it when a first attempt has failed and you are deciding whether to retry or escalate, when two reviewers disagree, or when someone asks which model to use for a task. Also use it when dispatching routed work to a background agent or bridge process, and when a dispatched worker or reviewer timed out, returned nothing, or cannot be confirmed dead.
 ---
 
 # Model Router
@@ -502,6 +502,25 @@ avoid:   frontier model for every trivial task
 prefer:  cheap model → one evidence-based retry → stronger model
 ```
 
+## Dispatching the route
+
+A route is a decision, not a result. A seat dispatched in the background
+returns a handle; the result exists only as an execution receipt, and
+`scripts/dispatch_agent.py` is what produces one — it owns the deadline,
+the kill ladder, and termination confirmation. Read
+`references/adapters.md` ("Dispatch contract") before the first background
+dispatch of a session.
+
+Two receipts are two different proofs, and neither substitutes for the
+other: `--isolation-evidence` takes the `attempt_id`s of reviewer receipts
+that reached `SUCCEEDED` — validate the set first with
+`dispatch_agent.py verify-evidence` — and no evidence at all beats an
+invented id. A seat whose receipt ended without a verdict did not review
+(`references/review-policy.md`, "A seat that returns no verdict"). An
+attempt whose process tree could not be confirmed dead blocks
+write-capable retries: re-route with `--flags termination_unconfirmed` and
+let the human gate hold it.
+
 ## Before the first route in a session
 
 Establish what you can actually invoke. A route naming a model you cannot call
@@ -524,8 +543,9 @@ Read these when the situation calls for them; not needed for a routine route.
   who may hold the judge seat, the reviewer output contract, disagreements.
 - **`references/control-loop.md`** — escalation triggers, retry limits, which model "ran"
   and how that inference has gone wrong, routing confidence, observability.
-- **`references/adapters.md`** — runtime differences, effort mapping, transports, and the
-  fallback matrices. Read when a model is unavailable or you cross the bridge.
+- **`references/adapters.md`** — runtime differences, effort mapping, transports, the
+  dispatch contract for background execution, and the fallback matrices. Read when a
+  model is unavailable, before a background dispatch, or when you cross the bridge.
 - **`references/examples.md`** — worked routing decisions, including the four cases an
   earlier version of this policy got wrong.
 
