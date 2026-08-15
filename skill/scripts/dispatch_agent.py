@@ -245,6 +245,50 @@ def _new_receipt(args, stdout_path: Path, stderr_path: Path) -> dict:
     }
 
 
+def _commit_terminal(receipt_dir: Path, receipt: dict, claim_path: Path) -> int:
+    """The single last-instant commit for a terminal receipt — shared by
+    `cmd_run`'s normal tail and its post-spawn `except Exception` handler,
+    so an external terminal write (typically `cancel`) is preserved no
+    matter which of the two paths reaches this attempt's last write. The
+    caller has already set `receipt["result"]["state"]` (and
+    `finished_at`) to its own conclusion before calling this.
+
+    This re-read is the LAST action before the atomic replace below — as
+    close to the write as the language lets it get, to shrink (not
+    eliminate) the read-replace gap that design doc DD-9 documents as a
+    residual race. An external `cancel` (or, in principle, a second `run`
+    sharing this attempt-id) may have reached the receipt first with a
+    terminal state of its own; whichever terminal state is already on disk
+    wins — the caller's own conclusion (typically FAILED or CANCELLED)
+    never overwrites it. Preserve ANY state in EXIT_BY_STATE (every
+    terminal state this file knows), not only CANCELLED/
+    TERMINATION_UNCONFIRMED: a late overwrite of a cancelled or unconfirmed
+    attempt must not relabel it FAILED, SUCCEEDED, or anything else,
+    regardless of which of the two call sites (normal tail or crash
+    handler) is the one doing the overwriting.
+
+    The claim sentinel is unlinked in both branches: this `run` process is
+    the only holder of the claim either way, so it is the one that
+    releases it once ANY terminal state is confirmed on disk, whoever's
+    conclusion that terminal state is."""
+    try:
+        on_disk = read_receipt(receipt_dir, receipt["attempt_id"])
+        on_disk_state = on_disk["result"]["state"]
+        if on_disk_state in EXIT_BY_STATE:
+            # Someone else (typically `cancel`, racing this same attempt)
+            # already landed a terminal state — this `run` is the only
+            # holder of the claim sentinel either way, so it is the one
+            # that removes it once ANY terminal state is confirmed on
+            # disk, whoever's conclusion that terminal state is.
+            claim_path.unlink(missing_ok=True)
+            return EXIT_BY_STATE[on_disk_state]
+    except (OSError, json.JSONDecodeError):
+        pass
+    write_receipt(receipt_dir, receipt)
+    claim_path.unlink(missing_ok=True)  # receipt is terminal now
+    return EXIT_BY_STATE[receipt["result"]["state"]]
+
+
 def cmd_run(args) -> int:
     # Everything that can fail before spawn is validated before any receipt
     # exists — a preflight failure must never leave a permanent STARTING
@@ -510,13 +554,15 @@ def cmd_run(args) -> int:
                 # DEFER-2: terminal persistence is best-effort. OSError here
                 # must not skip claim release or borrow crash exit 9 — the
                 # child is already reaped on this happy path. STARTING /
-                # start-failed writes above stay strict.
+                # start-failed writes above stay strict. Both this tail
+                # and the crash handler commit through `_commit_terminal`
+                # so an already-terminal on-disk state is never relabeled.
                 try:
-                    write_receipt(receipt_dir, receipt)
+                    return _commit_terminal(receipt_dir, receipt, claim_path)
                 except OSError:
                     print("receipt write failed", file=sys.stderr)
-                claim_path.unlink(missing_ok=True)  # receipt is terminal — release the claim, same as every other terminal path
-                return EXIT_BY_STATE[receipt["result"]["state"]]
+                    claim_path.unlink(missing_ok=True)
+                    return EXIT_BY_STATE[receipt["result"]["state"]]
             except Exception:
                 # A crash writing the RUNNING receipt, waiting on the child,
                 # validating output, or writing the terminal receipt above
@@ -534,12 +580,203 @@ def cmd_run(args) -> int:
                 receipt["result"]["state"] = (
                     "CANCELLED" if confirmed else "TERMINATION_UNCONFIRMED")
                 receipt["timing"]["finished_at"] = _utcnow()
-                write_receipt(receipt_dir, receipt)
-                claim_path.unlink(missing_ok=True)  # receipt is terminal now
+                # The return value is ignored here on purpose: whichever
+                # terminal state ends up on disk (this handler's own
+                # conclusion, or an already-terminal state
+                # `_commit_terminal` preserved instead), `main()`'s crash
+                # guard still turns THIS exception into exit 9 — the
+                # receipt being terminal is what matters here, not what
+                # `cmd_run` would have returned.
+                _commit_terminal(receipt_dir, receipt, claim_path)
                 raise
     finally:
         if stdin_f is not subprocess.DEVNULL:
             stdin_f.close()
+
+
+def _pid_alive(pid: int) -> bool:
+    """`os.kill(pid, 0)` semantics for a single pid — the supervisor's own
+    pid, not a process group. Analogous to `_group_alive` but distinguishes
+    "the child's group lives on" from "the process that was watching its
+    deadline is still around"."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but is not ours to signal — still alive
+
+
+def cmd_status(args) -> int:
+    # Same chokepoint `run` uses — a raw caller-supplied id never reaches
+    # _receipt_path unvalidated just because this is a read-only command.
+    try:
+        args.attempt_id = _validated_attempt_id(args.attempt_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    receipt_dir = Path(args.receipt_dir)
+    receipt_path = _receipt_path(receipt_dir, args.attempt_id)
+    if not receipt_path.exists():
+        claim_path = receipt_dir / f"{args.attempt_id}.claim"
+        if claim_path.exists():
+            # A claim sentinel with no receipt yet: `run` has exclusively
+            # claimed this attempt id but has not written even the STARTING
+            # receipt (normally too brief a window to observe; durably, this
+            # is what a crash between the claim and the first receipt write
+            # leaves behind). CLAIMED is a report-only label, not a receipt
+            # state — it is deliberately absent from STATES, since there is
+            # no receipt yet to hold a `result.state` in. It is safe to
+            # remove this claim file once the claiming supervisor
+            # (recorded nowhere else, since no receipt exists yet — this is
+            # the one case status cannot cross-check a supervisor_pid) is
+            # otherwise confirmed dead; this command does not do that
+            # removal itself (no automatic crashed-claim cleanup).
+            print(json.dumps({"attempt_id": args.attempt_id,
+                              "state": "CLAIMED"}, indent=2))
+            return 0
+    receipt = read_receipt(receipt_dir, args.attempt_id)
+    state = receipt["result"]["state"]
+    if state in ("STARTING", "RUNNING"):
+        pgid = receipt["process"]["process_group_id"]
+        # RUNNING with a dead group means the supervising `run` died before
+        # its terminal write: the state is unknown, not failed — the caller
+        # sees exactly that and escalates instead of guessing. STARTING has
+        # no child pgid yet (it is None until Popen succeeds), so
+        # child_alive is always False there — see the STARTING branch below.
+        child_alive = bool(pgid) and _group_alive(pgid)
+        receipt["process_alive"] = child_alive
+        supervisor_pid = receipt["process"].get("supervisor_pid")
+        supervisor_alive = bool(supervisor_pid) and _pid_alive(supervisor_pid)
+        if state == "STARTING":
+            # No child exists yet, so "child_alive" does not apply — the
+            # only question is whether anything is still driving this
+            # attempt toward RUNNING. A STARTING receipt whose supervisor
+            # died is stuck forever otherwise: cancel is the only safe move,
+            # the same reasoning as a stale/orphaned RUNNING receipt.
+            receipt["supervision"] = "supervised" if supervisor_alive else "stale"
+        elif child_alive and supervisor_alive:
+            # Both watcher and child are up — the deadline has an owner.
+            receipt["supervision"] = "supervised"
+        elif child_alive and not supervisor_alive:
+            # The child is still running and nothing owns its deadline —
+            # cancel is the only safe move; a retry behind a possibly-live
+            # writer is the duplicate-writer hazard (F-02).
+            receipt["supervision"] = "orphaned"
+        elif not child_alive and supervisor_alive:
+            # The child already exited and the supervisor that spawned it
+            # is still alive — most likely inside the ordinary window
+            # between the child dying and the terminal receipt landing
+            # (Task 10's group-confirmation wait, or output validation
+            # right after `proc.wait` returns). The supervisor still owns
+            # this attempt, so this is `supervised`, not `stale` — `stale`
+            # is reserved for a receipt nothing is driving toward a
+            # terminal state at all.
+            receipt["supervision"] = "supervised"
+        else:
+            # Both dead but the receipt is still RUNNING: the supervisor
+            # crashed before writing a terminal state. Same remedy as
+            # orphaned — a stale/orphaned RUNNING receipt requires cancel
+            # before any retry.
+            receipt["supervision"] = "stale"
+    print(json.dumps(receipt, indent=2))
+    return 0
+
+
+def cmd_cancel(args) -> int:
+    # Same chokepoint `run`/`status` use, before any path is built.
+    try:
+        args.attempt_id = _validated_attempt_id(args.attempt_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not _finite_positive(args.grace_seconds):
+        # cancel takes a duration input too — the same finiteness/sign
+        # check `run` applies to --deadline-seconds/--grace-seconds applies
+        # here, not just at spawn time.
+        print(f"--grace-seconds must be a finite number > 0, got "
+              f"{args.grace_seconds!r}", file=sys.stderr)
+        return 2
+    receipt_dir = Path(args.receipt_dir)
+    claim_path = receipt_dir / f"{args.attempt_id}.claim"
+    try:
+        receipt = read_receipt(receipt_dir, args.attempt_id)
+    except FileNotFoundError:
+        if claim_path.exists():
+            # A claim sentinel with no receipt yet: Task 8's narrow window
+            # between a successful O_CREAT|O_EXCL claim and the first
+            # STARTING receipt write, or a supervisor that crashed inside
+            # it. There is nothing recorded yet to signal (no pgid, no
+            # supervisor_pid to check liveness against), so cancel must
+            # not guess — it refuses without touching the claim. The
+            # documented remedy stays manual (DD-9's no-auto-delete rule
+            # for a crashed claim; `status` reports this window as
+            # CLAIMED).
+            print(f"attempt {args.attempt_id!r} is claimed but never "
+                  f"started — confirm the claimer is dead, then delete "
+                  f"the claim manually per DD-9; refusing to signal "
+                  f"anything", file=sys.stderr)
+            return 2
+        print(f"attempt {args.attempt_id!r} is unknown under {receipt_dir} "
+              f"— no receipt and no claim", file=sys.stderr)
+        return 2
+    state = receipt["result"]["state"]
+    if state not in ("STARTING", "RUNNING"):
+        # A terminal state is already someone's final word — refuse without
+        # touching the receipt.
+        print(f"not RUNNING: {state}", file=sys.stderr)
+        return EXIT_BY_STATE.get(state, 2)
+    # STARTING may predate the RUNNING write, so process_group_id can still
+    # be None here — there is no child yet for a STARTING receipt whose
+    # supervisor never got past claiming the attempt.
+    pgid = receipt["process"].get("process_group_id")
+    supervisor_pid = receipt["process"].get("supervisor_pid")
+    supervisor_alive = bool(supervisor_pid) and _pid_alive(supervisor_pid)
+    if not supervisor_alive:
+        # The receipt is stale: the supervisor that recorded this attempt is
+        # dead. If a pgid was recorded, its *identity* can no longer be
+        # trusted — an unrelated process may have been assigned the same
+        # pgid since; if no pgid was recorded yet (STARTING), there is
+        # nothing to signal in the first place. Either way POSIX offers no
+        # portable birth-identity check, so refuse to signal rather than
+        # risk killpg-ing an innocent process group. Fail closed: mark the
+        # receipt unconfirmed and let a human (or the orchestrator's
+        # termination_unconfirmed re-route) take over. No signal is sent.
+        pgid_desc = pgid if pgid is not None else "none recorded (STARTING)"
+        print(f"attempt {args.attempt_id!r} is stale (supervisor "
+              f"{supervisor_pid} is dead) — refusing to signal pgid "
+              f"{pgid_desc}: its identity cannot be verified after "
+              f"supervisor death", file=sys.stderr)
+        receipt["result"]["termination_confirmed"] = False
+        receipt["result"]["state"] = "TERMINATION_UNCONFIRMED"
+        receipt["timing"]["finished_at"] = _utcnow()
+        write_receipt(receipt_dir, receipt)
+        # The receipt is terminal now — same rule every terminal writer
+        # follows (ITEM-V-5): release the claim sentinel so it does not
+        # sit forever as a claim with a terminal receipt already behind
+        # it.
+        claim_path.unlink(missing_ok=True)
+        return EXIT_BY_STATE["TERMINATION_UNCONFIRMED"]
+    if state == "STARTING":
+        # The supervisor is alive but the attempt has not reached RUNNING
+        # yet — there is no child process group to signal, and the receipt
+        # may still be about to change out from under us (to RUNNING or a
+        # pre-spawn refusal). Refuse without touching the receipt; the
+        # caller can retry cancel once the attempt reaches RUNNING (or a
+        # terminal state on its own).
+        print(f"attempt {args.attempt_id!r} is not yet RUNNING (state is "
+              f"STARTING, supervisor {supervisor_pid} is alive) — nothing "
+              f"to signal yet", file=sys.stderr)
+        return 2
+    confirmed = terminate_group(None, pgid, args.grace_seconds)
+    receipt["result"]["termination_confirmed"] = confirmed
+    receipt["result"]["state"] = (
+        "CANCELLED" if confirmed else "TERMINATION_UNCONFIRMED")
+    receipt["timing"]["finished_at"] = _utcnow()
+    write_receipt(receipt_dir, receipt)
+    claim_path.unlink(missing_ok=True)  # receipt is terminal now — same rule every terminal writer follows
+    return EXIT_BY_STATE[receipt["result"]["state"]]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -565,12 +802,21 @@ def build_parser() -> argparse.ArgumentParser:
                      default="none")
     run.add_argument("argv", nargs="+",
                      help="command to execute, after `--`")
+
+    status = sub.add_parser("status", help="print the receipt; liveness-check RUNNING")
+    status.add_argument("--attempt-id", required=True)
+    status.add_argument("--receipt-dir", required=True)
+
+    cancel = sub.add_parser("cancel", help="terminate a RUNNING attempt and confirm")
+    cancel.add_argument("--attempt-id", required=True)
+    cancel.add_argument("--receipt-dir", required=True)
+    cancel.add_argument("--grace-seconds", type=float, default=15.0)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    handlers = {"run": cmd_run}
+    handlers = {"run": cmd_run, "status": cmd_status, "cancel": cmd_cancel}
     try:
         return handlers[args.command](args)
     except Exception:  # noqa: BLE001 — a crash must not borrow an outcome code

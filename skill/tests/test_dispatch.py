@@ -486,3 +486,338 @@ def test_grading_is_gated_on_the_deadline_even_after_the_leader_exits_0(tmp_path
     assert receipt["result"]["schema_valid"] is None
     assert receipt["result"]["termination_confirmed"] is True
 
+
+def _start_supervised_sleeper(tmp_path, attempt_id="bg1"):
+    fake = write_fake(tmp_path, "sleeper_bg.py", SLEEPER)
+    supervisor = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "run",
+         "--attempt-id", attempt_id,
+         "--receipt-dir", str(tmp_path / "receipts"),
+         "--deadline-seconds", "60", "--grace-seconds", "1",
+         "--seat", "worker", "--output-schema", "none",
+         "--", sys.executable, str(fake)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    receipt_path = tmp_path / "receipts" / f"{attempt_id}.json"
+    for _ in range(100):                       # wait for RUNNING, <=5 s
+        if receipt_path.exists():
+            receipt = json.loads(receipt_path.read_text())
+            if receipt["result"]["state"] == "RUNNING":
+                return supervisor, receipt
+        time.sleep(0.05)
+    supervisor.kill()
+    pytest.fail("supervisor never reached RUNNING")
+
+
+def _agent(args, tmp_path):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args,
+         "--receipt-dir", str(tmp_path / "receipts")],
+        capture_output=True, text=True, timeout=30)
+
+
+def test_status_reports_running_with_liveness(tmp_path):
+    supervisor, _ = _start_supervised_sleeper(tmp_path)
+    try:
+        proc = _agent(["status", "--attempt-id", "bg1"], tmp_path)
+        assert proc.returncode == 0
+        shown = json.loads(proc.stdout)
+        assert shown["result"]["state"] == "RUNNING"
+        assert shown["process_alive"] is True
+        assert shown["supervision"] == "supervised"
+    finally:
+        _agent(["cancel", "--attempt-id", "bg1"], tmp_path)
+        supervisor.wait(timeout=30)
+
+
+def test_status_detects_an_orphaned_child_when_the_supervisor_died(tmp_path):
+    """The receipt's own supervisor_pid is what makes this detectable: if the
+    `run` process dies while the child lives on, process_alive alone (which
+    only checks the child's group) would report a plain RUNNING attempt as
+    if someone were still watching its deadline. `status` must say
+    'orphaned' instead — a stale/orphaned RUNNING receipt requires cancel
+    before any retry (F-02: a retry behind a possibly-live writer is two
+    writers on the same files)."""
+    supervisor, receipt = _start_supervised_sleeper(tmp_path, attempt_id="bg5")
+    try:
+        path = tmp_path / "receipts" / "bg5.json"
+        on_disk = json.loads(path.read_text())
+        dead_pid = 999999  # not our process — the group's own child is
+        # still alive, so this cannot collide with a real pid this test uses
+        on_disk["process"]["supervisor_pid"] = dead_pid
+        path.write_text(json.dumps(on_disk))
+        proc = _agent(["status", "--attempt-id", "bg5"], tmp_path)
+        assert proc.returncode == 0
+        shown = json.loads(proc.stdout)
+        assert shown["process_alive"] is True
+        assert shown["supervision"] == "orphaned"
+    finally:
+        # `cancel` cannot clean this up: the on-disk supervisor_pid above
+        # was overwritten to a dead pid to simulate the orphaned case, so
+        # cancel correctly refuses to signal (the stale-refusal rule this
+        # test's sibling exercises directly) — using it here would leave
+        # the real 60s sleeper outliving supervisor.wait below. Kill the
+        # recorded process group directly instead.
+        pgid = receipt["process"]["process_group_id"]
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        supervisor.wait(timeout=30)
+
+
+def test_cancel_confirms_and_the_run_supervisor_preserves_it(tmp_path):
+    """cancel and run race on the receipt; the cancel verdict wins — the
+    attempt WAS killed, whatever the child's exit looked like to run."""
+    supervisor, receipt = _start_supervised_sleeper(tmp_path, attempt_id="bg2")
+    proc = _agent(["cancel", "--attempt-id", "bg2", "--grace-seconds", "2"],
+                  tmp_path)
+    assert proc.returncode == 7, proc.stderr
+    supervisor.wait(timeout=30)
+    final = json.loads((tmp_path / "receipts" / "bg2.json").read_text())
+    assert final["result"]["state"] == "CANCELLED"
+    assert final["result"]["termination_confirmed"] is True
+    assert _group_is_dead(receipt["process"]["process_group_id"])
+
+
+def test_cancel_of_a_finished_attempt_is_refused(tmp_path):
+    fake = write_fake(tmp_path, "happy2.py", HAPPY)
+    run_dispatch(tmp_path, [sys.executable, fake], attempt_id="done1")
+    proc = _agent(["cancel", "--attempt-id", "done1"], tmp_path)
+    assert proc.returncode == 0            # already SUCCEEDED — nothing to kill
+    assert "not RUNNING" in proc.stderr
+
+
+def test_cancel_refuses_to_signal_when_the_recorded_supervisor_is_dead(tmp_path):
+    """A stale receipt's recorded pgid may have been reused by an unrelated
+    process once the supervisor that watched it is gone — cancel must not
+    kill blind. POSIX has no portable check that a pgid still identifies
+    the same process group, so a dead supervisor means refuse, not
+    signal."""
+    supervisor, receipt = _start_supervised_sleeper(tmp_path, attempt_id="bg6")
+    pgid = receipt["process"]["process_group_id"]
+    try:
+        path = tmp_path / "receipts" / "bg6.json"
+        on_disk = json.loads(path.read_text())
+        dead_pid = 999999  # not our process — the child group is still
+        # alive, so this cannot collide with a real pid this test uses
+        on_disk["process"]["supervisor_pid"] = dead_pid
+        path.write_text(json.dumps(on_disk))
+
+        proc = _agent(["cancel", "--attempt-id", "bg6"], tmp_path)
+        assert proc.returncode == 5, proc.stderr
+        final = json.loads(path.read_text())
+        assert final["result"]["state"] == "TERMINATION_UNCONFIRMED"
+        assert final["result"]["termination_confirmed"] is False
+        # cancel must not have touched the group — it is still alive
+        assert not _group_is_dead(pgid)
+    finally:
+        os.killpg(pgid, signal.SIGKILL)  # test cleanup, not the code under test
+        supervisor.wait(timeout=30)
+
+
+def test_cancel_of_a_stale_starting_receipt_is_terminal_with_no_signal(tmp_path):
+    """A STARTING receipt whose supervisor died before ever reaching RUNNING
+    is stale exactly like a stale RUNNING receipt — there is no live
+    supervisor to trust a pgid's identity against, and a STARTING receipt
+    may not even have a pgid yet. cancel must still resolve it to a
+    terminal state (so a caller is not stuck polling a receipt nothing will
+    ever finish) without sending any signal — there is nothing recorded
+    that it could safely signal."""
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    dead_pid = 999999  # not our process
+    starting = {
+        "attempt_id": "stale-starting", "seat": "worker",
+        "process": {"pid": None, "process_group_id": None,
+                    "supervisor_pid": dead_pid},
+        "timing": {"started_at": None, "deadline_at": None, "finished_at": None},
+        "result": {"state": "STARTING", "exit_status": None,
+                  "stdout_path": None, "stderr_path": None,
+                  "output_sha256": None, "schema_valid": None,
+                  "termination_confirmed": None},
+    }
+    (receipts / "stale-starting.json").write_text(json.dumps(starting))
+    proc = _agent(["cancel", "--attempt-id", "stale-starting"], tmp_path)
+    assert proc.returncode == 5, proc.stderr
+    final = json.loads((receipts / "stale-starting.json").read_text())
+    assert final["result"]["state"] == "TERMINATION_UNCONFIRMED"
+    assert final["result"]["termination_confirmed"] is False
+
+
+def test_cancel_of_a_live_starting_receipt_refuses_without_a_signal(tmp_path):
+    """A STARTING receipt whose supervisor is alive but has not yet reached
+    RUNNING has no child process group to signal — cancel refuses instead
+    of guessing, and must leave the receipt exactly as it found it (simulate
+    the live supervisor with this test process's own pid, since it is
+    guaranteed alive for the duration of the call)."""
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    starting = {
+        "attempt_id": "live-starting", "seat": "worker",
+        "process": {"pid": None, "process_group_id": None,
+                    "supervisor_pid": os.getpid()},
+        "timing": {"started_at": None, "deadline_at": None, "finished_at": None},
+        "result": {"state": "STARTING", "exit_status": None,
+                  "stdout_path": None, "stderr_path": None,
+                  "output_sha256": None, "schema_valid": None,
+                  "termination_confirmed": None},
+    }
+    payload = json.dumps(starting)
+    (receipts / "live-starting.json").write_text(payload)
+    proc = _agent(["cancel", "--attempt-id", "live-starting"], tmp_path)
+    assert proc.returncode == 2, proc.stderr
+    assert "not yet RUNNING" in proc.stderr
+    assert (receipts / "live-starting.json").read_text() == payload
+
+
+def test_status_reports_a_claim_with_no_receipt_yet_as_claimed(tmp_path):
+    """CLAIMED is a report-only label for the window between a successful
+    O_CREAT|O_EXCL claim (Task 8) and the first receipt write — normally too
+    narrow to observe by racing a real `run`, so simulated directly here by
+    writing only the sentinel file. It must never be confused with a
+    receipt state: there is no receipt to read one out of yet."""
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    (receipts / "claimed-only.claim").write_text("")
+    proc = _agent(["status", "--attempt-id", "claimed-only"], tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    shown = json.loads(proc.stdout)
+    assert shown["state"] == "CLAIMED"
+
+
+def test_run_preserves_a_termination_unconfirmed_receipt_too(tmp_path):
+    """The preservation check must not stop at CANCELLED: a cancel whose own
+    kill ladder could not confirm the group dead writes
+    TERMINATION_UNCONFIRMED, and that verdict is just as authoritative — it
+    is the one state that must block a write-capable retry (DD-10), so
+    `run` must never overwrite it with its own conclusion (typically
+    TIMED_OUT once the signal actually lands). Direct-state simulation:
+    writing TERMINATION_UNCONFIRMED onto the on-disk receipt stands in for
+    an external cancel process reaching that same verdict — the
+    preservation check in `cmd_run` reads whatever state is on disk, not
+    who wrote it."""
+    fake = write_fake(tmp_path, "sleeper_bg2.py", SLEEPER)
+    attempt_id = "bg4"
+    supervisor = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "run",
+         "--attempt-id", attempt_id,
+         "--receipt-dir", str(tmp_path / "receipts"),
+         "--deadline-seconds", "1", "--grace-seconds", "1",
+         "--seat", "worker", "--output-schema", "none",
+         "--", sys.executable, str(fake)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    receipt_path = tmp_path / "receipts" / f"{attempt_id}.json"
+    for _ in range(100):                       # wait for RUNNING, <=5 s
+        if receipt_path.exists():
+            receipt = json.loads(receipt_path.read_text())
+            if receipt["result"]["state"] == "RUNNING":
+                break
+        time.sleep(0.05)
+    else:
+        supervisor.kill()
+        pytest.fail("supervisor never reached RUNNING")
+    on_disk = json.loads(receipt_path.read_text())
+    on_disk["result"]["state"] = "TERMINATION_UNCONFIRMED"
+    on_disk["result"]["termination_confirmed"] = False
+    receipt_path.write_text(json.dumps(on_disk))
+    supervisor.wait(timeout=30)
+    final = json.loads(receipt_path.read_text())
+    assert final["result"]["state"] == "TERMINATION_UNCONFIRMED"
+
+
+def test_a_post_spawn_crash_never_relabels_an_already_terminal_receipt(
+        tmp_path, monkeypatch):
+    """Task 8's post-spawn `except Exception` handler used to write its own
+    conclusion (CANCELLED/TERMINATION_UNCONFIRMED) unconditionally — if an
+    external `cancel` had already landed a terminal state for this same
+    attempt in the narrow window before the crash handler's own write, the
+    crash handler's write would relabel it: exactly the relabeling hazard
+    design doc DD-9 documents for the run/cancel race, now reachable from
+    the crash path too (ITEM-V-4). The fix: both the normal tail (the test
+    above) and this crash handler now go through the shared
+    `_commit_terminal` helper, so whichever terminal state is on disk right
+    before the final atomic write wins, no matter which of the two code
+    paths gets there last. Direct-state simulation stands in for an actual
+    concurrent `cancel`, exactly as the test above does for the normal
+    tail — the preservation check reads whatever state is on disk, not who
+    wrote it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dispatch_agent", SCRIPT)
+    dispatch_agent = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dispatch_agent)
+
+    receipt_dir = tmp_path / "receipts"
+
+    def _plant_termination_unconfirmed_then_boom(stdout_path, output_schema):
+        on_disk = json.loads((receipt_dir / "crash3.json").read_text())
+        on_disk["result"]["state"] = "TERMINATION_UNCONFIRMED"
+        on_disk["result"]["termination_confirmed"] = False
+        (receipt_dir / "crash3.json").write_text(json.dumps(on_disk))
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dispatch_agent, "_validate_output",
+                        _plant_termination_unconfirmed_then_boom)
+    fake = write_fake(tmp_path, "happy3.py", HAPPY)
+    rc = dispatch_agent.main([
+        "run", "--attempt-id", "crash3", "--receipt-dir", str(receipt_dir),
+        "--deadline-seconds", "30", "--grace-seconds", "1",
+        "--seat", "worker", "--output-schema", "review",
+        "--", sys.executable, str(fake)])
+    assert rc == 9
+    receipt = json.loads((receipt_dir / "crash3.json").read_text())
+    # The crash handler's own conclusion would have been CANCELLED (the
+    # group WAS confirmed dead — the child had already exited 0 before
+    # _validate_output ever ran) — the pre-planted TERMINATION_UNCONFIRMED
+    # must win instead.
+    assert receipt["result"]["state"] == "TERMINATION_UNCONFIRMED"
+    assert receipt["result"]["termination_confirmed"] is False
+    assert not (receipt_dir / "crash3.claim").exists()
+
+
+def test_cancel_of_a_claim_only_attempt_refuses_without_touching_the_claim(tmp_path):
+    """A claim sentinel with no receipt yet (Task 8's narrow claim-then-
+    STARTING window, or a supervisor that crashed inside it) must not crash
+    `cancel` — `read_receipt` would raise `FileNotFoundError` on a bare
+    attempt id with only a claim (ITEM-V-5). There is nothing recorded to
+    signal yet (no pgid, no supervisor_pid to check liveness against), so
+    `cancel` refuses without touching the claim; the documented remedy
+    (confirm the claimer is dead, then delete the claim manually) stays
+    manual — no automatic claim garbage collection."""
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    (receipts / "claim-only-1.claim").write_text("")
+    proc = _agent(["cancel", "--attempt-id", "claim-only-1"], tmp_path)
+    assert proc.returncode == 2, proc.stderr
+    assert "claimed but never started" in proc.stderr
+    assert (receipts / "claim-only-1.claim").exists()
+    assert not (receipts / "claim-only-1.json").exists()
+
+
+def test_cancel_of_a_stale_running_receipt_removes_the_claim_too(tmp_path):
+    """`cancel`'s stale-supervisor branch writes a terminal
+    TERMINATION_UNCONFIRMED receipt — the rule that any command writing a
+    terminal receipt also removes the claim (ITEM-V-5) applies here exactly
+    as it does to `run`'s own terminal writes. Leaving the claim behind
+    would contradict `status`'s CLAIMED report: a claim with no attempt
+    behind it, when a terminal receipt in fact already exists."""
+    supervisor, receipt = _start_supervised_sleeper(tmp_path, attempt_id="bg7")
+    pgid = receipt["process"]["process_group_id"]
+    try:
+        path = tmp_path / "receipts" / "bg7.json"
+        claim_path = tmp_path / "receipts" / "bg7.claim"
+        assert claim_path.exists()          # still RUNNING — not yet released
+        on_disk = json.loads(path.read_text())
+        dead_pid = 999999  # not our process — the child group is still
+        # alive, so this cannot collide with a real pid this test uses
+        on_disk["process"]["supervisor_pid"] = dead_pid
+        path.write_text(json.dumps(on_disk))
+
+        proc = _agent(["cancel", "--attempt-id", "bg7"], tmp_path)
+        assert proc.returncode == 5, proc.stderr
+        final = json.loads(path.read_text())
+        assert final["result"]["state"] == "TERMINATION_UNCONFIRMED"
+        assert not claim_path.exists()
+    finally:
+        os.killpg(pgid, signal.SIGKILL)  # test cleanup, not the code under test
+        supervisor.wait(timeout=30)
+
