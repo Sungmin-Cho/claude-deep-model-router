@@ -77,3 +77,23 @@ def test_routing_metrics_block_promises_only_what_the_router_emits():
     for field in ("final_success", "review_count"):
         assert field not in block, field
         assert field in text, f"{field} must stay documented — as a receipt field"
+
+
+# ---------------------------------------------------------------------------
+# DD-5 / DD-8 — a seat that returns no verdict must be a defined outcome
+# ---------------------------------------------------------------------------
+
+def test_review_policy_defines_the_absent_reviewer():
+    """The output contract admitted three verdicts and no absence, and the
+    disagreement matrix was a 3x3 with no missing row — so the two natural
+    moves (proceed on one verdict, or show it to a re-dispatched seat) were
+    both the failure the independence rules exist to prevent."""
+    text = (SKILL / "references" / "review-policy.md").read_text()
+    assert "NO_RESPONSE" in text
+    assert "### A seat that returns no verdict" in text
+    # the matrix rows exist
+    assert re.search(r"\|\s*any verdict\s*\|\s*`NO_RESPONSE`", text)
+    assert re.search(r"\|\s*`NO_RESPONSE`\s*\|\s*`NO_RESPONSE`", text)
+    # and the evidence-id source is stated
+    assert "### Where the evidence id comes from" in text
+    assert "attempt_id" in text
