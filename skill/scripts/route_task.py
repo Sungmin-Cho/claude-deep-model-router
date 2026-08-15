@@ -27,8 +27,12 @@ Usage:
                   --flags auth_sensitive,unknown_root_cause
 
 Exit status: 0 dispatchable as written; 1 terminal (no route to execute);
-2 invalid input; 3 executable only after a human confirms. 3 exists because a
-gate a caller cannot act on from a shell is not a gate.
+2 invalid input; 3 executable only after a human confirms; 4 dispatchable
+with a human confirmation owed after the fix ships (production hotfix);
+5 internal error — a crash, never a route outcome. 3 exists because a gate a
+caller cannot act on from a shell is not a gate; 5 exists because a crash
+that borrows 1 or 2 reports a terminal state or an input error that never
+happened.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
@@ -85,6 +90,9 @@ CAUSE_REASONS = {
     "review_below_band": "the review is staffed below its band",
     "effort_below_floor":
         "the selected model cannot reach the effort a floor required",
+    "unconfirmed_prior_termination":
+        "a prior attempt's process tree could not be confirmed dead — "
+        "dispatching a retry risks two concurrent writers",
 }
 
 
@@ -145,6 +153,13 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
             return yaml.safe_load(f)
     except OSError as exc:
         raise ConfigError(f"cannot read policy config at {path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        # Same shape as the OSError arm, and for the same reason the eager
+        # `human_gate_exit_status` validation exists: an uncontained raise
+        # lands on the interpreter's exit 1, which the contract reserves for
+        # "terminal (no route to execute)".
+        raise ConfigError(
+            f"policy config at {path} is not valid YAML: {exc}") from exc
 
 
 # --------------------------------------------------------------------------
@@ -251,7 +266,7 @@ class Policy:
         per_key = dict.fromkeys((
             "on_independence_unachievable", "on_any_critical_review",
             "on_judge_unavailable", "on_review_depth_reduced",
-            "on_effort_below_floor"), implemented)
+            "on_effort_below_floor", "on_termination_unconfirmed"), implemented)
         per_key["on_production_hotfix"] = {
             "require_human_confirmation", "defer_human_confirmation"}
         for key, allowed in per_key.items():
@@ -1199,11 +1214,13 @@ def independence(review: dict, task: Task) -> str:
     if task.isolation_available is False:
         return "unavailable"
     distinct = len({e.strip() for e in task.isolation_evidence if e.strip()})
-    # One identifier per reviewer — no more, and no hidden extra minimum. The
-    # old `and distinct >= 2` made a single-reviewer MEDIUM band unable to
-    # reach `enforced` even when the caller did exactly what both documents
-    # instruct, with no note explaining the refusal.
-    if review["reviewers"] and distinct >= len(review["reviewers"]):
+    # One identifier per reviewer — exactly. `>=` accepted surplus ids, so a
+    # stale or foreign identifier could ride along and still flip the
+    # strongest reported state; a count mismatch in either direction is not
+    # evidence about THIS route's reviewers. The old `and distinct >= 2`
+    # failure — a single-reviewer MEDIUM band unable to reach `enforced` —
+    # stays fixed: one reviewer, one id, equality holds.
+    if review["reviewers"] and distinct == len(review["reviewers"]):
         return "enforced"
     if task.isolation_available is True:
         return "planned"
@@ -1592,6 +1609,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     confidence = routing_confidence(task, fallbacks)
 
     review_independence = independence(review, task)
+    supplied = len({e.strip() for e in task.isolation_evidence if e.strip()})
+    if supplied and review["independent"] and supplied != len(review["reviewers"]):
+        # The caller typed evidence and it was NOT counted — say so, or the
+        # refusal is invisible and the next caller pads the list further.
+        effort_notes.append(
+            f"isolation evidence not counted: {supplied} id(s) for "
+            f"{len(review['reviewers'])} reviewer seat(s); independence stays "
+            f"{review_independence!r}")
     judge = judge_role
 
     band_requires_independence = bool(
@@ -1674,6 +1699,9 @@ def route(task: Task, cfg: dict | None = None) -> dict:
                 "HUMAN_REQUIRED"),
         Control("on_effort_below_floor", "effort_below_floor",
                 any(r["floor_broken"] for r in ceiling_records),
+                "HUMAN_REQUIRED"),
+        Control("on_termination_unconfirmed", "unconfirmed_prior_termination",
+                task.has("termination_unconfirmed"),
                 "HUMAN_REQUIRED"),
     ]
 
@@ -1813,7 +1841,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             and hitl["on_production_hotfix"] == "defer_human_confirmation"
             and not review.get("independence_compromised")
             and not review.get("review_depth_reduced")
-            and not any(r["floor_broken"] for r in ceiling_records)):
+            and not any(r["floor_broken"] for r in ceiling_records)
+            # A prior write-capable attempt whose process tree could not be
+            # confirmed dead is not made acceptable by an incident — it is
+            # made MORE dangerous: hotfix pressure is exactly when a second
+            # writer racing the first is likeliest. This gate is a hold,
+            # not a disclosure a later confirmation can absorb, so
+            # production_hotfix's deferral does not reach it either.
+            and not task.has("termination_unconfirmed")):
         deferred = True
         requires_human = False
         effort_notes.append(
@@ -2050,6 +2085,10 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 — a crash must not borrow 1 or 2
+        traceback.print_exc()
+        print(f"internal error before routing: {exc}", file=sys.stderr)
+        return 5
 
     p = build_parser(policy)
     args = p.parse_args(argv)
@@ -2086,32 +2125,36 @@ def main(argv: list[str] | None = None) -> int:
                 isolation_evidence=_split(args.isolation_evidence),
             )
         result = route(task)
+
+        if args.format == "json":
+            print(json.dumps(result, indent=2))
+        else:
+            _print_text(result)
+        # Exit status is the only part of this contract a shell can act on. A
+        # route that needs a human but exits 0 is a gate that any caller treating
+        # success as authorisation walks straight through — which is the shape
+        # this module rejects everywhere else ("disclosure is not a control"). So
+        # every human-gated outcome is nonzero, terminal or not. 1 is terminal;
+        # 3 is executable-after-approval, distinct so a caller can tell them apart.
+        if result["terminal"]:
+            return 1
+        if result["requires_human_confirmation"]:
+            return policy.human_gate_exit_status
+        # 4: run it, then get the confirmation. A shell that treats 0 as "nothing
+        # further is required" would drop the obligation, and an obligation nobody
+        # can read from the exit status is the disclosure-instead-of-control shape
+        # this module rejects everywhere else.
+        return 4 if result["human_confirmation_deferred"] else 0
     except ValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
-
-    if args.format == "json":
-        print(json.dumps(result, indent=2))
-    else:
-        _print_text(result)
-    # Exit status is the only part of this contract a shell can act on. A
-    # route that needs a human but exits 0 is a gate that any caller treating
-    # success as authorisation walks straight through — which is the shape
-    # this module rejects everywhere else ("disclosure is not a control"). So
-    # every human-gated outcome is nonzero, terminal or not. 1 is terminal;
-    # 3 is executable-after-approval, distinct so a caller can tell them apart.
-    if result["terminal"]:
-        return 1
-    if result["requires_human_confirmation"]:
-        return policy.human_gate_exit_status
-    # 4: run it, then get the confirmation. A shell that treats 0 as "nothing
-    # further is required" would drop the obligation, and an obligation nobody
-    # can read from the exit status is the disclosure-instead-of-control shape
-    # this module rejects everywhere else.
-    return 4 if result["human_confirmation_deferred"] else 0
+    except Exception as exc:  # noqa: BLE001 — a crash must not borrow 1 or 2
+        traceback.print_exc()
+        print(f"internal error: {exc}", file=sys.stderr)
+        return 5
 
 
 def _print_text(r: dict) -> None:

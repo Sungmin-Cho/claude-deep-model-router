@@ -1668,6 +1668,9 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
         "review_below_band": "the review is staffed below its band",
         "effort_below_floor":
             "the selected model cannot reach the effort a floor required",
+        "unconfirmed_prior_termination":
+            "a prior attempt's process tree could not be confirmed dead — "
+            "dispatching a retry risks two concurrent writers",
     }
     from route_task import CAUSE_REASONS
     assert CAUSE_REASONS == EXPECTED_WORDING, (
@@ -1690,6 +1693,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
             "review_below_band": bool(rv["review_depth_reduced"]),
             "effort_below_floor": any(
                 r["floor_broken"] for r in out["effort_ceiling_applied"]),
+            "unconfirmed_prior_termination":
+                "termination_unconfirmed" in task.flags,
         }
 
     # The oracle must cover exactly the causes the router declares. A control
@@ -1708,7 +1713,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
     for task_class in TASK_CLASSES:
         for dims in ((0, 0, 0, 0), (2, 2, 2, 0), (3, 3, 3, 3)):
             for flags in ([], ["auth_sensitive"], ["review_disagreement"],
-                          ["auth_sensitive", "bridge_down"]):
+                          ["auth_sensitive", "bridge_down"],
+                          ["termination_unconfirmed"]):
                 for iso in (None, True, False):
                     for pf, pm in ((0, []), (1, [ids[4]]), (cap, [ids[4]] * cap)):
                         for scarce in ([], [ids[0]], ids[:3]):
@@ -2359,3 +2365,141 @@ def test_d23_the_same_role_writes_one_ceiling_row():
     assert len(senior) == 1, f"expected one senior_engineer row: {senior}"
     assert senior[0]["floor_broken"] == "review.CRITICAL.effort"
     assert senior[0]["floor_requires"] == "MAX"
+
+
+# ---------------------------------------------------------------------------
+# D24/D25 — a crash must not borrow a contracted exit status
+# (docs/design/2026-08-15-dispatch-layer-design.md, DD-2)
+# ---------------------------------------------------------------------------
+
+def test_d24_yaml_parse_error_is_a_config_error_not_a_crash(tmp_path):
+    """A config that exists but does not parse must exit 2 with an actionable
+    message — not escape as a traceback on the interpreter's exit 1, which
+    the contract reserves for "terminal (no route to execute)"."""
+    import shutil
+    clone = tmp_path / "skill"
+    shutil.copytree(SKILL, clone, ignore=shutil.ignore_patterns(
+        "__pycache__", ".pytest_cache", "tests"))
+    (clone / "config" / "model-routing.yaml").write_text(
+        "bands: [\n  broken: yaml: : :\n")
+    proc = subprocess.run(
+        [sys.executable, str(clone / "scripts" / "route_task.py"),
+         "--class", "MECHANICAL", "--complexity", "0", "--uncertainty", "0",
+         "--blast-radius", "0", "--reversibility", "0", "--format", "json"],
+        capture_output=True, text=True)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    assert "not valid YAML" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_d24_an_unexpected_crash_exits_5_not_a_route_outcome(monkeypatch):
+    """1 means "terminal", 2 means "invalid input". A crash is neither, so it
+    must have its own status — a wrapper branching on the exit code must
+    never be told a story about the route that did not happen."""
+    import route_task
+    def boom(task, cfg=None):
+        raise RuntimeError("synthetic crash")
+    monkeypatch.setattr(route_task, "route", boom)
+    rc = route_task.main(["--class", "MECHANICAL", "--complexity", "0",
+                          "--uncertainty", "0", "--blast-radius", "0",
+                          "--reversibility", "0"])
+    assert rc == 5
+
+
+def test_d25_help_states_every_exit_the_cli_can_return():
+    """main() returns 4 (deferred confirmation) and now 5 (crash); --help is
+    built from the module docstring, so the docstring must state both."""
+    proc = cli("--help")
+    flat = proc.stdout.replace("\n", " ")
+    for token in ("0 dispatchable", "1 terminal", "2 invalid",
+                  "3 executable only after", "4 dispatchable", "5 internal"):
+        assert token in flat, token
+
+
+def test_d24_a_post_route_crash_also_exits_5(monkeypatch):
+    """The guard must cover the whole post-parse body, not just the
+    route(task) call — a crash while turning a route into output
+    (serialization, text formatting, the exit-status mapping) is still a
+    crash, not a route outcome, and must not escape as the interpreter's
+    exit 1 either."""
+    import route_task
+
+    class Unserializable:
+        pass
+
+    def route_returns_bad_json(task, cfg=None):
+        return {"unserializable": Unserializable()}
+
+    monkeypatch.setattr(route_task, "route", route_returns_bad_json)
+    rc = route_task.main(["--class", "MECHANICAL", "--complexity", "0",
+                          "--uncertainty", "0", "--blast-radius", "0",
+                          "--reversibility", "0", "--format", "json"])
+    assert rc == 5
+
+
+# ---------------------------------------------------------------------------
+# D26 — surplus isolation evidence must not count (DD-7)
+# ---------------------------------------------------------------------------
+
+def test_d26_surplus_evidence_is_not_enforced():
+    """`>=` accepted stale, foreign, or extra ids as proof, so over-supplying
+    evidence could flip the strongest reported state. A count mismatch in
+    either direction is not evidence about THIS route's reviewers."""
+    out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
+            isolation_available=True,
+            isolation_evidence=["s1", "s2", "stale-from-another-route"])
+    assert out["review"]["review_independence"] == "planned"
+    assert any("isolation evidence not counted" in n for n in out["notes"]), \
+        out["notes"]
+
+
+def test_d26_exact_evidence_still_reaches_enforced():
+    """Regression guard: the fix must not resurrect the old `>= 2` failure —
+    one reviewer, one id, equality holds."""
+    out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
+            isolation_available=True,
+            isolation_evidence=["session-a1b2", "session-c3d4"])
+    assert out["review"]["review_independence"] == "enforced"
+    assert not any("isolation evidence not counted" in n for n in out["notes"])
+
+
+# ---------------------------------------------------------------------------
+# D27 — an unconfirmed termination must hold the route (DD-10)
+# ---------------------------------------------------------------------------
+
+def test_d27_unconfirmed_termination_holds_the_route_for_a_human():
+    """A timed-out write-capable attempt whose process tree could not be
+    confirmed dead may still be writing. Dispatching a retry behind it is
+    two concurrent writers on the same files."""
+    out = r(task_class="IMPLEMENTATION", flags=["termination_unconfirmed"])
+    assert out["requires_human_confirmation"] is True
+    assert "unconfirmed_prior_termination" in out["human_control_causes"]
+
+
+def test_d27_the_gate_reaches_the_shell():
+    proc = cli("--class", "IMPLEMENTATION", "--complexity", "0",
+               "--uncertainty", "0", "--blast-radius", "0",
+               "--reversibility", "0", "--flags", "termination_unconfirmed")
+    assert proc.returncode == 3
+
+
+def test_d27_production_hotfix_does_not_defer_an_unconfirmed_termination():
+    """The deferral branch excludes independence_compromised,
+    review_depth_reduced, and floor-broken already — termination_unconfirmed
+    must join them. A possibly-live writer is not made acceptable by an
+    incident; hotfix pressure is exactly when a second writer racing the
+    first is likeliest, so this hold must survive combination with
+    production_hotfix rather than being deferred to after the fix ships."""
+    out = r(task_class="IMPLEMENTATION",
+            flags=["production_hotfix", "termination_unconfirmed"])
+    assert out["requires_human_confirmation"] is True
+    assert out["human_confirmation_deferred"] is False
+
+
+def test_d27_production_hotfix_combined_with_termination_unconfirmed_exits_3():
+    proc = cli("--class", "IMPLEMENTATION", "--complexity", "0",
+               "--uncertainty", "0", "--blast-radius", "0",
+               "--reversibility", "0",
+               "--flags", "production_hotfix,termination_unconfirmed")
+    assert proc.returncode == 3
+

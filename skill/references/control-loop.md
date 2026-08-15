@@ -16,6 +16,10 @@ Escalate when any of these occurs:
 10. The worker requests scope beyond the original task.
 11. The proposed change increases blast radius beyond the original estimate.
 12. Required context exceeds the worker's reliable handling capacity.
+13. A dispatched seat produced no result — its receipt ended `START_FAILED`,
+    `TIMED_OUT`, `TERMINATION_UNCONFIRMED`, or `INVALID_OUTPUT`, or `FAILED` with no parseable verdict block. Silence is evidence about the
+    *dispatch*; classify it (below) before treating it as evidence about the
+    *model*.
 
 Every one of these is **evidence**. None of them is "a stronger model exists and
 I feel uneasy." That distinction is what keeps cost bounded: escalating on
@@ -47,6 +51,43 @@ require_new_evidence_on_same_tier: true    # "tier" = capability_tier of the
                                           # model that RAN
 ```
 
+### Accounting for silent seats
+
+Two questions the retry rules used to leave open, decided:
+
+- **A re-dispatch consumes budget.** Re-running a `NO_RESPONSE` reviewer
+  consumes one `max_review_rounds` round; re-running a silent worker
+  consumes one implementation attempt. Silence is not free — unbounded
+  re-dispatch is exactly the silent loop the terminal states exist to
+  prevent.
+- **What `--prior-models` records.** A seat counts as a failure *of the
+  dispatched model id* only when its receipt proves the model ran and did
+  not deliver: `TIMED_OUT` with `termination_confirmed: true`,
+  `INVALID_OUTPUT`, or `FAILED`. `FAILED` enters the ladder with or without
+  a parseable verdict block — the model ran and did not deliver either way,
+  so a missing verdict is not an exemption from accounting. Environmental
+  outcomes never enter the ladder: `START_FAILED` and permission stalls are
+  transport problems — fix the command or the approval mode, or pass
+  `--flags bridge_down` — and `TERMINATION_UNCONFIRMED` blocks retrying
+  instead of recording anything: re-route with `--flags termination_unconfirmed`
+  and the route holds for a human, because a
+  possibly-live writer plus a retry is two writers on the same files.
+  `CANCELLED` never enters the ladder — the orchestrator cancelled it,
+  which is evidence about the orchestrator's schedule, not the model; the
+  re-dispatch still consumes budget exactly like any other re-dispatch
+  (previous bullet). That is also why `CANCELLED` is a `NO_RESPONSE` member
+  (the seat did not review) but not one of trigger 13's causes above — it
+  is never itself the thing being escalated. An attempt the orchestrator
+  cancelled never enters `--prior-models` regardless of what state its
+  receipt ends up in: the authority for what was cancelled is the
+  orchestrator's own round log, not the receipt — `run`'s terminal write
+  races the receipt against a `cancel` that landed in between (design doc
+  DD-9), and a receipt that a late overwrite relabeled `FAILED` or
+  `SUCCEEDED` must not be read back as evidence about the model.
+
+Recording a hang as a model failure escalates the ladder for a reason that
+was never about capability — the wrong model gets blamed and the wrong
+model gets paid.
 
 ### Which model "ran"
 
@@ -161,11 +202,32 @@ routing_metrics:
   fallbacks_applied: []
   escalation_count:
   retry_count:
-  review_count:
   routing_confidence:
-  final_success:
   rationale:            # names band + flags + fallbacks, in prose
 ```
+
+### Fields the router cannot know
+
+`review_count` and `final_success` were listed above until 2026-08-15 with
+no producer: `route_task.py` runs before any dispatch, so it can know
+neither. They belong to the **execution receipt** written per dispatched
+seat by `scripts/dispatch_agent.py`, which owns the time axis after launch:
+
+```yaml
+execution_receipt:            # one per attempt — see references/adapters.md,
+  attempt_id:                 # "Dispatch contract", for the full schema
+  result.state:  RUNNING | SUCCEEDED | FAILED | TIMED_OUT | CANCELLED |
+                 START_FAILED | TERMINATION_UNCONFIRMED | INVALID_OUTPUT
+  result.exit_status:
+  result.schema_valid:
+  result.termination_confirmed:
+```
+
+`review_count` is the number of reviewer-seat receipts with `result.state:
+SUCCEEDED` this round. `final_success` is a statement about the last
+implementation receipt *and* its review round together — only the
+orchestrator that watched both can assert it, and it lives in the
+orchestrator's summary, not in any single route or receipt.
 
 Recommended additions where the runtime exposes them: `input_tokens`,
 `output_tokens`, `latency_ms`, `estimated_cost`.

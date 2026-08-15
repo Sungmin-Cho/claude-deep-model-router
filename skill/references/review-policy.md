@@ -231,6 +231,26 @@ what independence reports. Anything else would let the policy's strongest
 control be opened by typing two words, which is precisely the false assurance
 this section exists to prevent.
 
+### Where the evidence id comes from
+
+`--isolation-evidence` wants one id per reviewer seat **that returned a
+verdict** — completion evidence and isolation evidence meet here. The
+canonical id is the dispatch receipt's `attempt_id`
+(`scripts/dispatch_agent.py`), validated before routing:
+
+```bash
+python3 "$SKILL_DIR"/scripts/dispatch_agent.py verify-evidence \
+    --receipt-dir receipts/ --ids r1-a7f3,r2-b2c9 --expect-count 2
+```
+
+Per transport, the underlying session identifier is recorded in the receipt:
+`grok -p` takes a caller-chosen `-s <fresh-uuid>`; `codex exec` and the
+Claude Code `Agent` tool expose no caller-visible session id — which is why
+the receipt's `attempt_id`, not an invented string, is the evidence. **If
+there is no receipt, there is no id**: leave `--isolation-evidence` empty
+and let the route report `planned` or `degraded`. Inventing an id is typing
+the control open.
+
 **Independence is also a property of the resolved models, not the roles.** Two
 reviewer roles that resolve to the same model are one reviewer with two labels.
 Under a degraded single-provider binding this is the normal case, so the router
@@ -264,6 +284,35 @@ The `uncertainties` field earns its place: a reviewer that could not evaluate
 something is giving you different information from a reviewer that evaluated it
 and found nothing, and collapsing the two loses the signal.
 
+### A seat that returns no verdict
+
+`NO_RESPONSE` is not a fourth verdict a reviewer can emit — it is the
+orchestrator's classification of a seat whose dispatch receipt ended
+`START_FAILED`, `TIMED_OUT`, `TERMINATION_UNCONFIRMED`, `INVALID_OUTPUT`, or
+`CANCELLED` (orchestrator-initiated)
+(`INVALID_OUTPUT` covers only output written *inside* the deadline with exit
+0 that is empty or fails to parse; output written after the deadline is
+never graded regardless of content, so a truncated `PASS` after a timeout
+kill is `TIMED_OUT`, not a pass and not `INVALID_OUTPUT`), or `FAILED` with
+no parseable verdict block.
+
+- A seat classified `NO_RESPONSE` did not review. The band's review is
+  incomplete; nothing that seat would have checked can be assumed checked.
+- Re-dispatch the missing seat **once**, with a fresh session id, and with
+  the finished reviewer's output kept out of the prompt. Leaking it to
+  unblock a stall is the exact isolation failure these rules exist to
+  prevent.
+- The re-dispatch consumes one `max_review_rounds` round (see
+  `control-loop.md`, "Accounting for silent seats").
+- If the seat is silent again, the band's independent review cannot be
+  completed as specified this session. Re-route with `--isolation
+  unavailable` — the router reports the `INDEPENDENCE_UNAVAILABLE` terminal
+  for independence-requiring bands and a human takes over; record
+  `review_independence: degraded` with both attempts' receipts in the
+  orchestrator's round log. One verdict is not a dual review.
+- `MEDIUM` (single reviewer): same re-dispatch rule; a second silence goes
+  to a human with whatever partial evidence exists.
+
 ## Reading verdicts
 
 **Reason about content, not the verdict token.** Models are quite capable of
@@ -288,6 +337,8 @@ Given two independent reviews R1 and R2:
 | `FAIL` | `PASS` | **Judge** |
 | `PASS_WITH_CHANGES` | `FAIL` | Judge if the `FAIL` cites `critical`/`high` severity; otherwise return for reimplementation |
 | `FAIL` | `FAIL` | Return for reimplementation — no judge needed, they agree |
+| any verdict | `NO_RESPONSE` | Not a disagreement — an incomplete review. Apply "A seat that returns no verdict"; never adjudicate a verdict against an absence |
+| `NO_RESPONSE` | `NO_RESPONSE` | A dispatch failure, not a review failure: check the transport (`bridge_down`?) before spending review rounds |
 
 ### Judge selection
 
