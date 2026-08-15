@@ -161,11 +161,32 @@ routing_metrics:
   fallbacks_applied: []
   escalation_count:
   retry_count:
-  review_count:
   routing_confidence:
-  final_success:
   rationale:            # names band + flags + fallbacks, in prose
 ```
+
+### Fields the router cannot know
+
+`review_count` and `final_success` were listed above until 2026-08-15 with
+no producer: `route_task.py` runs before any dispatch, so it can know
+neither. They belong to the **execution receipt** written per dispatched
+seat by `scripts/dispatch_agent.py`, which owns the time axis after launch:
+
+```yaml
+execution_receipt:            # one per attempt — see references/adapters.md,
+  attempt_id:                 # "Dispatch contract", for the full schema
+  result.state:  RUNNING | SUCCEEDED | FAILED | TIMED_OUT | CANCELLED |
+                 START_FAILED | TERMINATION_UNCONFIRMED | INVALID_OUTPUT
+  result.exit_status:
+  result.schema_valid:
+  result.termination_confirmed:
+```
+
+`review_count` is the number of reviewer-seat receipts with `result.state:
+SUCCEEDED` this round. `final_success` is a statement about the last
+implementation receipt *and* its review round together — only the
+orchestrator that watched both can assert it, and it lives in the
+orchestrator's summary, not in any single route or receipt.
 
 Recommended additions where the runtime exposes them: `input_tokens`,
 `output_tokens`, `latency_ms`, `estimated_cost`.

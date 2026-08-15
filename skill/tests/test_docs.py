@@ -61,3 +61,19 @@ def test_every_bridge_mechanism_carries_a_quoted_prompt_and_no_pipe():
             assert "|" not in mech, (host, name, mech)
             if "codex exec" in mech:
                 assert "-s <sandbox>" in mech, (host, name, mech)
+
+
+# ---------------------------------------------------------------------------
+# F-04 — the observability contract must not promise fields nothing produces
+# (DD-3)
+# ---------------------------------------------------------------------------
+
+def test_routing_metrics_block_promises_only_what_the_router_emits():
+    """`review_count` and `final_success` were listed under "Every route
+    emits" with no producer anywhere in route_task.py. Pre-dispatch code
+    cannot know either; they belong to the execution receipt."""
+    text = (SKILL / "references" / "control-loop.md").read_text()
+    block = re.search(r"routing_metrics:\n(.*?)```", text, re.S).group(1)
+    for field in ("final_success", "review_count"):
+        assert field not in block, field
+        assert field in text, f"{field} must stay documented — as a receipt field"
