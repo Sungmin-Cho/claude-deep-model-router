@@ -168,6 +168,49 @@ def read_receipt(receipt_dir: Path, attempt_id: str) -> dict:
     return json.loads(_receipt_path(receipt_dir, attempt_id).read_text())
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but is not ours to signal — still alive
+
+
+def _await_group_death(pgid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _group_alive(pgid):
+            return True
+        time.sleep(0.05)
+    return not _group_alive(pgid)
+
+
+def terminate_group(proc: subprocess.Popen | None, pgid: int,
+                    grace: float) -> bool:
+    """TERM -> grace -> KILL -> confirm, against the whole group.
+
+    Returns True only when the group is confirmed gone. The leader must be
+    reaped (`proc.wait`) or a zombie holds the group open and a dead tree
+    reads as alive forever.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+        if proc is not None:
+            try:
+                proc.wait(timeout=grace)
+                proc = None  # leader reaped
+            except subprocess.TimeoutExpired:
+                continue  # leader ignored the signal; escalate
+        if _await_group_death(pgid, grace):
+            return True
+    return _await_group_death(pgid, grace)
+
+
 def _validate_output(stdout_path: Path, output_schema: str) -> tuple[bool, str | None]:
     data = stdout_path.read_bytes()
     if not data.strip():
@@ -391,9 +434,7 @@ def cmd_run(args) -> int:
             # Everything from here to the terminal write is one try: a spawn
             # handle is not a result, and nothing after Popen succeeds may
             # leave the group unsupervised or the receipt stuck non-terminal
-            # (below, `except Exception`). Once Task 9 adds `terminate_group`
-            # this handler calls it; until then this branch is unreachable
-            # from any test in this task.
+            # (below, `except Exception`).
             try:
                 receipt["process"] = {"pid": proc.pid, "process_group_id": pgid,
                                       "supervisor_pid": os.getpid()}
@@ -402,15 +443,35 @@ def cmd_run(args) -> int:
                 receipt["result"]["state"] = "RUNNING"
                 write_receipt(receipt_dir, receipt)
 
-                exit_status = proc.wait()
-                receipt["result"]["exit_status"] = exit_status
-                if exit_status != 0:
-                    receipt["result"]["state"] = "FAILED"
+                try:
+                    # Consume the REMAINING budget against the one monotonic
+                    # anchor stamped before spawn (deadline_monotonic, Task 8)
+                    # — not args.deadline_seconds again. Waiting the full
+                    # duration a second time here would let the leader run
+                    # past its own recorded deadline_at before TimeoutExpired
+                    # ever fires; with the remaining-budget expression,
+                    # TimeoutExpired now fires at the absolute deadline
+                    # instant, not deadline_seconds after this wait started.
+                    remaining = max(0.0, deadline_monotonic - time.monotonic())
+                    exit_status = proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    # Past the deadline nothing the attempt writes can matter:
+                    # the state is decided by termination alone, and a late
+                    # verdict on disk is deliberately never graded.
+                    confirmed = terminate_group(proc, pgid, args.grace_seconds)
+                    receipt["result"]["termination_confirmed"] = confirmed
+                    receipt["result"]["state"] = (
+                        "TIMED_OUT" if confirmed else "TERMINATION_UNCONFIRMED")
                 else:
-                    ok, digest = _validate_output(stdout_path, args.output_schema)
-                    receipt["result"]["output_sha256"] = digest
-                    receipt["result"]["schema_valid"] = ok
-                    receipt["result"]["state"] = "SUCCEEDED" if ok else "INVALID_OUTPUT"
+                    receipt["result"]["exit_status"] = exit_status
+                    if exit_status != 0:
+                        receipt["result"]["state"] = "FAILED"
+                    else:
+                        ok, digest = _validate_output(stdout_path, args.output_schema)
+                        receipt["result"]["output_sha256"] = digest
+                        receipt["result"]["schema_valid"] = ok
+                        receipt["result"]["state"] = (
+                            "SUCCEEDED" if ok else "INVALID_OUTPUT")
 
                 receipt["timing"]["finished_at"] = _utcnow()
                 # DEFER-2: terminal persistence is best-effort. OSError here

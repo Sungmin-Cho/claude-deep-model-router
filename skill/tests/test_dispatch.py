@@ -40,6 +40,27 @@ SILENT_OK = """
 pass
 """
 
+SLEEPER = """
+import time
+time.sleep(60)
+"""
+
+TERM_IGNORER = """
+import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(60)
+"""
+
+LATE_WRITER = """
+import signal, sys, time
+def bail(*_):
+    print("verdict: PASS")
+    sys.stdout.flush()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, bail)
+time.sleep(60)
+"""
+
 
 def write_fake(tmp_path: Path, name: str, body: str) -> Path:
     path = tmp_path / name
@@ -304,3 +325,72 @@ def test_terminal_receipt_write_failure_is_best_effort_and_observable(
     assert leftovers == []
     assert not (receipt_dir / "t1.claim").exists()
     assert rc == 0
+
+
+def test_deadline_expiry_is_timed_out_and_confirmed(tmp_path):
+    """Without a deadline the supervisor inherits the research docs' core
+    finding: an unresponsive model waits forever. The harness timeout is the
+    RED phase here — an unimplemented deadline hangs this test."""
+    fake = write_fake(tmp_path, "sleeper.py", SLEEPER)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 deadline=1.0, grace=1.0, harness_timeout=30)
+    assert proc.returncode == 3
+    assert receipt["result"]["state"] == "TIMED_OUT"
+    assert receipt["result"]["termination_confirmed"] is True
+    assert receipt["timing"]["finished_at"]
+
+
+def test_term_ignorer_is_killed_and_still_timed_out(tmp_path):
+    fake = write_fake(tmp_path, "stubborn.py", TERM_IGNORER)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 deadline=1.0, grace=0.5, harness_timeout=30)
+    assert proc.returncode == 3
+    assert receipt["result"]["state"] == "TIMED_OUT"
+    assert receipt["result"]["termination_confirmed"] is True
+
+
+def test_a_verdict_written_after_the_deadline_stays_timed_out(tmp_path):
+    """The invariant from DD-9: once the deadline fired, no output can
+    produce SUCCEEDED. A partial dump after the kill is not a review."""
+    fake = write_fake(tmp_path, "late.py", LATE_WRITER)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 deadline=1.0, grace=2.0, harness_timeout=30)
+    assert proc.returncode == 3
+    assert receipt["result"]["state"] == "TIMED_OUT"
+    assert receipt["result"]["schema_valid"] is None
+    # the late output exists on disk — and was still not graded
+    assert "verdict: PASS" in Path(receipt["result"]["stdout_path"]).read_text()
+
+
+def test_a_post_spawn_crash_still_confirms_termination_and_writes_a_terminal_receipt(
+        tmp_path, monkeypatch):
+    """Task 8's `cmd_run` wraps everything after Popen succeeds in
+    try/except Exception precisely so a crash there cannot abandon a live
+    process group behind a receipt stuck at RUNNING. This is the one
+    in-process test in this file: it needs to monkeypatch a name inside the
+    module before calling `main()`, which the subprocess-driven harness the
+    rest of this file uses cannot do."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dispatch_agent", SCRIPT)
+    dispatch_agent = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dispatch_agent)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dispatch_agent, "_validate_output", _boom)
+    fake = write_fake(tmp_path, "happy.py", HAPPY)
+    receipt_dir = tmp_path / "receipts"
+    rc = dispatch_agent.main([
+        "run", "--attempt-id", "crash1", "--receipt-dir", str(receipt_dir),
+        "--deadline-seconds", "30", "--grace-seconds", "1",
+        "--seat", "worker", "--output-schema", "review",
+        "--", sys.executable, str(fake)])
+    assert rc == 9
+    receipt = json.loads((receipt_dir / "crash1.json").read_text())
+    assert receipt["result"]["state"] == "CANCELLED"
+    assert receipt["result"]["termination_confirmed"] is True
+    assert receipt["timing"]["finished_at"]
+    pgid = receipt["process"]["process_group_id"]
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)
