@@ -27,8 +27,12 @@ Usage:
                   --flags auth_sensitive,unknown_root_cause
 
 Exit status: 0 dispatchable as written; 1 terminal (no route to execute);
-2 invalid input; 3 executable only after a human confirms. 3 exists because a
-gate a caller cannot act on from a shell is not a gate.
+2 invalid input; 3 executable only after a human confirms; 4 dispatchable
+with a human confirmation owed after the fix ships (production hotfix);
+5 internal error — a crash, never a route outcome. 3 exists because a gate a
+caller cannot act on from a shell is not a gate; 5 exists because a crash
+that borrows 1 or 2 reports a terminal state or an input error that never
+happened.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
@@ -145,6 +150,13 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
             return yaml.safe_load(f)
     except OSError as exc:
         raise ConfigError(f"cannot read policy config at {path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        # Same shape as the OSError arm, and for the same reason the eager
+        # `human_gate_exit_status` validation exists: an uncontained raise
+        # lands on the interpreter's exit 1, which the contract reserves for
+        # "terminal (no route to execute)".
+        raise ConfigError(
+            f"policy config at {path} is not valid YAML: {exc}") from exc
 
 
 # --------------------------------------------------------------------------
@@ -2050,6 +2062,10 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 — a crash must not borrow 1 or 2
+        traceback.print_exc()
+        print(f"internal error before routing: {exc}", file=sys.stderr)
+        return 5
 
     p = build_parser(policy)
     args = p.parse_args(argv)
@@ -2086,32 +2102,36 @@ def main(argv: list[str] | None = None) -> int:
                 isolation_evidence=_split(args.isolation_evidence),
             )
         result = route(task)
+
+        if args.format == "json":
+            print(json.dumps(result, indent=2))
+        else:
+            _print_text(result)
+        # Exit status is the only part of this contract a shell can act on. A
+        # route that needs a human but exits 0 is a gate that any caller treating
+        # success as authorisation walks straight through — which is the shape
+        # this module rejects everywhere else ("disclosure is not a control"). So
+        # every human-gated outcome is nonzero, terminal or not. 1 is terminal;
+        # 3 is executable-after-approval, distinct so a caller can tell them apart.
+        if result["terminal"]:
+            return 1
+        if result["requires_human_confirmation"]:
+            return policy.human_gate_exit_status
+        # 4: run it, then get the confirmation. A shell that treats 0 as "nothing
+        # further is required" would drop the obligation, and an obligation nobody
+        # can read from the exit status is the disclosure-instead-of-control shape
+        # this module rejects everywhere else.
+        return 4 if result["human_confirmation_deferred"] else 0
     except ValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
-
-    if args.format == "json":
-        print(json.dumps(result, indent=2))
-    else:
-        _print_text(result)
-    # Exit status is the only part of this contract a shell can act on. A
-    # route that needs a human but exits 0 is a gate that any caller treating
-    # success as authorisation walks straight through — which is the shape
-    # this module rejects everywhere else ("disclosure is not a control"). So
-    # every human-gated outcome is nonzero, terminal or not. 1 is terminal;
-    # 3 is executable-after-approval, distinct so a caller can tell them apart.
-    if result["terminal"]:
-        return 1
-    if result["requires_human_confirmation"]:
-        return policy.human_gate_exit_status
-    # 4: run it, then get the confirmation. A shell that treats 0 as "nothing
-    # further is required" would drop the obligation, and an obligation nobody
-    # can read from the exit status is the disclosure-instead-of-control shape
-    # this module rejects everywhere else.
-    return 4 if result["human_confirmation_deferred"] else 0
+    except Exception as exc:  # noqa: BLE001 — a crash must not borrow 1 or 2
+        traceback.print_exc()
+        print(f"internal error: {exc}", file=sys.stderr)
+        return 5
 
 
 def _print_text(r: dict) -> None:

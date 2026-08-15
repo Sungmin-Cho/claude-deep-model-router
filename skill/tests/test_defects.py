@@ -2359,3 +2359,73 @@ def test_d23_the_same_role_writes_one_ceiling_row():
     assert len(senior) == 1, f"expected one senior_engineer row: {senior}"
     assert senior[0]["floor_broken"] == "review.CRITICAL.effort"
     assert senior[0]["floor_requires"] == "MAX"
+
+
+# ---------------------------------------------------------------------------
+# D24/D25 — a crash must not borrow a contracted exit status
+# (docs/design/2026-08-15-dispatch-layer-design.md, DD-2)
+# ---------------------------------------------------------------------------
+
+def test_d24_yaml_parse_error_is_a_config_error_not_a_crash(tmp_path):
+    """A config that exists but does not parse must exit 2 with an actionable
+    message — not escape as a traceback on the interpreter's exit 1, which
+    the contract reserves for "terminal (no route to execute)"."""
+    import shutil
+    clone = tmp_path / "skill"
+    shutil.copytree(SKILL, clone, ignore=shutil.ignore_patterns(
+        "__pycache__", ".pytest_cache", "tests"))
+    (clone / "config" / "model-routing.yaml").write_text(
+        "bands: [\n  broken: yaml: : :\n")
+    proc = subprocess.run(
+        [sys.executable, str(clone / "scripts" / "route_task.py"),
+         "--class", "MECHANICAL", "--complexity", "0", "--uncertainty", "0",
+         "--blast-radius", "0", "--reversibility", "0", "--format", "json"],
+        capture_output=True, text=True)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    assert "not valid YAML" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_d24_an_unexpected_crash_exits_5_not_a_route_outcome(monkeypatch):
+    """1 means "terminal", 2 means "invalid input". A crash is neither, so it
+    must have its own status — a wrapper branching on the exit code must
+    never be told a story about the route that did not happen."""
+    import route_task
+    def boom(task, cfg=None):
+        raise RuntimeError("synthetic crash")
+    monkeypatch.setattr(route_task, "route", boom)
+    rc = route_task.main(["--class", "MECHANICAL", "--complexity", "0",
+                          "--uncertainty", "0", "--blast-radius", "0",
+                          "--reversibility", "0"])
+    assert rc == 5
+
+
+def test_d25_help_states_every_exit_the_cli_can_return():
+    """main() returns 4 (deferred confirmation) and now 5 (crash); --help is
+    built from the module docstring, so the docstring must state both."""
+    proc = cli("--help")
+    flat = proc.stdout.replace("\n", " ")
+    for token in ("0 dispatchable", "1 terminal", "2 invalid",
+                  "3 executable only after", "4 dispatchable", "5 internal"):
+        assert token in flat, token
+
+
+def test_d24_a_post_route_crash_also_exits_5(monkeypatch):
+    """The guard must cover the whole post-parse body, not just the
+    route(task) call — a crash while turning a route into output
+    (serialization, text formatting, the exit-status mapping) is still a
+    crash, not a route outcome, and must not escape as the interpreter's
+    exit 1 either."""
+    import route_task
+
+    class Unserializable:
+        pass
+
+    def route_returns_bad_json(task, cfg=None):
+        return {"unserializable": Unserializable()}
+
+    monkeypatch.setattr(route_task, "route", route_returns_bad_json)
+    rc = route_task.main(["--class", "MECHANICAL", "--complexity", "0",
+                          "--uncertainty", "0", "--blast-radius", "0",
+                          "--reversibility", "0", "--format", "json"])
+    assert rc == 5
