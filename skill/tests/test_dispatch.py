@@ -394,3 +394,95 @@ def test_a_post_spawn_crash_still_confirms_termination_and_writes_a_terminal_rec
     pgid = receipt["process"]["process_group_id"]
     with pytest.raises(ProcessLookupError):
         os.killpg(pgid, 0)
+
+
+GRANDCHILD_SPAWNER_TIMEOUT = """
+import subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+time.sleep(60)
+"""
+
+ORPHAN_LEAVER = """
+import subprocess, sys
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+print("verdict: PASS")
+"""
+
+FLOODER = """
+import sys
+chunk = "x" * 65536
+for _ in range(160):          # ~10 MB — enough to jam any pipe buffer
+    sys.stdout.write(chunk)
+sys.stdout.write("\\nverdict: PASS\\n")
+"""
+
+
+def _group_is_dead(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+
+
+def test_timeout_kills_the_grandchild_too(tmp_path):
+    """F-02: killing only the leader leaves a live writer behind — the
+    duplicate-writer scenario. The whole group must be confirmed dead."""
+    fake = write_fake(tmp_path, "spawner.py", GRANDCHILD_SPAWNER_TIMEOUT)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 deadline=1.0, grace=2.0, harness_timeout=30)
+    assert receipt["result"]["state"] == "TIMED_OUT"
+    assert receipt["result"]["termination_confirmed"] is True
+    assert _group_is_dead(receipt["process"]["process_group_id"])
+
+
+def test_a_clean_exit_that_leaves_an_orphan_is_cleaned_and_confirmed(tmp_path):
+    """The leader exiting 0 is not the end of the attempt: an orphaned
+    grandchild is still our dispatch. It is reaped before the result is
+    called a result."""
+    fake = write_fake(tmp_path, "orphan.py", ORPHAN_LEAVER)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 grace=2.0, harness_timeout=30)
+    assert receipt["result"]["state"] == "SUCCEEDED"
+    assert receipt["result"]["termination_confirmed"] is True
+    assert _group_is_dead(receipt["process"]["process_group_id"])
+
+
+def test_a_flooding_child_cannot_deadlock_the_supervisor(tmp_path):
+    """stdout goes to a file, not a pipe — 10 MB must complete, not jam."""
+    fake = write_fake(tmp_path, "flooder.py", FLOODER)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 deadline=30.0, harness_timeout=60)
+    assert receipt["result"]["state"] == "SUCCEEDED"
+    assert Path(receipt["result"]["stdout_path"]).stat().st_size > 10_000_000
+
+
+GRANDCHILD_TERM_IGNORER_QUICK_LEADER = """
+import subprocess, sys, time
+subprocess.Popen([sys.executable, "-c",
+    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
+time.sleep(0.3)
+print("verdict: PASS")
+"""
+
+
+def test_grading_is_gated_on_the_deadline_even_after_the_leader_exits_0(tmp_path):
+    """DD-9's invariant ("no output can produce SUCCEEDED once the deadline
+    has expired") is about the moment GRADING happens, not merely the
+    moment the leader exited. Here the leader exits 0 well inside the
+    deadline, but its TERM-ignoring grandchild forces the normal-exit
+    branch's group-confirmation cleanup to run past the deadline before
+    grading is ever reached. The gate sits between confirmation and
+    grading: past the deadline, the state is TIMED_OUT regardless of the
+    leader's exit status, exit_status is still recorded, and schema_valid
+    stays null — a post-deadline result is never graded."""
+    fake = write_fake(tmp_path, "quick_leader_stuck_grandchild.py",
+                      GRANDCHILD_TERM_IGNORER_QUICK_LEADER)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 deadline=0.5, grace=1.0, harness_timeout=30)
+    assert proc.returncode == 3
+    assert receipt["result"]["state"] == "TIMED_OUT"
+    assert receipt["result"]["exit_status"] == 0
+    assert receipt["result"]["schema_valid"] is None
+    assert receipt["result"]["termination_confirmed"] is True
+

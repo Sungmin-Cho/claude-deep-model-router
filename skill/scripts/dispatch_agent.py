@@ -463,8 +463,41 @@ def cmd_run(args) -> int:
                     receipt["result"]["state"] = (
                         "TIMED_OUT" if confirmed else "TERMINATION_UNCONFIRMED")
                 else:
+                    # The leader exited — but grandchildren may linger, and a
+                    # lingering writer is the duplicate-writer hazard (F-02).
+                    # Clean the group up and confirm before grading anything.
+                    # Bound this confirmation wait by whatever deadline budget
+                    # remains too, via min(args.grace_seconds, remaining) —
+                    # grace is time to let a normal exit's stragglers finish
+                    # dying, never free extra time before grading, so it must
+                    # not let a normal exit outrun deadline_at. Grace keeps its
+                    # full, un-shortened value only inside terminate_group's own
+                    # TERM->grace->KILL escalation ladder below (that ladder
+                    # already runs only once termination is being forced, past
+                    # the point where "on time" still means anything).
+                    remaining = max(0.0, deadline_monotonic - time.monotonic())
+                    normal_exit_grace = min(args.grace_seconds, remaining)
+                    confirmed = (_await_group_death(pgid, normal_exit_grace)
+                                 or terminate_group(None, pgid, args.grace_seconds))
+                    receipt["result"]["termination_confirmed"] = confirmed
                     receipt["result"]["exit_status"] = exit_status
-                    if exit_status != 0:
+                    if not confirmed:
+                        receipt["result"]["state"] = "TERMINATION_UNCONFIRMED"
+                    elif time.monotonic() > deadline_monotonic:
+                        # Group confirmation itself can consume time —
+                        # normal_exit_grace above, or the escalation ladder in
+                        # terminate_group() when a grandchild lingers — and that
+                        # wait can run past deadline_monotonic even though the
+                        # leader exited 0 well before it. DD-9's invariant ("no
+                        # output can produce SUCCEEDED once the deadline has
+                        # expired") is about when GRADING happens, not just when
+                        # the leader exited, so this re-check sits immediately
+                        # before grading, not only in the TimeoutExpired branch
+                        # above. exit_status is already recorded either way;
+                        # schema_valid stays null — a post-deadline result is
+                        # never graded, regardless of the leader's exit status.
+                        receipt["result"]["state"] = "TIMED_OUT"
+                    elif exit_status != 0:
                         receipt["result"]["state"] = "FAILED"
                     else:
                         ok, digest = _validate_output(stdout_path, args.output_schema)
