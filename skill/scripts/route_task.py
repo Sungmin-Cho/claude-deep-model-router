@@ -1211,11 +1211,13 @@ def independence(review: dict, task: Task) -> str:
     if task.isolation_available is False:
         return "unavailable"
     distinct = len({e.strip() for e in task.isolation_evidence if e.strip()})
-    # One identifier per reviewer — no more, and no hidden extra minimum. The
-    # old `and distinct >= 2` made a single-reviewer MEDIUM band unable to
-    # reach `enforced` even when the caller did exactly what both documents
-    # instruct, with no note explaining the refusal.
-    if review["reviewers"] and distinct >= len(review["reviewers"]):
+    # One identifier per reviewer — exactly. `>=` accepted surplus ids, so a
+    # stale or foreign identifier could ride along and still flip the
+    # strongest reported state; a count mismatch in either direction is not
+    # evidence about THIS route's reviewers. The old `and distinct >= 2`
+    # failure — a single-reviewer MEDIUM band unable to reach `enforced` —
+    # stays fixed: one reviewer, one id, equality holds.
+    if review["reviewers"] and distinct == len(review["reviewers"]):
         return "enforced"
     if task.isolation_available is True:
         return "planned"
@@ -1604,6 +1606,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     confidence = routing_confidence(task, fallbacks)
 
     review_independence = independence(review, task)
+    supplied = len({e.strip() for e in task.isolation_evidence if e.strip()})
+    if supplied and review["independent"] and supplied != len(review["reviewers"]):
+        # The caller typed evidence and it was NOT counted — say so, or the
+        # refusal is invisible and the next caller pads the list further.
+        effort_notes.append(
+            f"isolation evidence not counted: {supplied} id(s) for "
+            f"{len(review['reviewers'])} reviewer seat(s); independence stays "
+            f"{review_independence!r}")
     judge = judge_role
 
     band_requires_independence = bool(

@@ -2429,3 +2429,29 @@ def test_d24_a_post_route_crash_also_exits_5(monkeypatch):
                           "--uncertainty", "0", "--blast-radius", "0",
                           "--reversibility", "0", "--format", "json"])
     assert rc == 5
+
+
+# ---------------------------------------------------------------------------
+# D26 — surplus isolation evidence must not count (DD-7)
+# ---------------------------------------------------------------------------
+
+def test_d26_surplus_evidence_is_not_enforced():
+    """`>=` accepted stale, foreign, or extra ids as proof, so over-supplying
+    evidence could flip the strongest reported state. A count mismatch in
+    either direction is not evidence about THIS route's reviewers."""
+    out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
+            isolation_available=True,
+            isolation_evidence=["s1", "s2", "stale-from-another-route"])
+    assert out["review"]["review_independence"] == "planned"
+    assert any("isolation evidence not counted" in n for n in out["notes"]), \
+        out["notes"]
+
+
+def test_d26_exact_evidence_still_reaches_enforced():
+    """Regression guard: the fix must not resurrect the old `>= 2` failure —
+    one reviewer, one id, equality holds."""
+    out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=2, blast_radius=2,
+            isolation_available=True,
+            isolation_evidence=["session-a1b2", "session-c3d4"])
+    assert out["review"]["review_independence"] == "enforced"
+    assert not any("isolation evidence not counted" in n for n in out["notes"])
