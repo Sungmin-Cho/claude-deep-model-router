@@ -97,3 +97,25 @@ def test_review_policy_defines_the_absent_reviewer():
     # and the evidence-id source is stated
     assert "### Where the evidence id comes from" in text
     assert "attempt_id" in text
+
+
+# ---------------------------------------------------------------------------
+# DD-6 — dispatch failure must be an escalation trigger with decided
+# accounting
+# ---------------------------------------------------------------------------
+
+def test_control_loop_escalates_on_silent_seats_and_decides_the_accounting():
+    text = (SKILL / "references" / "control-loop.md").read_text()
+    assert re.search(r"^13\.\s", text, re.M), "trigger 13 missing"
+    assert "FAILED` with no parseable verdict block" in text, \
+        "trigger 13 must name the same NO_RESPONSE members DD-5/Task 6 do, " \
+        "except CANCELLED (deliberately excluded — see the CANCELLED " \
+        "accounting clause below)"
+    assert "### Accounting for silent seats" in text
+    # the two decisions are stated, not left open
+    assert "consumes one `max_review_rounds` round" in text
+    assert "termination_confirmed: true" in text
+    assert "--flags termination_unconfirmed" in text
+    # CANCELLED joins the NO_RESPONSE/accounting vocabulary without becoming
+    # an escalation trigger of its own
+    assert "CANCELLED` never enters the ladder" in text
