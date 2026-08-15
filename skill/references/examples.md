@@ -6,6 +6,15 @@ model ids in the pasted stdout (and in any command that had to name one),
 because concrete identifiers live in the registry and nowhere else; resolve
 them there.
 
+`SKILL_DIR` is the skill's base directory (the directory containing
+`SKILL.md`); commands below are written against it. Assign it once before
+the first command below, substituting the real absolute path announced when
+the skill loaded:
+
+```bash
+SKILL_DIR=<skill-base-directory announced when the skill loads>
+```
+
 If you change the policy and these stop matching, the examples are wrong, not
 the policy. Regenerate rather than edit by hand.
 
@@ -30,7 +39,7 @@ the policy. Regenerate rather than edit by hand.
 **Task:** rename a symbol across 12 files. `c0 u0 b0 r0`
 
 ```
-python3 scripts/route_task.py --class MECHANICAL \
+python3 "$SKILL_DIR"/scripts/route_task.py --class MECHANICAL \
     --complexity 0 --uncertainty 0 --blast-radius 0 --reversibility 0
 ```
 
@@ -68,7 +77,7 @@ independence, so there is nothing to fail to enforce.
 `auth_sensitive`
 
 ```
-python3 scripts/route_task.py --class IMPLEMENTATION \
+python3 "$SKILL_DIR"/scripts/route_task.py --class IMPLEMENTATION \
     --complexity 1 --uncertainty 0 --blast-radius 1 --reversibility 0 \
     --flags auth_sensitive
 ```
@@ -121,7 +130,7 @@ requested and effective effort stay equal.
 `c2 u2 b1 r0`, `auth_sensitive`, `unknown_root_cause`
 
 ```
-python3 scripts/route_task.py --class DEBUGGING \
+python3 "$SKILL_DIR"/scripts/route_task.py --class DEBUGGING \
     --complexity 2 --uncertainty 2 --blast-radius 1 --reversibility 0 \
     --flags auth_sensitive,unknown_root_cause
 ```
@@ -181,7 +190,7 @@ half a control, which is worse than none because it looks whole.
 `financial_sensitive`
 
 ```
-python3 scripts/route_task.py --class ARCHITECTURE \
+python3 "$SKILL_DIR"/scripts/route_task.py --class ARCHITECTURE \
     --complexity 3 --uncertainty 3 --blast-radius 3 --reversibility 2 \
     --flags financial_sensitive
 ```
@@ -234,7 +243,7 @@ Ran once per task class. Every class emitted `risk_score: 10` / `risk_band:
 HIGH`. Representative output (`MECHANICAL`):
 
 ```
-python3 scripts/route_task.py --class MECHANICAL \
+python3 "$SKILL_DIR"/scripts/route_task.py --class MECHANICAL \
     --complexity 2 --uncertainty 2 --blast-radius 2 --reversibility 0
 ```
 
@@ -282,7 +291,7 @@ that lands on the boundary goes wrong.
 `c2 u2 b2 r0`, `reasoning_centric=true`
 
 ```
-python3 scripts/route_task.py --class INVESTIGATION \
+python3 "$SKILL_DIR"/scripts/route_task.py --class INVESTIGATION \
     --complexity 2 --uncertainty 2 --blast-radius 2 --reversibility 0 \
     --reasoning-centric
 ```
@@ -326,7 +335,7 @@ resolved to did not need replacing.
 `data_integrity_sensitive`
 
 ```
-python3 scripts/route_task.py --class MIGRATION \
+python3 "$SKILL_DIR"/scripts/route_task.py --class MIGRATION \
     --complexity 3 --uncertainty 2 --blast-radius 3 --reversibility 3 \
     --flags migration,data_integrity_sensitive
 ```
@@ -378,7 +387,7 @@ implementer already holds the architect seat.
 lives in the config):
 
 ```
-python3 scripts/route_task.py --class IMPLEMENTATION \
+python3 "$SKILL_DIR"/scripts/route_task.py --class IMPLEMENTATION \
     --complexity 1 --uncertainty 1 --blast-radius 1 --reversibility 0 \
     --prior-failures 1 --prior-models <openai_worker_fast id>
 ```
@@ -414,7 +423,7 @@ escalation is now `xai_frontier`.
 `RETRY_HISTORY_REQUIRED`:
 
 ```
-python3 scripts/route_task.py --class IMPLEMENTATION \
+python3 "$SKILL_DIR"/scripts/route_task.py --class IMPLEMENTATION \
     --complexity 1 --uncertainty 1 --blast-radius 1 --reversibility 0 \
     --prior-failures 1
 ```
@@ -453,7 +462,7 @@ unavailable. `c2 u1 b2 r1`, `security_sensitive`,
 `--unavailable reasoning_specialist`
 
 ```
-python3 scripts/route_task.py --class IMPLEMENTATION \
+python3 "$SKILL_DIR"/scripts/route_task.py --class IMPLEMENTATION \
     --complexity 2 --uncertainty 1 --blast-radius 2 --reversibility 1 \
     --flags security_sensitive --unavailable reasoning_specialist
 ```
@@ -505,7 +514,7 @@ metric can be in.
 **Task:** anything, after four failed attempts. `prior_failures=4`
 
 ```
-python3 scripts/route_task.py --class IMPLEMENTATION \
+python3 "$SKILL_DIR"/scripts/route_task.py --class IMPLEMENTATION \
     --complexity 1 --uncertainty 1 --blast-radius 1 --reversibility 1 \
     --prior-failures 4 \
     --prior-models <openai_worker_fast id>,<openai_worker_fast id>,<openai_worker_fast id>,<openai_worker_fast id>

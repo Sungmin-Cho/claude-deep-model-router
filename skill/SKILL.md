@@ -105,8 +105,19 @@ recovers more gracefully from a wrong guess.
 Hand your classification to the scorer. It is deterministic, so the band, the
 overrides, and the review policy come out the same every time:
 
+`SKILL_DIR` below is this skill's base directory — the path announced when
+the skill loads, i.e. the directory containing this file. Every command in
+this file and in `references/examples.md` is written against it, because a
+subagent's working directory is the project root, not the skill root. Assign
+it once before the first command below, substituting the real absolute path
+announced when the skill loaded:
+
 ```bash
-python3 scripts/route_task.py --class DEBUGGING \
+SKILL_DIR=<skill-base-directory announced when the skill loads>
+```
+
+```bash
+python3 "$SKILL_DIR"/scripts/route_task.py --class DEBUGGING \
     --complexity 2 --uncertainty 3 --blast-radius 2 --reversibility 1 \
     --flags auth_sensitive,unknown_root_cause
 ```
