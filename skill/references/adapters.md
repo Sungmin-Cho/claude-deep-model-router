@@ -146,6 +146,28 @@ Verification is per direction, not a blanket "the bridges work":
 - Codex → xai, grok → claude, grok → openai — assumed (same mechanisms, the
   hosted direction was not probed)
 
+**Passing the prompt.** A reviewer's prompt contains the diff, and diffs
+contain quotes, backticks, `$`, and newlines. Build argv programmatically —
+never interpolate a prompt into a shell string. Prefer file delivery: write
+the prompt to a file and feed it to the child's stdin (`codex exec` reads
+the instruction from stdin when the prompt argument is `-`;
+`scripts/dispatch_agent.py --prompt-file` does this for any transport). A
+CLI that only takes a positional prompt gets it as a single argv element.
+
+**Pin a non-interactive permission mode before a background launch.** A
+background bridge has no TTY, so an approval prompt is a hang that looks
+exactly like a slow model. Decide the mode up front, pass it explicitly
+(`--permission-mode` / `-s <sandbox>` / the grok approval flags), and record
+it in the dispatch receipt. The far side of a bridge keeps its own
+sandbox/approval config — verify the effective mode at preflight.
+
+**Fences mirror the YAML.** Every command fence in this section is Layer B's
+prose rendering of the matching `transports` mechanism in
+`config/model-routing.yaml` — the same argv shape, token-for-token (modulo
+line wrapping for readability); a `codex exec` fence carries `-s <sandbox>`
+and `--skip-git-repo-check` wherever the YAML mechanism does, and a mismatch
+between the two is a bug, not an intentional variant.
+
 ### Claude Code
 
 **Native:** the `Agent` tool. Context isolation is the enforcement boundary for
@@ -154,12 +176,14 @@ independent review.
 **To openai models:**
 
 ```bash
-codex exec -m <model-id> \
+codex exec -m <id> \
     -c model_reasoning_effort=<effort> \
-    -s read-only|workspace-write \
+    -s <sandbox> \
     --skip-git-repo-check \
     "<prompt>"
 ```
+
+`<sandbox>` is `read-only` or `workspace-write`.
 
 Runs as a separate process with a fresh session — isolation holds by
 construction.
@@ -167,10 +191,13 @@ construction.
 **To xai models:**
 
 ```bash
-grok --no-auto-update -p <prompt> -m <id> \
-    --effort <low|medium|high|xhigh> \
+grok --no-auto-update -p "<prompt>" -m <id> \
+    --effort <native-effort> \
     --output-format plain -s <fresh-uuid>
 ```
+
+`<native-effort>` is one of `low`, `medium`, `high`, `xhigh` — the family's
+native token from the effort map above, never the conceptual level.
 
 Also a separate process with a fresh session.
 
@@ -184,7 +211,7 @@ run both reviewers as separate `codex exec` processes.
 **To claude models:**
 
 ```bash
-claude -p --model <model-id> \
+claude -p --model <id> \
     --effort <effort> \
     --permission-mode <mode> \
     "<prompt>"
@@ -208,7 +235,11 @@ host; the flag itself is verified.
 **To openai models:**
 
 ```bash
-codex exec -m <id> -c model_reasoning_effort=<effort>
+codex exec -m <id> \
+    -c model_reasoning_effort=<effort> \
+    -s <sandbox> \
+    --skip-git-repo-check \
+    "<prompt>"
 ```
 
 Assumed from this host; the same mechanism is verified from Claude Code.

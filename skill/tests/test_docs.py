@@ -37,3 +37,27 @@ def test_docs_never_invoke_the_router_cwd_relative():
         assert not re.search(r"python3 scripts/route_task\.py", text), doc.name
         assert '"$SKILL_DIR"/scripts/route_task.py' in text, doc.name
         assert re.search(r"^SKILL_DIR=", text, re.MULTILINE), doc.name
+
+
+# ---------------------------------------------------------------------------
+# F-06 / T2 — every bridge template must carry a quoted prompt, no shell
+# hazards (DD-4)
+# ---------------------------------------------------------------------------
+
+def test_every_bridge_mechanism_carries_a_quoted_prompt_and_no_pipe():
+    """`codex exec` with no prompt argument waits on stdin — a background
+    shell with stdin open never reaches the model, and to the caller that is
+    indistinguishable from an unresponsive model. An unquoted <prompt>
+    word-splits, and a literal alternation inside a template is a shell pipe
+    when pasted. Every `codex exec` mechanism must also carry a sandbox
+    slot — DD-4's permission-pinning rule applies to all three hosts that
+    bridge into openai, not just the ones written first."""
+    for host, entries in CFG["transports"].items():
+        for name, spec in entries.items():
+            if name == "native":
+                continue
+            mech = spec["mechanism"]
+            assert '"<prompt>"' in mech, (host, name, mech)
+            assert "|" not in mech, (host, name, mech)
+            if "codex exec" in mech:
+                assert "-s <sandbox>" in mech, (host, name, mech)

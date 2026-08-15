@@ -543,31 +543,31 @@ transports:
   claude_code:
     native: { mechanism: agent_tool_subagent, isolation: context_isolation }
     to_openai:
-      mechanism: "codex exec -m <id> -c model_reasoning_effort=<effort> -s <sandbox>"
+      mechanism: "codex exec -m <id> -c model_reasoning_effort=<effort> -s <sandbox> --skip-git-repo-check \"<prompt>\""
       isolation: separate_process
       verified: true
     to_xai:
-      mechanism: "grok --no-auto-update -p <prompt> -m <id> --effort <low|medium|high|xhigh> --output-format plain -s <fresh-uuid>"
+      mechanism: "grok --no-auto-update -p \"<prompt>\" -m <id> --effort <native-effort> --output-format plain -s <fresh-uuid>"
       isolation: separate_process
       verified: true
   codex:
     native: { mechanism: multi_agent_subagent, isolation: unverified }
     to_claude:
-      mechanism: "claude -p --model <id> --effort <effort> --permission-mode <mode>"
+      mechanism: "claude -p --model <id> --effort <effort> --permission-mode <mode> \"<prompt>\""
       isolation: separate_process
       verified: true
     to_xai:
-      mechanism: "grok --no-auto-update -p <prompt> -m <id> --effort <low|medium|high|xhigh> --output-format plain -s <fresh-uuid>"
+      mechanism: "grok --no-auto-update -p \"<prompt>\" -m <id> --effort <native-effort> --output-format plain -s <fresh-uuid>"
       isolation: separate_process
       verified: false
   grok:
     native: { mechanism: subagent, isolation: unverified }
     to_claude:
-      mechanism: "claude -p --model <id> --effort <effort> --permission-mode <mode>"
+      mechanism: "claude -p --model <id> --effort <effort> --permission-mode <mode> \"<prompt>\""
       isolation: separate_process
       verified: false
     to_openai:
-      mechanism: "codex exec -m <id> -c model_reasoning_effort=<effort>"
+      mechanism: "codex exec -m <id> -c model_reasoning_effort=<effort> -s <sandbox> --skip-git-repo-check \"<prompt>\""
       isolation: separate_process
       verified: false
 
