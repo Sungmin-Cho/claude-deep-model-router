@@ -97,6 +97,7 @@ flags:
   # route were different things.
   operational:
     - bridge_down             # the cross-provider transport is unreachable
+    - termination_unconfirmed # a prior write-capable attempt may still be alive
 
 # Flags whose effect is real but only in combination with another flag. Listed
 # explicitly so the "no inert elevating flag" test can tell a deliberate
@@ -353,6 +354,10 @@ human_in_the_loop:
   # fact as `review_depth_reduced` — the review does not run at the depth the
   # band asked for — so a hotfix does not defer it either.
   on_effort_below_floor:        require_human_confirmation
+  # A timed-out writer whose process tree could not be confirmed dead may
+  # still be writing. Retrying behind it risks two concurrent writers on the
+  # same files, so the route holds until a human confirms the workspace.
+  on_termination_unconfirmed:  require_human_confirmation
   human_gate_exit_status:       3
   # `on_routing_confidence_below` used to sit here holding 0.60 — the same
   # number as `router.confidence.escalate_below`, which is the one the router

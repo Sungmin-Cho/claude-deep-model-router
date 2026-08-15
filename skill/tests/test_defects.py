@@ -1668,6 +1668,9 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
         "review_below_band": "the review is staffed below its band",
         "effort_below_floor":
             "the selected model cannot reach the effort a floor required",
+        "unconfirmed_prior_termination":
+            "a prior attempt's process tree could not be confirmed dead — "
+            "dispatching a retry risks two concurrent writers",
     }
     from route_task import CAUSE_REASONS
     assert CAUSE_REASONS == EXPECTED_WORDING, (
@@ -1690,6 +1693,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
             "review_below_band": bool(rv["review_depth_reduced"]),
             "effort_below_floor": any(
                 r["floor_broken"] for r in out["effort_ceiling_applied"]),
+            "unconfirmed_prior_termination":
+                "termination_unconfirmed" in task.flags,
         }
 
     # The oracle must cover exactly the causes the router declares. A control
@@ -1708,7 +1713,8 @@ def test_d19_every_control_fires_exactly_on_its_declared_cause():
     for task_class in TASK_CLASSES:
         for dims in ((0, 0, 0, 0), (2, 2, 2, 0), (3, 3, 3, 3)):
             for flags in ([], ["auth_sensitive"], ["review_disagreement"],
-                          ["auth_sensitive", "bridge_down"]):
+                          ["auth_sensitive", "bridge_down"],
+                          ["termination_unconfirmed"]):
                 for iso in (None, True, False):
                     for pf, pm in ((0, []), (1, [ids[4]]), (cap, [ids[4]] * cap)):
                         for scarce in ([], [ids[0]], ids[:3]):
@@ -2455,3 +2461,45 @@ def test_d26_exact_evidence_still_reaches_enforced():
             isolation_evidence=["session-a1b2", "session-c3d4"])
     assert out["review"]["review_independence"] == "enforced"
     assert not any("isolation evidence not counted" in n for n in out["notes"])
+
+
+# ---------------------------------------------------------------------------
+# D27 — an unconfirmed termination must hold the route (DD-10)
+# ---------------------------------------------------------------------------
+
+def test_d27_unconfirmed_termination_holds_the_route_for_a_human():
+    """A timed-out write-capable attempt whose process tree could not be
+    confirmed dead may still be writing. Dispatching a retry behind it is
+    two concurrent writers on the same files."""
+    out = r(task_class="IMPLEMENTATION", flags=["termination_unconfirmed"])
+    assert out["requires_human_confirmation"] is True
+    assert "unconfirmed_prior_termination" in out["human_control_causes"]
+
+
+def test_d27_the_gate_reaches_the_shell():
+    proc = cli("--class", "IMPLEMENTATION", "--complexity", "0",
+               "--uncertainty", "0", "--blast-radius", "0",
+               "--reversibility", "0", "--flags", "termination_unconfirmed")
+    assert proc.returncode == 3
+
+
+def test_d27_production_hotfix_does_not_defer_an_unconfirmed_termination():
+    """The deferral branch excludes independence_compromised,
+    review_depth_reduced, and floor-broken already — termination_unconfirmed
+    must join them. A possibly-live writer is not made acceptable by an
+    incident; hotfix pressure is exactly when a second writer racing the
+    first is likeliest, so this hold must survive combination with
+    production_hotfix rather than being deferred to after the fix ships."""
+    out = r(task_class="IMPLEMENTATION",
+            flags=["production_hotfix", "termination_unconfirmed"])
+    assert out["requires_human_confirmation"] is True
+    assert out["human_confirmation_deferred"] is False
+
+
+def test_d27_production_hotfix_combined_with_termination_unconfirmed_exits_3():
+    proc = cli("--class", "IMPLEMENTATION", "--complexity", "0",
+               "--uncertainty", "0", "--blast-radius", "0",
+               "--reversibility", "0",
+               "--flags", "production_hotfix,termination_unconfirmed")
+    assert proc.returncode == 3
+

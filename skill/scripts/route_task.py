@@ -90,6 +90,9 @@ CAUSE_REASONS = {
     "review_below_band": "the review is staffed below its band",
     "effort_below_floor":
         "the selected model cannot reach the effort a floor required",
+    "unconfirmed_prior_termination":
+        "a prior attempt's process tree could not be confirmed dead — "
+        "dispatching a retry risks two concurrent writers",
 }
 
 
@@ -263,7 +266,7 @@ class Policy:
         per_key = dict.fromkeys((
             "on_independence_unachievable", "on_any_critical_review",
             "on_judge_unavailable", "on_review_depth_reduced",
-            "on_effort_below_floor"), implemented)
+            "on_effort_below_floor", "on_termination_unconfirmed"), implemented)
         per_key["on_production_hotfix"] = {
             "require_human_confirmation", "defer_human_confirmation"}
         for key, allowed in per_key.items():
@@ -1697,6 +1700,9 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         Control("on_effort_below_floor", "effort_below_floor",
                 any(r["floor_broken"] for r in ceiling_records),
                 "HUMAN_REQUIRED"),
+        Control("on_termination_unconfirmed", "unconfirmed_prior_termination",
+                task.has("termination_unconfirmed"),
+                "HUMAN_REQUIRED"),
     ]
 
     terminal = None
@@ -1835,7 +1841,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             and hitl["on_production_hotfix"] == "defer_human_confirmation"
             and not review.get("independence_compromised")
             and not review.get("review_depth_reduced")
-            and not any(r["floor_broken"] for r in ceiling_records)):
+            and not any(r["floor_broken"] for r in ceiling_records)
+            # A prior write-capable attempt whose process tree could not be
+            # confirmed dead is not made acceptable by an incident — it is
+            # made MORE dangerous: hotfix pressure is exactly when a second
+            # writer racing the first is likeliest. This gate is a hold,
+            # not a disclosure a later confirmation can absorb, so
+            # production_hotfix's deferral does not reach it either.
+            and not task.has("termination_unconfirmed")):
         deferred = True
         requires_human = False
         effort_notes.append(

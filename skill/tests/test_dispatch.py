@@ -821,3 +821,74 @@ def test_cancel_of_a_stale_running_receipt_removes_the_claim_too(tmp_path):
         os.killpg(pgid, signal.SIGKILL)  # test cleanup, not the code under test
         supervisor.wait(timeout=30)
 
+
+def _fake_receipt(tmp_path, attempt_id, seat, state, output_schema="review",
+                   schema_valid=True):
+    receipts = tmp_path / "receipts"
+    receipts.mkdir(exist_ok=True)
+    payload = {
+        "attempt_id": attempt_id, "seat": seat,
+        "result": {"state": state},
+        "output_schema": output_schema,
+    }
+    if schema_valid is not None:
+        payload["result"]["schema_valid"] = schema_valid
+    (receipts / f"{attempt_id}.json").write_text(json.dumps(payload))
+
+
+def test_verify_evidence_accepts_exactly_the_valid_set(tmp_path):
+    _fake_receipt(tmp_path, "r1", "reviewer-1", "SUCCEEDED")
+    _fake_receipt(tmp_path, "r2", "reviewer-2", "SUCCEEDED")
+    proc = _agent(["verify-evidence", "--ids", "r1,r2", "--expect-count", "2"],
+                  tmp_path)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_verify_evidence_rejects_a_seat_that_did_not_succeed(tmp_path):
+    _fake_receipt(tmp_path, "r1", "reviewer-1", "SUCCEEDED")
+    _fake_receipt(tmp_path, "r2", "reviewer-2", "TIMED_OUT")
+    proc = _agent(["verify-evidence", "--ids", "r1,r2", "--expect-count", "2"],
+                  tmp_path)
+    assert proc.returncode == 1
+    assert "TIMED_OUT" in proc.stderr
+
+
+def test_verify_evidence_rejects_surplus_missing_and_duplicate_seats(tmp_path):
+    _fake_receipt(tmp_path, "r1", "reviewer-1", "SUCCEEDED")
+    _fake_receipt(tmp_path, "r2", "reviewer-1", "SUCCEEDED")   # same seat twice
+    for ids, count in (("r1,r2,r3", "2"), ("r1", "2"), ("r1,r2", "2")):
+        proc = _agent(["verify-evidence", "--ids", ids, "--expect-count", count],
+                      tmp_path)
+        assert proc.returncode == 1, (ids, count, proc.stderr)
+
+
+def test_verify_evidence_rejects_a_receipt_without_a_valid_review_schema(tmp_path):
+    """A SUCCEEDED receipt is not enough — verify-evidence must also confirm
+    the attempt actually produced a schema-valid review, not merely that the
+    process exited 0. schema_valid absent or output_schema != "review" is a
+    weak receipt regardless of state."""
+    _fake_receipt(tmp_path, "r1", "reviewer-1", "SUCCEEDED",
+                  output_schema="none", schema_valid=None)
+    _fake_receipt(tmp_path, "r2", "reviewer-2", "SUCCEEDED")
+    proc = _agent(["verify-evidence", "--ids", "r1,r2", "--expect-count", "2"],
+                  tmp_path)
+    assert proc.returncode == 1
+    assert "r1" in proc.stderr
+
+
+def test_status_cancel_and_verify_evidence_reject_a_traversal_id_untouched(tmp_path):
+    """The validation chokepoint (_validated_attempt_id) is shared across
+    every subcommand, not just `run` — a crafted id must never reach a path
+    built from it, whether it names an attempt to inspect, kill, or verify,
+    and the rejection must happen before any filesystem access."""
+    traversal = "../../escape"
+    for cli_args in (["status", "--attempt-id", traversal],
+                     ["cancel", "--attempt-id", traversal],
+                     ["verify-evidence", "--ids", traversal,
+                      "--expect-count", "1"]):
+        proc = _agent(cli_args, tmp_path)
+        assert proc.returncode == 2, (cli_args, proc.stderr)
+    assert not (tmp_path / "receipts").exists()
+    assert not (tmp_path.parent / "escape.json").exists()
+
+

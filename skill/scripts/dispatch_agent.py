@@ -779,6 +779,65 @@ def cmd_cancel(args) -> int:
     return EXIT_BY_STATE[receipt["result"]["state"]]
 
 
+def cmd_verify_evidence(args) -> int:
+    """Exit 0 iff the ids are exactly the valid evidence set: the expected
+    count, each with a readable receipt for a supervised, completed review
+    attempt (state SUCCEEDED, output_schema "review", schema_valid true),
+    and each from a distinct seat (as recorded by the dispatcher). This
+    proves a completed reviewer attempt per seat — not that the transport
+    opened distinct real model sessions, which no receipt field can show.
+    This is the producer-side check behind route_task.py's exact-count
+    rule — run it BEFORE typing --isolation-evidence."""
+    receipt_dir = Path(args.receipt_dir)
+    ids = [x.strip() for x in args.ids.split(",") if x.strip()]
+    # Same chokepoint `run`/`status`/`cancel` use — every id is validated
+    # BEFORE any path is built or any receipt is read, not merely trusted
+    # because it happens to name an existing file. A malformed id (a `../`
+    # segment, say) exits 2 here without a single filesystem access, the
+    # same shape as every other subcommand's usage errors.
+    try:
+        ids = [_validated_attempt_id(x) for x in ids]
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    problems = []
+    if len(set(ids)) != args.expect_count:
+        problems.append(
+            f"expected exactly {args.expect_count} distinct id(s), "
+            f"got {len(set(ids))}")
+    seats = []
+    for attempt_id in sorted(set(ids)):
+        try:
+            receipt = read_receipt(receipt_dir, attempt_id)
+        except (OSError, json.JSONDecodeError):
+            # ITEM-V-5: a claim sentinel with no receipt yet (Task 8's
+            # claim-then-STARTING window, or a supervisor that crashed
+            # inside it) is not a completed reviewer attempt either way,
+            # but the caller should be able to tell "claimed, maybe still
+            # alive" apart from "nothing was ever claimed under this id".
+            claim_path = receipt_dir / f"{attempt_id}.claim"
+            if claim_path.exists():
+                problems.append(f"{attempt_id}: no readable receipt (claim only)")
+            else:
+                problems.append(f"{attempt_id}: no readable receipt")
+            continue
+        state = receipt["result"]["state"]
+        if state != "SUCCEEDED":
+            problems.append(f"{attempt_id}: state is {state}, not SUCCEEDED")
+        if receipt.get("output_schema") != "review":
+            problems.append(
+                f"{attempt_id}: output_schema is "
+                f"{receipt.get('output_schema')!r}, not 'review'")
+        if receipt.get("result", {}).get("schema_valid") is not True:
+            problems.append(f"{attempt_id}: schema_valid is not true")
+        seats.append(receipt.get("seat"))
+    if len(seats) != len(set(seats)):
+        problems.append(f"seats are not distinct: {sorted(seats)}")
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    return 1 if problems else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -811,12 +870,22 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("--attempt-id", required=True)
     cancel.add_argument("--receipt-dir", required=True)
     cancel.add_argument("--grace-seconds", type=float, default=15.0)
+
+    verify = sub.add_parser(
+        "verify-evidence",
+        help="check ids against receipts before --isolation-evidence")
+    verify.add_argument("--receipt-dir", required=True)
+    verify.add_argument("--ids", required=True,
+                        help="comma-separated attempt ids")
+    verify.add_argument("--expect-count", type=int, required=True,
+                        help="the route's reviewer seat count — exactly")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    handlers = {"run": cmd_run, "status": cmd_status, "cancel": cmd_cancel}
+    handlers = {"run": cmd_run, "status": cmd_status, "cancel": cmd_cancel,
+                "verify-evidence": cmd_verify_evidence}
     try:
         return handlers[args.command](args)
     except Exception:  # noqa: BLE001 — a crash must not borrow an outcome code
