@@ -16,7 +16,7 @@ examples do not look.
 Every invariant here was learned from a real defect that shipped past a green
 suite. The comment on each says which.
 
-Run:  python3 -m pytest skill/tests/test_invariants.py -q
+Run:  python3 -m pytest skills/model-router/tests/test_invariants.py -q
 """
 
 import itertools

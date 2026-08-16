@@ -6,7 +6,7 @@ documented invocation was cwd-dependent, templates omitted prompts, and the
 observability contract listed fields nothing produces. Each test here pins
 one of those contracts.
 
-Run:  python3 -m pytest skill/tests/ -q
+Run:  python3 -m pytest skills/model-router/tests/ -q
 """
 
 import re

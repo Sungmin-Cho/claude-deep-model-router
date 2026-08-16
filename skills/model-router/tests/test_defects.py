@@ -9,7 +9,7 @@ The lesson encoded here: an invariant test must exercise the condition the
 invariant is about. `test_i4` asserted "routes name only available models"
 without ever marking a model unavailable, so it could not have failed.
 
-Run:  python3 -m pytest skill/tests/ -q
+Run:  python3 -m pytest skills/model-router/tests/ -q
 """
 
 import itertools
@@ -186,9 +186,13 @@ def test_d1_a_failed_model_is_never_re_emitted_under_a_new_role():
     # retry path nobody exercises.
     priors = ("claude-sonnet-5", "claude-opus-5", "gpt-5.6-sol", "grok-4.6")
     fam = {m["id"]: m["family"] for m in CFG["models"].values()}
-    assert {fam[p] for p in priors} == set(fam.values()), (
-        f"priors {priors} miss a configured family "
-        f"{sorted(set(fam.values()) - {fam[p] for p in priors})}")
+    dispatchable_fams = {
+        m["family"] for m in CFG["models"].values()
+        if m.get("dispatchable", True)
+    }
+    assert {fam[p] for p in priors} == dispatchable_fams, (
+        f"priors {priors} miss a dispatchable family "
+        f"{sorted(dispatchable_fams - {fam[p] for p in priors})}")
     for runtime in sorted(CFG["runtimes"]):
         for prior in priors:
             out = r(task_class="IMPLEMENTATION", complexity=2, uncertainty=1, blast_radius=1,
@@ -1029,6 +1033,9 @@ DOCUMENTED_BUT_UNREAD = {
     "effort_map.xai.LOW": "the probes below never pair the only xai seat with "
                           "LOW effort — reachable via a prior-failure promotion "
                           "on MECHANICAL/LOW, which this probe set does not build",
+    "effort_map.gemini": "unbound family: registered for suite ID spelling, "
+                         "dispatchable:false, never seated so effort_map.gemini "
+                         "leaves are completeness-only",
     "models": "ids/families/tiers are read; price_per_mtok and verified are "
               "cost and provenance documentation for people",
     "transports": "how the CALLER invokes each model; the router names models, "
@@ -2117,6 +2124,8 @@ EXPECTED_NATIVE = {
     # and the clamp means no route reaches that entry anyway.
     "xai":    {"MINIMAL": "low",  "LOW": "low", "MEDIUM": "medium",
                "HIGH": "high", "VERY_HIGH": "xhigh", "MAX": "xhigh"},
+    "gemini": {"MINIMAL": "low",  "LOW": "low", "MEDIUM": "medium",
+               "HIGH": "high", "VERY_HIGH": "high", "MAX": "high"},
 }
 ACCEPTED_CLI_TOKENS = {f: set(m.values()) for f, m in EXPECTED_NATIVE.items()}
 

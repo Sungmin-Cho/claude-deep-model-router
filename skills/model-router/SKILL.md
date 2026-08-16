@@ -132,6 +132,7 @@ Other inputs worth knowing:
 | `--unavailable <role>` / `--unavailable-models <id>` | a specific role or model does not resolve |
 | `--flags bridge_down` | the whole cross-provider transport is unreachable — switches to the degraded single-provider binding |
 | `--isolation available\|unavailable` / `--isolation-evidence <ids>` | whether isolation *can* be achieved this session, and one distinct session id per dispatched reviewer |
+| `--request-json <file>` | RouteRequestV1 file (`route_schema_version`, `local_policy`, `availability_snapshot`). Wins over `--json` and flags |
 
 **Independence has five states, and only one of them is a claim.** A route is
 computed before any reviewer runs, so nothing known at routing time can prove
@@ -171,6 +172,7 @@ execute:
 | `INDEPENDENCE_UNAVAILABLE` | the band requires independent review and it cannot be had — no distinct-model assignment exists, or the caller reported isolation unavailable |
 | `RETRY_HISTORY_REQUIRED` | `--prior-failures N` without one concrete model id per failure. The router does not guess what ran |
 | `SUPPLY_EXHAUSTED` | no usable model remains for a role the route needs — an operational shortage, not a bad request |
+| `UNSATISFIABLE_LOCAL_POLICY` | `local_policy` cannot be met (empty `allowed_families`, empty intersection, or a floor the binding cannot seat) |
 
 `judge_unavailable` is deliberately **not** terminal: independence failing means
 the review cannot happen as specified, so nothing is safe to dispatch, whereas a
@@ -441,6 +443,9 @@ Every route reports:
 
 ```yaml
 task_class:  complexity:  uncertainty:  blast_radius:  reversibility:
+route_schema_version:  router_plugin_version:  policy_sha256:
+effective_policy:  selected_capability_tier:  selected_families: []
+local_policy_applied:
 reasoning_centric:
 risk_score:  risk_band:   band_overrides_applied: []   critical_flags: []
 band_overrides_redundant: []   # fired, but another rule had already got there

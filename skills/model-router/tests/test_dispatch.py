@@ -4,7 +4,7 @@ No real model is ever invoked: every scenario is a tiny Python script the
 test writes into tmp_path. See docs/design/2026-08-15-dispatch-layer-design.md
 §5 for the scenario table.
 
-Run:  python3 -m pytest skill/tests/test_dispatch.py -q
+Run:  python3 -m pytest skills/model-router/tests/test_dispatch.py -q
 """
 
 import json

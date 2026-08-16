@@ -42,16 +42,51 @@ import json
 import sys
 import traceback
 from dataclasses import dataclass, field, fields, replace
+
+from policy_digest import policy_sha256
 from pathlib import Path
 from typing import Any
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "model-routing.yaml"
+ROUTE_SCHEMA_VERSION = 1
+REQUEST_V1_KEYS = frozenset({
+    "route_schema_version", "task_class", "complexity", "uncertainty",
+    "blast_radius", "reversibility", "reasoning_centric", "flags",
+    "runtime", "prior_failures", "availability_snapshot", "local_policy",
+})
+AVAIL_KEYS = frozenset({
+    "unavailable_roles", "unavailable_models", "isolation", "isolation_evidence",
+})
+LOCAL_POLICY_KEYS = frozenset({
+    "minimum_capability_tier", "minimum_effort", "minimum_reviewers",
+    "minimum_provider_families", "allowed_families",
+})
+
+
+_PLUGIN_VERSION_CACHE: dict[str, str] = {}
+
+
+def plugin_manifest_version(start: Path | None = None) -> str:
+    here = Path(start) if start is not None else Path(__file__).resolve()
+    cache_key = str(here)
+    if cache_key in _PLUGIN_VERSION_CACHE:
+        return _PLUGIN_VERSION_CACHE[cache_key]
+    for parent in [here, *here.parents]:
+        manifest = parent / ".claude-plugin" / "plugin.json"
+        if manifest.is_file():
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            version = data.get("version")
+            if not isinstance(version, str) or not version:
+                raise ConfigError(f"{manifest} has no string version")
+            _PLUGIN_VERSION_CACHE[cache_key] = version
+            return version
+    raise ConfigError("cannot find .claude-plugin/plugin.json above route_task.py")
 
 # Every terminal this router can emit. Named here so documentation tests can
 # assert the set rather than a sample of it.
 TERMINAL_STATES = (
     "HUMAN_REQUIRED", "ESCALATE_ROUTING", "INDEPENDENCE_UNAVAILABLE",
-    "RETRY_HISTORY_REQUIRED", "SUPPLY_EXHAUSTED",
+    "RETRY_HISTORY_REQUIRED", "SUPPLY_EXHAUSTED", "UNSATISFIABLE_LOCAL_POLICY",
 )
 
 MAX_PROMOTION_PASSES = 4   # bounded fixed point; the band ladder is only 4 deep
@@ -400,6 +435,8 @@ class Task:
     isolation_evidence: list[str] = field(default_factory=list)
     # Set by route(); not part of the caller's input contract.
     _policy: Any = field(default=None, repr=False, compare=False)
+    # RouteRequestV1 local_policy. None = omitted. Not accepted via --json.
+    _local_policy: dict | None = field(default=None, repr=False, compare=False)
 
     def validate(self, policy: Policy) -> None:
         self._require_choice("task_class", self.task_class, policy.task_classes)
@@ -1091,7 +1128,14 @@ class Resolver:
         # When the bridge is down the opposite family is unreachable by
         # definition — a fallback that crosses it names a model that cannot be
         # invoked, which is the one thing a route must never do.
-        self.allowed_family = policy.local_family[task.runtime] if self.bridge_down else None
+        allowed: set[str] | None = None
+        if self.bridge_down:
+            allowed = {policy.local_family[task.runtime]}
+        lp = task._local_policy or {}
+        if lp.get("allowed_families") is not None:
+            asked = set(lp["allowed_families"])
+            allowed = asked if allowed is None else allowed & asked
+        self.allowed_families = allowed
 
         blocked = set(task.unavailable_models)
         for role in task.unavailable_roles:
@@ -1134,7 +1178,9 @@ class Resolver:
             if k in seen:
                 continue
             seen.add(k)
-            if self.allowed_family and cfg["models"][k]["family"] != self.allowed_family:
+            if self.allowed_families is not None and cfg["models"][k]["family"] not in self.allowed_families:
+                continue
+            if cfg["models"][k].get("dispatchable", True) is False:
                 continue
             out.append(k)
         return out
@@ -1284,6 +1330,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     policy = Policy.of(cfg)
     task.validate(policy)
 
+    lp = task._local_policy or {}
+    local_unsat = False
+    if isinstance(lp.get("allowed_families"), list) and len(lp["allowed_families"]) == 0:
+        local_unsat = True
+
     # Before anything resolves: a route whose retry history cannot be used will
     # not run, so nothing may be inferred from that history on the way there.
     history_note = history_gap(task, policy)
@@ -1304,6 +1355,11 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     if history_note:
         worker_notes.append(history_note)
     effort, effort_notes = select_effort(task, band, policy)
+    if lp.get("minimum_effort") in policy.efforts:
+        asked = lp["minimum_effort"]
+        if policy.efforts.index(asked) > policy.efforts.index(effort):
+            effort_notes.append(f"local_policy raised effort to {asked}")
+            effort = asked
     disagreement = cfg["review"]["disagreement"]
 
     def roles_for(rev):
@@ -1602,6 +1658,24 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         and fams[review["reviewers"][0]] != fams[worker]
     )
 
+    if resolver.allowed_families is not None and len(resolver.allowed_families) == 0:
+        local_unsat = True
+    if not local_unsat and lp:
+        if lp.get("minimum_capability_tier") is not None and resolved.get(worker):
+            if policy.tier_of[resolved[worker]] < int(lp["minimum_capability_tier"]):
+                local_unsat = True
+        if lp.get("minimum_reviewers") is not None:
+            if len(review.get("reviewers") or []) < int(lp["minimum_reviewers"]):
+                local_unsat = True
+        if lp.get("minimum_provider_families") is not None:
+            seated = {policy.family_of[m] for m in resolved.values()}
+            if len(seated) < int(lp["minimum_provider_families"]):
+                local_unsat = True
+        if lp.get("minimum_effort") in policy.efforts and resolved.get(worker):
+            ceiling = policy.ceiling_of.get(resolved[worker])
+            if ceiling is not None and policy.efforts.index(ceiling) < policy.efforts.index(lp["minimum_effort"]):
+                local_unsat = True
+
     # The band is settled and the plan above was built from it, so the
     # confidence that ships is the confidence of what ships. Round 16 found the
     # two disagreeing; round 17's fix put the correction after the
@@ -1760,6 +1834,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             f"{cfg['retry']['max_total_implementation_attempts']} — stop retrying and "
             f"surface what was tried to a human")
 
+    if local_unsat:
+        worker_notes.append("local_policy cannot be satisfied")
+        terminal = terminal or "UNSATISFIABLE_LOCAL_POLICY"
+
     if supply_exhausted:
         worker_notes.append(f"supply exhausted: {supply_exhausted}")
         # `terminal or`, not `=`. The stated design is that this outranks the
@@ -1876,7 +1954,25 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # worker left a consumer able to dispatch the reviewers from a route the
     # rationale said must not be executed.
     executable = terminal is None
+    effective_policy = {
+        "minimum_capability_tier": lp.get("minimum_capability_tier"),
+        "minimum_effort": lp.get("minimum_effort"),
+        "minimum_reviewers": lp.get("minimum_reviewers"),
+        "minimum_provider_families": lp.get("minimum_provider_families"),
+        "allowed_families": lp.get("allowed_families"),
+    }
+    worker_model = resolved.get(worker) if executable else None
     result = {
+        "route_schema_version": ROUTE_SCHEMA_VERSION,
+        "router_plugin_version": plugin_manifest_version(),
+        "policy_sha256": policy_sha256(CONFIG_PATH),
+        "effective_policy": effective_policy,
+        "selected_capability_tier": (
+            policy.tier_of[worker_model] if worker_model else None),
+        "selected_families": sorted({
+            policy.family_of[m] for m in resolved.values()
+        }) if executable else [],
+        "local_policy_applied": bool(lp),
         "task_class": task.task_class,
         "complexity": task.complexity,
         "uncertainty": task.uncertainty,
@@ -2052,6 +2148,8 @@ def build_parser(policy: Policy) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--json", help="full task as a JSON object; overrides the flags below")
+    p.add_argument("--request-json", dest="request_json",
+                   help="RouteRequestV1 JSON file; wins over --json and flags")
     p.add_argument("--class", dest="task_class", choices=policy.task_classes)
     p.add_argument("--complexity", type=int)
     p.add_argument("--uncertainty", type=int)
@@ -2079,6 +2177,69 @@ REQUIRED_JSON_FIELDS = ("task_class", "complexity", "uncertainty", "blast_radius
 PUBLIC_FIELDS = {f.name for f in fields(Task) if not f.name.startswith("_")}
 
 
+def task_from_request_v1(payload: dict) -> Task:
+    if not isinstance(payload, dict):
+        raise ValidationError("--request-json must be a JSON object")
+    if (unknown := set(payload) - REQUEST_V1_KEYS):
+        raise ValidationError(
+            f"--request-json has unknown field(s): {', '.join(sorted(unknown))}")
+    version = payload.get("route_schema_version")
+    if version != ROUTE_SCHEMA_VERSION:
+        raise ValidationError(
+            f"unsupported route_schema_version {version!r} (want {ROUTE_SCHEMA_VERSION})")
+    if (missing := [f for f in REQUIRED_JSON_FIELDS if f not in payload]):
+        raise ValidationError(
+            f"--request-json is missing required field(s): {', '.join(missing)}")
+
+    prior = payload.get("prior_failures", [])
+    if prior is None:
+        prior = []
+    if isinstance(prior, int):
+        raise ValidationError("prior_failures must be a list of model ids")
+    if not isinstance(prior, list) or not all(isinstance(x, str) for x in prior):
+        raise ValidationError("prior_failures must be a list of model ids")
+
+    snap = payload.get("availability_snapshot") or {}
+    if snap:
+        if not isinstance(snap, dict):
+            raise ValidationError("availability_snapshot must be an object")
+        if (unknown := set(snap) - AVAIL_KEYS):
+            raise ValidationError(
+                f"availability_snapshot has unknown field(s): {', '.join(sorted(unknown))}")
+        if snap.get("isolation_evidence") and "isolation" not in snap:
+            raise ValidationError("isolation_evidence requires isolation")
+
+    lp = payload.get("local_policy")
+    if lp is not None:
+        if not isinstance(lp, dict):
+            raise ValidationError("local_policy must be an object")
+        if (unknown := set(lp) - LOCAL_POLICY_KEYS):
+            raise ValidationError(
+                f"local_policy has unknown field(s): {', '.join(sorted(unknown))}")
+
+    isolation = snap.get("isolation") if snap else None
+    flags = payload.get("flags") or []
+    if isinstance(flags, str):
+        flags = _split(flags)
+    return Task(
+        task_class=payload["task_class"],
+        complexity=payload["complexity"],
+        uncertainty=payload["uncertainty"],
+        blast_radius=payload["blast_radius"],
+        reversibility=payload["reversibility"],
+        reasoning_centric=bool(payload.get("reasoning_centric", False)),
+        flags=list(flags),
+        prior_failures=len(prior),
+        prior_models=list(prior),
+        runtime=payload.get("runtime", "claude_code"),
+        unavailable_roles=list(snap.get("unavailable_roles") or []),
+        unavailable_models=list(snap.get("unavailable_models") or []),
+        isolation_available=None if isolation is None else isolation == "available",
+        isolation_evidence=list(snap.get("isolation_evidence") or []),
+        _local_policy=lp,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         policy = _default_policy()
@@ -2094,7 +2255,15 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     try:
-        if args.json:
+        if args.request_json:
+            try:
+                payload = json.loads(Path(args.request_json).read_text(encoding="utf-8"))
+            except OSError as exc:
+                raise ValidationError(f"--request-json cannot be read: {exc}") from None
+            except json.JSONDecodeError as exc:
+                raise ValidationError(f"--request-json is not valid JSON: {exc}") from None
+            task = task_from_request_v1(payload)
+        elif args.json:
             try:
                 payload = json.loads(args.json)
             except json.JSONDecodeError as exc:

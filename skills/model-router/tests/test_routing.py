@@ -14,7 +14,7 @@ careful classifier would plausibly assign for that description. Where the
 resulting review band differs from the spec's loose parenthetical, the test
 says so rather than bending the policy to match.
 
-Run:  python3 -m pytest skill/tests/ -q
+Run:  python3 -m pytest skills/model-router/tests/ -q
 """
 
 import sys
