@@ -7,6 +7,12 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.0.1] — 2026-08-17
+
+### 수정됨
+
+- Claude Sonnet 5 정식 가격이 $2 / $10으로 확정된 뒤, 레지스트리에 남아 있던 $3 / $15 수치를 고쳤다.
+
 ## [1.0.0] — 2026-08-17
 
 ### 추가됨

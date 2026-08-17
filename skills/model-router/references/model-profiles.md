@@ -166,8 +166,9 @@ The same posture as `worker_fast`, pointed at the first escalation.
 
 **Price — verified.** The xai frontier model is priced as a balanced-tier
 seat ($2.00 / $6.00 per million input/output tokens) against the Claude
-balanced model's $3.00 / $15.00, and against a claimed frontier tier. For the
-first escalation that difference is the point of the binding.
+balanced model's $2.00 / $10.00, and against a claimed frontier tier. Input
+is now equal; the remaining advantage is output price. For the first
+escalation that difference is the point of the binding.
 
 **Quality — not established.** No head-to-head was run here. A frontier claim
 is not a measured peer of the tier-2 seats.

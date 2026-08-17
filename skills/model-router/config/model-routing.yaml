@@ -395,7 +395,7 @@ models:
     family: claude
     capability_tier: 1
     verified: true
-    price_per_mtok: { input: 3.00, output: 15.00 }
+    price_per_mtok: { input: 2.00, output: 10.00 }
 
   claude_senior:
     id: claude-opus-5
@@ -759,10 +759,14 @@ verification_ledger:
 
     - item: "worker_balanced binding: grok-4.6 over claude-sonnet-5"
       status: price_verified_quality_unverified
-      probed_on: 2026-08-14
+      probed_on: 2026-08-17
       evidence: >
         PRICE: verified from published rates — grok-4.6 $2.00/$6.00 per MTok
-        vs sonnet-5 $3.00/$15.00. QUALITY: NOT established. No head-to-head
-        was run here. The binding rests on the verified price advantage
-        against a claimed frontier tier, not on a demonstrated quality
-        advantage. capability_tier stays 1 for that reason.
+        vs sonnet-5 $2.00/$10.00. Anthropic made Sonnet 5's $2/$10
+        introductory rate permanent on 2026-08-10; the previous $3.00/$15.00
+        figure was the scheduled post-intro price and is now wrong. Input is
+        now equal; output remains cheaper on grok-4.6. QUALITY: NOT
+        established. No head-to-head was run here. The binding rests on the
+        verified output-price advantage against a claimed frontier tier, not
+        on a demonstrated quality advantage. capability_tier stays 1 for
+        that reason.
