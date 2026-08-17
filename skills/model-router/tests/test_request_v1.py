@@ -45,7 +45,15 @@ def test_policy_digest_ignores_comments(tmp_path):
 
 def test_plugin_manifest_walks_ancestors():
     scripts = Path(__file__).resolve().parent.parent / "scripts" / "route_task.py"
-    assert plugin_manifest_version(scripts) == "1.0.0"
+    root = Path(__file__).resolve()
+    for parent in root.parents:
+        manifest = parent / ".claude-plugin" / "plugin.json"
+        if manifest.is_file():
+            expected = json.loads(manifest.read_text(encoding="utf-8"))["version"]
+            break
+    else:
+        raise AssertionError("no .claude-plugin/plugin.json above " + str(root))
+    assert plugin_manifest_version(scripts) == expected
 
 
 def test_request_json_unknown_field_exits_2(tmp_path):

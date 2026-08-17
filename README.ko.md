@@ -1,0 +1,148 @@
+[English](./README.md) | **한국어**
+
+# deep-model-router
+
+![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/claude-deep-model-router?label=version)
+![license](https://img.shields.io/github/license/Sungmin-Cho/claude-deep-model-router)
+[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/claude-deep-suite)
+
+Claude Code, Codex, Grok를 위한 결정적 모델 / effort / 리뷰 라우터.
+
+위임할 소프트웨어 엔지니어링 작업을 분류하면, 채점기가 파일 수·토큰 수·지금 열려 있는 모델이 아니라 리스크에 따라 워커, reasoning effort, 리뷰 깊이를 고릅니다. 리뷰 깊이는 리스크 밴드만의 함수이며, 워커 선택이 몰래 약화시킬 수 없습니다.
+
+[deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) 에코시스템의 일원입니다. [deep-work](https://github.com/Sungmin-Cho/claude-deep-work)와 [deep-loop](https://github.com/Sungmin-Cho/claude-deep-loop)가 공유 결정 평면으로 이 플러그인에 의존합니다. 릴리스 이력은 [CHANGELOG](CHANGELOG.md)를 참고하세요.
+
+---
+
+## deep-suite에서의 역할
+
+deep-model-router는 **결정 평면**입니다. 형제 플러그인은 집행, durable state, 각자의 안전 하한을 유지합니다. 이 플러그인은 두 질문을 분리해서 답합니다.
+
+1. **누가 하는가** — 사용 가능한 모델과 effort에 묶인 역할.
+2. **얼마나 엄하게 검사하는가** — 리스크 밴드를 따르는 리뷰 정책(독립 리뷰가 필요한지 포함).
+
+작업을 대신 구현하지 않으며, 실제로 집행하지 않은 통제를 주장하지 않습니다. `independence_required`는 정책이고 `review_independence`는 증거입니다. 라우터가 없으면 로컬 폴백이지, HIGH/CRITICAL 하한을 내릴 이유가 아닙니다.
+
+---
+
+## 설치
+
+### 방법 1 — 마켓플레이스 (deep-suite 등록 완료)
+
+```text
+# Claude Code
+/plugin marketplace add Sungmin-Cho/claude-deep-suite
+/plugin install deep-model-router@claude-deep-suite
+
+# Codex
+codex plugin marketplace add Sungmin-Cho/claude-deep-suite
+codex plugin add deep-model-router@claude-deep-suite
+```
+
+### 방법 2 — 로컬 clone
+
+```text
+# Claude Code
+claude plugin add https://github.com/Sungmin-Cho/claude-deep-model-router.git
+
+# Codex — Codex 설정에서 로컬 경로를 plugin 디렉터리로 추가
+```
+
+채점기와 dispatch supervisor는 Python 3가 필요합니다. supervisor는 POSIX 전용입니다(프로세스 그룹 제어). Node 런타임 의존성은 없습니다.
+
+---
+
+## 사용법
+
+### Claude Code
+
+```text
+/deep-model-router:model-router
+```
+
+### Codex
+
+```text
+$deep-model-router:model-router
+```
+
+분류 규약은 세션당 한 번 스킬을 로드해 익힙니다. 반복 결정은 CLI로 하고, 밴드를 손으로 다시 계산하지 않습니다.
+
+```text
+SKILL_DIR=<스킬 로드 시 안내된 skill-base-directory>
+python3 "$SKILL_DIR"/scripts/route_task.py --class IMPLEMENTATION \
+    --complexity 1 --uncertainty 1 --blast-radius 1 --reversibility 0 \
+    --format json
+```
+
+`SKILL_DIR`은 `SKILL.md`가 있는 디렉터리입니다. 백그라운드 서브에이전트는 스킬 루트가 아니라 프로젝트 루트를 상속하므로, 스크립트 경로는 항상 이 접두사로 호출합니다.
+
+RouteRequestV1 파일은 플래그보다 우선합니다.
+
+```text
+python3 "$SKILL_DIR"/scripts/route_task.py --request-json ./route-request.json --format json
+```
+
+백그라운드 dispatch는 별도 단계입니다. 라우트는 결정이고, `scripts/dispatch_agent.py`가 deadline·kill ladder·완료 receipt를 소유합니다. 세션의 첫 백그라운드 dispatch 전에 `skills/model-router/references/adapters.md`를 읽으세요.
+
+---
+
+## 스킬
+
+| 스킬 | Claude Code | Codex | 목적 |
+|---|---|---|---|
+| model-router | `/deep-model-router:model-router` | `$deep-model-router:model-router` | 위임 작업을 분류하고 RouteDecisionV1을 방출 |
+
+소비자는 `../deep-model-router`나 개인 `~/.claude/skills/model-router` 심링크를 import하면 안 됩니다. CLI 탐색은 [`docs/locator.md`](docs/locator.md)를 따르세요.
+
+---
+
+## 라우팅 방식
+
+당신이 분류하고, 스크립트가 채점합니다. 싼 모델이 물량을 처리하고, 승격은 증거로만 일어납니다. 리뷰 깊이는 리스크를 따릅니다.
+
+| 당신이 주는 것 | 채점기가 돌려주는 것 |
+|---|---|
+| 작업 클래스, 0–3 차원 네 개, 플래그 | 리스크 밴드, 워커 역할+모델, effort, 리뷰 정책 |
+| 런타임, 가용성, 이전 실패 | 폴백, terminal 상태, human-gate exit code |
+
+```
+risk_score = complexity + 2×uncertainty + 2×blast_radius + reversibility     (0–18)
+LOW 0–3 · MEDIUM 4–7 · HIGH 8–10 · CRITICAL 11–18
+```
+
+critical-domain 플래그(auth, security, financial, data integrity)는 채점 후 모든 작업 클래스에서 밴드를 올립니다. 잘 이해된 작은 인가 경로 수정도 강한 워커와 독립 리뷰를 받습니다.
+
+정책은 `skills/model-router/config/model-routing.yaml`에 있습니다. 모델 식별자는 여기에만 등장합니다. 스킬 본문과 `references/`는 스크립트가 실행하는 규칙과 같습니다.
+
+exit status도 계약입니다. **0** 디스패치 가능, **1** terminal, **2** 잘못된 입력, **3** 먼저 확인 필요, **4** production hotfix(배포 후 확인), **5** 내부 오류.
+
+---
+
+## deep-suite 링크
+
+| 플러그인 | 역할 |
+|---|---|
+| [deep-model-router](https://github.com/Sungmin-Cho/claude-deep-model-router) | 이 플러그인 — 공유 결정 평면 |
+| [deep-work](https://github.com/Sungmin-Cho/claude-deep-work) | 단계별 구현 오케스트레이터 |
+| [deep-review](https://github.com/Sungmin-Cho/claude-deep-review) | APPROVE 판정의 독립 평가자 |
+| [deep-loop](https://github.com/Sungmin-Cho/claude-deep-loop) | 다중 세션 durable 제어 평면 |
+| [deep-goal](https://github.com/Sungmin-Cho/claude-deep-goal) | goal 조건 컴파일러 |
+| [deep-evolve](https://github.com/Sungmin-Cho/claude-deep-evolve) | 자율 fitness metric 실험 루프 |
+| [deep-docs](https://github.com/Sungmin-Cho/claude-deep-docs) | 문서 정비 에이전트 |
+| [deep-wiki](https://github.com/Sungmin-Cho/claude-deep-wiki) | 지식 베이스 수집·관리 |
+| [deep-memory](https://github.com/Sungmin-Cho/claude-deep-memory) | 프로젝트 간 시맨틱 메모리 |
+| [deep-dashboard](https://github.com/Sungmin-Cho/claude-deep-dashboard) | 하네스 진단과 스위트 텔레메트리 |
+| [deep-suite (마켓플레이스)](https://github.com/Sungmin-Cho/claude-deep-suite) | 통합 마켓플레이스와 하네스 매트릭스 |
+
+## 링크
+
+- [변경 이력](CHANGELOG.ko.md)
+- [기여 안내](CONTRIBUTING.md)
+- [보안](SECURITY.md)
+- [Locator](docs/locator.md)
+- [deep-suite 마켓플레이스](https://github.com/Sungmin-Cho/claude-deep-suite)
+
+## 라이선스
+
+MIT — [LICENSE](LICENSE) 참고.

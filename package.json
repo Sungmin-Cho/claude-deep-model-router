@@ -1,0 +1,15 @@
+{
+  "name": "deep-model-router",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deterministic model/effort/review router for Claude Code, Codex, and Grok",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sungmin-Cho/claude-deep-model-router.git"
+  },
+  "scripts": {
+    "test": "python3 -m pytest skills/model-router/tests/ -q",
+    "verify": "python3 -m pytest skills/model-router/tests/ -q"
+  }
+}

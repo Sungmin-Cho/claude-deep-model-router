@@ -6,6 +6,8 @@ share this file. The skill name is `model-router`; the plugin key is
 
 Read the version from `.claude-plugin/plugin.json`. Do not hard-code it.
 
+📄 Documentation in this repo follows `docs/DOCS_RULE.md` (local maintainer guide).
+
 ## Layout
 
 ```
@@ -33,7 +35,7 @@ directory that contains `SKILL.md`.
 Consumers must not import `../deep-model-router` or a personal
 `~/.claude/skills/model-router` symlink. Resolve the CLI with
 `DEEP_MODEL_ROUTER_CLI`, then `DEEP_MODEL_ROUTER_ROOT`, then the host
-plugin cache. See `docs/locator.md` once it exists.
+plugin cache. See `docs/locator.md`.
 
 ## Tests
 

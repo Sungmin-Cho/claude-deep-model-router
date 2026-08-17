@@ -3,3 +3,12 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .deep-review/
+.deep-work/
+.deep-docs/
+.deep-evolve/
+.deep-dashboard/
+
+# Development docs (specs, plans, handoffs, backlog) — local-only.
+# Re-include published consumer contracts with ! exceptions.
+docs/*
+!docs/locator.md
