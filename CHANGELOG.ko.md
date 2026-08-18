@@ -7,6 +7,12 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.1.1] — 2026-08-18 (바인딩 품질 측정)
+
+### 변경됨
+
+- worker_fast·worker_balanced 바인딩의 품질을 가정이 아닌 측정으로 확인했다: 변별력 있는 446-노드 숨긴 테스트 헤드투헤드에서 haiku가 luna를 근소하게 앞섰고, grok-4.6 대 sonnet-5는 천장에서 동률이었다. 두 바인딩과 모든 `capability_tier`는 변경 없음 — 여전히 검증된 가격 우위에 근거하며, 검증 원장(verification ledger)에 점수·실패 유형·지연 시간이 기록됐다.
+
 ## [1.1.0] — 2026-08-18 (설계·가격 감사)
 
 ### 추가됨

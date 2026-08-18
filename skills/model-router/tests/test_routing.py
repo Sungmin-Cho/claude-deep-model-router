@@ -401,15 +401,19 @@ def test_high_and_critical_reviews_are_cross_family_by_construction():
 
 
 def test_ledger_does_not_overclaim():
-    """Any entry marked plainly `verified` must carry evidence, and the two
-    known-unproven items must not be marked verified."""
+    """Any entry marked plainly `verified` must carry evidence, the never-probed
+    isolation item must not be marked verified, and the worker binding entries
+    must not claim a quality *win*: the 2026-08-18 head-to-head measured haiku
+    marginally ahead of luna and a tie at ceiling for the balanced pair, so
+    both bindings still rest on price, with quality probed rather than proven."""
     entries = {e["item"]: e for e in CFG["verification_ledger"]["entries"]}
     for item, e in entries.items():
         assert e.get("evidence"), f"{item} claims a status with no evidence"
     codex_isolation = next(k for k in entries if "Codex native subagent" in k)
     assert entries[codex_isolation]["status"] != "verified"
-    worker_fast = next(k for k in entries if "worker_fast binding" in k)
-    assert entries[worker_fast]["status"] == "price_verified_quality_unverified"
+    for binding in ("worker_fast binding", "worker_balanced binding"):
+        key = next(k for k in entries if binding in k)
+        assert entries[key]["status"] == "price_verified_quality_probed"
 
 
 # ---------------------------------------------------------------------------
