@@ -68,12 +68,12 @@ elevating (each one has an observable effect — see the table below):
   concurrency_sensitive  migration  public_api_change
   production_hotfix  unknown_root_cause  review_disagreement
 
-context (inform decomposition, never the band):
+context (inform decomposition and model choice, never the band):
   unfamiliar_codebase  cross_service_change  long_horizon
   large_context  tool_heavy
 
 operational (state of the runtime, not of the task):
-  bridge_down
+  bridge_down  termination_unconfirmed
 ```
 
 What each elevating flag actually does — a flag with no consumer is a promise
@@ -87,6 +87,13 @@ the system does not keep, so this table is enforced by test:
 | `migration` | with `data_integrity_sensitive` → band `CRITICAL` |
 | `unknown_root_cause` | effort `MAX`, worker promotion, confidence penalty |
 | `review_disagreement` | routes to the disagreement path and binds a judge |
+
+One context flag also has a deterministic effect, on the model rather than the
+band: `large_context` binds `worker_balanced` to `worker_balanced_alt`, because
+the primary seat's provider re-bills the whole request at double rate past 200K
+input tokens and its window ends earlier. Set it when the prompt, the retrieved
+context, or the files in scope plausibly reach that size —
+`references/model-profiles.md` carries the numbers.
 
 **`reasoning_centric`** — one boolean that decides between the two frontier
 roles:
@@ -260,6 +267,7 @@ any critical-domain flag AND reversibility≥2 → band = CRITICAL
 migration AND data_integrity_sensitive       → band = CRITICAL
 production_hotfix                            → band = max(band, HIGH)
 public_api_change                            → band = max(band, MEDIUM)
+concurrency_sensitive                        → band = max(band, MEDIUM)
 review_disagreement                          → disagreement path, regardless of band
 ```
 
@@ -278,7 +286,7 @@ Overrides only raise a band, never lower it.
 | `INVESTIGATION` | worker_fast | worker_balanced | reasoning_specialist | reasoning_specialist |
 | `MIGRATION` | worker_balanced | worker_balanced | senior_engineer | principal_architect † |
 | `ARCHITECTURE` | worker_balanced | worker_balanced | senior_engineer | principal_architect |
-| `REVIEW` | worker_fast | worker_balanced | senior_engineer | senior_engineer + reasoning_specialist |
+| `REVIEW` | worker_fast | worker_balanced | senior_engineer | senior_engineer |
 | `OPERATIONS` | worker_fast | worker_balanced | senior_engineer | senior_engineer |
 
 **‡** `reasoning_specialist` if `reasoning_centric`, else `senior_engineer`.

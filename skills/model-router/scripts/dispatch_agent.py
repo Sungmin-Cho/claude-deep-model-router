@@ -617,9 +617,16 @@ def cmd_status(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     receipt_dir = Path(args.receipt_dir)
-    receipt_path = _receipt_path(receipt_dir, args.attempt_id)
-    if not receipt_path.exists():
-        claim_path = receipt_dir / f"{args.attempt_id}.claim"
+    claim_path = receipt_dir / f"{args.attempt_id}.claim"
+    # Asked for, not tested for: an `exists()` pre-check answers a question
+    # about a moment that has already passed by the time the read runs, and
+    # when it guessed wrong the FileNotFoundError escaped to the crash guard —
+    # a traceback and exit 9, the status reserved for "a crash, never an
+    # attempt outcome". `cancel` has always read first and handled the absence;
+    # both commands answer the same question the same way now.
+    try:
+        receipt = read_receipt(receipt_dir, args.attempt_id)
+    except FileNotFoundError:
         if claim_path.exists():
             # A claim sentinel with no receipt yet: `run` has exclusively
             # claimed this attempt id but has not written even the STARTING
@@ -636,7 +643,12 @@ def cmd_status(args) -> int:
             print(json.dumps({"attempt_id": args.attempt_id,
                               "state": "CLAIMED"}, indent=2))
             return 0
-    receipt = read_receipt(receipt_dir, args.attempt_id)
+        # Nothing was ever created under this id. That is a caller mistake,
+        # not an attempt outcome — the same sentence and the same status
+        # `cancel` gives it.
+        print(f"attempt {args.attempt_id!r} is unknown under {receipt_dir} "
+              f"— no receipt and no claim", file=sys.stderr)
+        return 2
     state = receipt["result"]["state"]
     if state in ("STARTING", "RUNNING"):
         pgid = receipt["process"]["process_group_id"]

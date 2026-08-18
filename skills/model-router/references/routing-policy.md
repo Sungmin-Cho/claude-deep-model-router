@@ -117,12 +117,24 @@ concurrency_sensitive  migration  public_api_change
 production_hotfix  unknown_root_cause  review_disagreement
 ```
 
+**Operational** — state of the runtime, not a property of the task:
+
+```
+bridge_down  termination_unconfirmed
+```
+
 **Context** — these inform how you decompose the work and which model fits, but
 never the band:
 
 ```
 unfamiliar_codebase  cross_service_change  long_horizon  large_context  tool_heavy
 ```
+
+`large_context` is the one the router itself acts on: it rebinds
+`worker_balanced` to `worker_balanced_alt`, a same-tier seat, because the
+primary's price doubles and its window runs out past 200K input tokens. Same
+band, same review, different model — which is exactly what a context flag is
+allowed to move.
 
 The distinction matters. Context flags describe the working conditions; letting
 them move the band would inflate risk assessments for tasks that are merely
@@ -154,6 +166,7 @@ any critical-domain flag AND reversibility≥2  → band = CRITICAL
 migration AND data_integrity_sensitive        → band = CRITICAL
 production_hotfix                             → band = max(band, HIGH)
 public_api_change                             → band = max(band, MEDIUM)
+concurrency_sensitive                         → band = max(band, MEDIUM)
 review_disagreement                           → disagreement path, any band
 ```
 

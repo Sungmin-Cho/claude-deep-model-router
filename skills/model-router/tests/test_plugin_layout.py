@@ -93,3 +93,59 @@ def test_agents_points_at_existing_locator():
     text = (root / "AGENTS.md").read_text(encoding="utf-8")
     assert "docs/locator.md" in text
     assert "once it exists" not in text
+
+
+# ---------------------------------------------------------------------------
+# B13 / B14 (audit 2026-08-18) — the README's two runtime claims
+# ---------------------------------------------------------------------------
+
+def _config():
+    import sys
+    root = _repo_root()
+    sys.path.insert(0, str(root / "skills" / "model-router" / "scripts"))
+    from route_task import load_config
+    return load_config()
+
+
+def test_readme_states_the_pyyaml_requirement():
+    """The README promised "Python 3 required ... no Node runtime dependency"
+    and never named PyYAML, which `load_config` and `policy_digest` both
+    import. There is no requirements.txt to discover it from either, so the
+    first route on a PyYAML-less box failed with an ImportError the install
+    instructions gave no warning about."""
+    root = _repo_root()
+    for rel in ("README.md", "README.ko.md"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert "PyYAML" in text, rel
+        assert "pip install pyyaml" in text, rel
+
+
+def test_readme_does_not_document_the_human_gate_status_as_fixed():
+    """Exit 3 is `human_in_the_loop.human_gate_exit_status`, configurable over
+    3..255. A caller that hard-codes 3 because the README presented it as fixed
+    reads a gate it may have moved."""
+    root = _repo_root()
+    key = "human_gate_exit_status"
+    assert isinstance(_config()["human_in_the_loop"][key], int)
+    for rel in ("README.md", "README.ko.md"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert key in text, rel
+        assert "3..255" in text, rel
+
+
+def test_codex_agent_interface_sidecar_is_well_formed():
+    """`skills/model-router/agents/openai.yaml` is referenced by nothing in
+    this repo (audit 2026-08-18 §5) because its consumer is the Codex host, not
+    this code. That makes it exactly the kind of file that rots unnoticed, so
+    the shape it must keep is pinned here, and its display name is held to the
+    same product name the Codex plugin manifest declares."""
+    import yaml
+    root = _repo_root()
+    path = root / "skills" / "model-router" / "agents" / "openai.yaml"
+    spec = yaml.safe_load(path.read_text(encoding="utf-8"))
+    interface = spec["interface"]
+    assert set(interface) == {"display_name", "short_description", "default_prompt"}
+    assert all(isinstance(v, str) and v.strip() for v in interface.values())
+    manifest = _read_json(root, ".codex-plugin/plugin.json")["interface"]
+    assert interface["display_name"] in manifest["longDescription"] or \
+        interface["display_name"] in manifest["displayName"]

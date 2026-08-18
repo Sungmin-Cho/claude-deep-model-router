@@ -48,7 +48,7 @@ claude plugin add https://github.com/Sungmin-Cho/claude-deep-model-router.git
 # Codex — add the local path as a plugin directory in your Codex config
 ```
 
-Python 3 is required for the scorer and the dispatch supervisor. The supervisor is POSIX-only (process-group control). There is no Node runtime dependency.
+Python 3 and **PyYAML** are required for the scorer and the dispatch supervisor — the policy is a YAML file, so the first route on a box without PyYAML fails. Install it with `python3 -m pip install pyyaml` if your interpreter does not already have it. The supervisor is POSIX-only (process-group control). There is no Node runtime dependency.
 
 ---
 
@@ -115,7 +115,7 @@ Critical-domain flags (auth, security, financial, data integrity) raise the band
 
 The policy lives in `skills/model-router/config/model-routing.yaml`. Model identifiers appear there and nowhere else. The skill body and `references/` describe the same rules the script executes.
 
-Exit status is part of the contract: **0** dispatchable, **1** terminal, **2** invalid input, **3** needs confirmation first, **4** production hotfix (confirm after it ships), **5** internal error.
+Exit status is part of the contract: **0** dispatchable, **1** terminal, **2** invalid input, **3** needs confirmation first, **4** production hotfix (confirm after it ships), **5** internal error. Only 3 is configurable — it is `human_in_the_loop.human_gate_exit_status`, any value in 3..255, so a caller that already uses 3 for something else can move the gate. Read it from the config rather than hard-coding it; 0, 1 and 2 are taken and >255 truncates to a success code, which is why the range is validated at load time.
 
 ---
 

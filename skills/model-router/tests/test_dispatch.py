@@ -892,3 +892,113 @@ def test_status_cancel_and_verify_evidence_reject_a_traversal_id_untouched(tmp_p
     assert not (tmp_path.parent / "escape.json").exists()
 
 
+
+
+def test_status_on_an_unknown_attempt_id_is_a_usage_error_not_a_crash(tmp_path):
+    """B5 (audit 2026-08-18). With neither receipt nor claim, `status` fell
+    through to `read_receipt`, and the FileNotFoundError escaped to the crash
+    guard: a traceback and exit 9, the status this module reserves for "a
+    crash, never an attempt outcome". `cancel` has always answered the same
+    situation with one sentence and exit 2; asking about an id nobody created
+    is a usage error either way."""
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    proc = _agent(["status", "--attempt-id", "never-created"], tmp_path)
+    assert proc.returncode == 2, proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert "never-created" in proc.stderr
+    assert "no receipt and no claim" in proc.stderr
+
+
+def test_status_on_a_missing_receipt_dir_is_a_usage_error_too(tmp_path):
+    """The directory itself not existing is the same question with the same
+    answer — not a different failure mode to be discovered by traceback."""
+    proc = _agent(["status", "--attempt-id", "never-created"], tmp_path)
+    assert proc.returncode == 2, proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Coverage top-ups from the 2026-08-18 audit §5
+# ---------------------------------------------------------------------------
+
+RECEIPT_KEYS = {
+    "attempt_id", "seat", "runtime", "model_id", "effort_native",
+    "permission_mode", "argv", "prompt_sha256", "output_schema",
+    "process", "timing", "result",
+}
+RECEIPT_PROCESS_KEYS = {"pid", "process_group_id", "supervisor_pid"}
+RECEIPT_TIMING_KEYS = {"started_at", "deadline_at", "finished_at"}
+RECEIPT_RESULT_KEYS = {
+    "state", "exit_status", "stdout_path", "stderr_path", "output_sha256",
+    "schema_valid", "termination_confirmed",
+}
+
+
+def test_receipt_carries_exactly_the_documented_fields(tmp_path):
+    """Equality, not membership. Every other receipt assertion in this file
+    names the fields it cares about, so a field silently added (or a terminal
+    write dropping one) is invisible to all of them — and the receipt is the
+    only durable record of what an attempt did."""
+    fake = write_fake(tmp_path, "happy.py", HAPPY)
+    _, receipt = run_dispatch(tmp_path, [sys.executable, fake])
+    assert set(receipt) == RECEIPT_KEYS
+    assert set(receipt["process"]) == RECEIPT_PROCESS_KEYS
+    assert set(receipt["timing"]) == RECEIPT_TIMING_KEYS
+    assert set(receipt["result"]) == RECEIPT_RESULT_KEYS
+
+
+def test_a_route_can_be_dispatched_and_verified_end_to_end(tmp_path):
+    """The two layers are tested apart and never together, so nothing checks
+    that a route's own reviewer count is the number `verify-evidence` will
+    accept. This walks the seam: route, dispatch one fake reviewer per seat the
+    route asked for, then verify the evidence set against that same count."""
+    router = SKILL / "scripts" / "route_task.py"
+    routed = subprocess.run(
+        [sys.executable, str(router), "--class", "IMPLEMENTATION",
+         "--complexity", "2", "--uncertainty", "2", "--blast-radius", "2",
+         "--reversibility", "1", "--format", "json"],
+        capture_output=True, text=True, timeout=60)
+    assert routed.returncode in (0, 3, 4), routed.stderr
+    decision = json.loads(routed.stdout)
+    seats = decision["review"]["reviewers"]
+    assert seats and decision["terminal"] is None
+
+    fake = write_fake(tmp_path, "reviewer.py", HAPPY)
+
+    def dispatch(attempt_id, seat, model_id):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), "run",
+             "--attempt-id", attempt_id,
+             "--receipt-dir", str(tmp_path / "receipts"),
+             "--deadline-seconds", "30", "--grace-seconds", "1",
+             "--seat", seat, "--model-id", model_id,
+             "--effort-native", decision["review"]["effort"],
+             "--output-schema", "review",
+             "--", sys.executable, str(fake)],
+            capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+        return attempt_id
+
+    ids = [dispatch(f"e2e-{i}", seat, decision["review"]["reviewer_models"][i])
+           for i, seat in enumerate(seats)]
+
+    # The count the route asked for is the count the evidence check enforces.
+    # That equality is the whole seam, and neither file could see it alone.
+    verdict = _agent(["verify-evidence", "--ids", ",".join(ids),
+                      "--expect-count", str(len(seats))], tmp_path)
+    assert verdict.returncode == 0, verdict.stderr
+
+    # And the route's own rule is exact-count: one id short must fail on both
+    # sides of the seam.
+    short = _agent(["verify-evidence", "--ids", ids[0],
+                    "--expect-count", str(len(seats))], tmp_path)
+    assert short.returncode != 0
+
+    routed_back = subprocess.run(
+        [sys.executable, str(router), "--class", "IMPLEMENTATION",
+         "--complexity", "2", "--uncertainty", "2", "--blast-radius", "2",
+         "--reversibility", "1", "--format", "json",
+         "--isolation", "available", "--isolation-evidence", ",".join(ids)],
+        capture_output=True, text=True, timeout=60)
+    assert json.loads(routed_back.stdout)["review"]["review_independence"] == "enforced"

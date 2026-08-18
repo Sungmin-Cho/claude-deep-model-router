@@ -49,6 +49,8 @@ from typing import Any
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "model-routing.yaml"
 ROUTE_SCHEMA_VERSION = 1
+# The dimension scale the four inputs are validated against.
+MAX_DIMENSION_SCORE = 3
 REQUEST_V1_KEYS = frozenset({
     "route_schema_version", "task_class", "complexity", "uncertainty",
     "blast_radius", "reversibility", "reasoning_centric", "flags",
@@ -221,6 +223,8 @@ class Policy:
         self.roles: list[str] = list(cfg["role_tiers"])
         self.task_classes: list[str] = list(cfg["worker_selection"])
         self.critical_domain_flags: tuple[str, ...] = tuple(cfg["flags"]["critical_domain"])
+        # Every dimension at its maximum. The band table is declared over 0..this.
+        self.max_risk_score: int = MAX_DIMENSION_SCORE * sum(cfg["router"]["score_weights"].values())
         self.known_flags: frozenset[str] = frozenset(f for g in cfg["flags"].values() for f in g)
         self.runtimes: frozenset[str] = frozenset(cfg["runtimes"])
         self.model_ids: frozenset[str] = frozenset(m["id"] for m in cfg["models"].values())
@@ -243,6 +247,7 @@ class Policy:
                     f"binding is what survives when the bridge is down, so it "
                     f"must name exactly one family")
         families = set(self.family_of.values())
+        self.families: frozenset[str] = frozenset(families)
         if set(cfg["effort_map"]) != families:
             raise ConfigError(
                 f"effort_map is keyed by model family; it covers "
@@ -423,7 +428,6 @@ class Task:
     flags: list[str] = field(default_factory=list)
     prior_failures: int = 0
     prior_models: list[str] = field(default_factory=list)
-    implementation_role: str | None = None
     runtime: str = "claude_code"
     unavailable_roles: list[str] = field(default_factory=list)
     unavailable_models: list[str] = field(default_factory=list)
@@ -455,8 +459,6 @@ class Task:
         # usage error. What it must never do is reach resolution.
         self._require_str_list("prior_models", self.prior_models,
                                frozenset(policy.roles) | policy.model_ids, "role or model id")
-        if self.implementation_role is not None:
-            self._require_choice("implementation_role", self.implementation_role, policy.roles)
         if self.isolation_available is not None:
             self._require_bool("isolation_available", self.isolation_available)
         # This field is the only input that can reach `enforced`, so it gets
@@ -470,7 +472,51 @@ class Task:
                 raise ValidationError(
                     f"isolation_evidence: expected non-empty strings, got {item!r}"
                 )
+        # `local_policy` VALUES, not only its key names. The request parser
+        # checked the names; nothing checked what they held, and the two halves
+        # failed in opposite directions: an unknown effort token was dropped by
+        # a membership test while `effective_policy` still reported it as
+        # applied — the "recorded a change that did not happen" defect this
+        # module's docstring forbids — and a non-numeric tier reached `int()`
+        # inside `route()` and crashed to exit 5, the status reserved for
+        # outcomes that are never routing outcomes. Validated here rather than
+        # in `task_from_request_v1` for two reasons: this is the only place
+        # holding a Policy to check the vocabulary against, and it also covers
+        # a `Task` constructed directly.
+        self._validate_local_policy(policy)
         self._policy = policy
+
+    def _validate_local_policy(self, policy: Policy) -> None:
+        lp = self._local_policy
+        if lp is None:
+            return
+        if not isinstance(lp, dict):
+            raise ValidationError(
+                f"local_policy: expected an object, got {type(lp).__name__}")
+        if (unknown := set(lp) - LOCAL_POLICY_KEYS):
+            raise ValidationError(
+                f"local_policy has unknown field(s): {', '.join(sorted(unknown))}")
+        if (effort := lp.get("minimum_effort")) is not None and effort not in policy.efforts:
+            # Listed in policy order, not sorted: `_require_choice` alphabetises,
+            # which is right for a set of names and wrong for a floor — a caller
+            # told the levels are [HIGH, LOW, MAX, MEDIUM, MINIMAL, VERY_HIGH]
+            # cannot see which one is a higher floor than the value they typed.
+            raise ValidationError(
+                f"local_policy.minimum_effort: {effort!r} is not one of "
+                f"{policy.efforts} (weakest to strongest)")
+        # Zero is meaningful for all three (an explicit "no floor"), and a
+        # negative floor is not a weaker ask — it is a value no comparison in
+        # `route()` can act on.
+        for name in ("minimum_capability_tier", "minimum_reviewers",
+                     "minimum_provider_families"):
+            if (value := lp.get(name)) is not None:
+                self._require_int(f"local_policy.{name}", value, minimum=0)
+        # An empty list is legal and deliberately load-bearing: it is the one
+        # value that makes the policy unsatisfiable by construction, which
+        # `route()` reports as a terminal rather than as an error.
+        if (fams := lp.get("allowed_families")) is not None:
+            self._require_str_list("local_policy.allowed_families", fams,
+                                   policy.families, "model family")
 
     # -- validators ------------------------------------------------------
 
@@ -489,8 +535,9 @@ class Task:
     @classmethod
     def _require_score(cls, name, value):
         cls._require_int(name, value)
-        if not 0 <= value <= 3:
-            raise ValidationError(f"{name}: must be between 0 and 3, got {value}")
+        if not 0 <= value <= MAX_DIMENSION_SCORE:
+            raise ValidationError(
+                f"{name}: must be between 0 and {MAX_DIMENSION_SCORE}, got {value}")
 
     @staticmethod
     def _require_bool(name, value):
@@ -514,19 +561,6 @@ class Task:
 
     def critical_flags(self, policy: Policy) -> list[str]:
         return [f for f in policy.critical_domain_flags if f in self.flags]
-
-    def failed_roles(self, policy: Policy, binding: dict) -> list[str]:
-        """Prior failures normalized to role aliases, resolved against the
-        binding actually in force — mapping through the default binding would
-        misread a degraded-binding model as a different (usually higher) role."""
-        out = []
-        for item in self.prior_models:
-            if item in policy.roles:
-                out.append(item)
-            else:
-                key = policy.id_to_key[item]
-                out.extend(r for r, k in binding.items() if k == key and r in policy.roles)
-        return out
 
     def failed_models(self, policy: Policy) -> set[str]:
         """The models that already failed, as concrete ids.
@@ -691,7 +725,7 @@ def _promote_above(floor: int, policy: Policy, resolver: "Resolver") -> str | No
 
 
 def select_worker(task: Task, band: str, policy: Policy,
-                  resolver: "Resolver") -> tuple[str, list[str], bool, bool]:
+                  resolver: "Resolver") -> tuple[str, list[str], bool]:
     """Returns (worker, notes, ceiling_exhausted)."""
     binding = resolver.binding
     cfg = policy.cfg
@@ -790,24 +824,23 @@ def select_worker(task: Task, band: str, policy: Policy,
         # The structure was checked before this function ran (see
         # `history_gap`), so reaching here means the history is exact.
         floor = max(policy.tier_of[m] for m in task.prior_models)
-        if True:
-            current = resolver.peek(worker)
-            if current is not None and policy.tier_of[current] > floor:
-                # Already stronger than everything that failed. `_promote_above`
-                # returns the WEAKEST role above the floor, so taking it here
-                # could only move the route down — which round 12 caught doing
-                # exactly that: a task whose table selection was tier 2 came
-                # back at tier 1 after one tier-0 failure, called an escalation,
-                # at exit 0. Evidence of difficulty must never weaken a route.
-                notes.append(f"retry keeps {worker}: already above the failed "
-                             f"capability tier {floor}")
-            elif (promoted := _promote_above(floor, policy, resolver)) is not None:
-                notes.append(f"escalated above capability tier {floor}")
-                worker = promoted
-            else:
-                ceiling_exhausted = True
-                notes.append(f"retry ladder exhausted: no usable model is stronger "
-                             f"than capability tier {floor}")
+        current = resolver.peek(worker)
+        if current is not None and policy.tier_of[current] > floor:
+            # Already stronger than everything that failed. `_promote_above`
+            # returns the WEAKEST role above the floor, so taking it here
+            # could only move the route down — which round 12 caught doing
+            # exactly that: a task whose table selection was tier 2 came
+            # back at tier 1 after one tier-0 failure, called an escalation,
+            # at exit 0. Evidence of difficulty must never weaken a route.
+            notes.append(f"retry keeps {worker}: already above the failed "
+                         f"capability tier {floor}")
+        elif (promoted := _promote_above(floor, policy, resolver)) is not None:
+            notes.append(f"escalated above capability tier {floor}")
+            worker = promoted
+        else:
+            ceiling_exhausted = True
+            notes.append(f"retry ladder exhausted: no usable model is stronger "
+                         f"than capability tier {floor}")
 
     return worker, notes, ceiling_exhausted
 
@@ -882,11 +915,15 @@ def select_review(band: str, worker: str, policy: Policy, resolver: "Resolver") 
                 if resolver.peek(candidate):
                     chosen = candidate
                     break
+        # One seat, and cross-family first. Both were config keys until the
+        # 2026-08-18 audit found them inert: this line has always seated
+        # exactly one reviewer and the loop above has always preferred a
+        # different family, so the keys read as policy while changing nothing.
+        # The constants live here now, with the config carrying the reasons.
         spec = {
             "reviewers": [chosen or ranked[0]],
             "effort": spec["effort"],
             "independent": spec["independent"],
-            "prefer_cross_family": spec["prefer_cross_family"],
         }
 
     spec.setdefault("required_checks", [])
@@ -1159,11 +1196,40 @@ class Resolver:
         self.failed = task.failed_models(policy)
         self.unusable = self.blocked | self.failed
 
+    def _primary(self, role: str) -> str | None:
+        """The registry key this role binds to FOR THIS TASK.
+
+        `worker_balanced_selection` moves the first escalation to its alt seat
+        when the task carries the configured flag: the primary seat's provider
+        re-bills the entire request at a doubled rate past a context threshold
+        and its window ends earlier, so above that line the cheaper seat is the
+        more expensive one. The threshold is a token count the router never
+        sees; the flag is the caller's statement about which side of it this
+        route is on.
+
+        It is a binding decision and not a fallback, which is why it lives here
+        rather than in the candidate ladder alone: `resolve` compares what was
+        chosen against what this role *should* have bound to, and a swap the
+        policy made on purpose must not be reported as a model going missing.
+        """
+        sel = self.policy.cfg.get("worker_balanced_selection") or {}
+        flag = sel.get("prefer_alt_when_flag")
+        if flag and role == sel.get("prefer") and self.task.has(flag):
+            # A degraded binding names no alt seat. Nothing to prefer, so the
+            # rule is a no-op there rather than an invented substitution.
+            if (alt := self.binding.get(sel.get("alt"))):
+                return alt
+        return self.binding.get(role)
+
     def _candidates(self, role: str) -> list[str]:
         cfg = self.policy.cfg
         ordered: list[str] = []
-        if (primary := self.binding.get(role)):
+        if (primary := self._primary(role)):
             ordered.append(primary)
+        # The role's own binding stays on the ladder behind the preferred seat:
+        # preferring the alt must not delete the seat it was preferred over.
+        if (bound := self.binding.get(role)):
+            ordered.append(bound)
         ordered.extend(cfg["fallbacks"].get(self.task.runtime, {}).get(role, []))
         degraded_name = self.policy.degraded_binding[self.task.runtime]
         if (d := cfg["role_bindings"][degraded_name].get(role)):
@@ -1207,7 +1273,7 @@ class Resolver:
         comp_cfg = cfg.get("fallback_compensations", {})
 
         for role in roles:
-            primary_key = self.binding.get(role)
+            primary_key = self._primary(role)
             primary_id = cfg["models"][primary_key]["id"] if primary_key else None
             chosen_id = self.peek(role)
             if chosen_id is None:
@@ -1277,20 +1343,28 @@ def independence(review: dict, task: Task) -> str:
 # Confidence
 # --------------------------------------------------------------------------
 
-def routing_confidence(task: Task, fallbacks: list[str]) -> float:
-    c = 0.95
+def routing_confidence(task: Task, fallbacks: list[str], cfg: dict) -> float:
+    """The number `router.confidence.escalate_below` is compared against.
+
+    The thresholds lived in the config and the penalties that produce the value
+    lived here, so moving a threshold meant guessing at numbers in another file.
+    One policy, one place.
+    """
+    conf = cfg["router"]["confidence"]
+    penalty = conf["penalties"]
+    c = conf["base"]
     if task.uncertainty == 3:
-        c -= 0.20
+        c -= penalty["uncertainty_3"]
     elif task.uncertainty == 2:
-        c -= 0.08
+        c -= penalty["uncertainty_2"]
     if task.prior_failures >= 2:
-        c -= 0.15
+        c -= penalty["prior_failures_2_or_more"]
     elif task.prior_failures == 1:
-        c -= 0.05
+        c -= penalty["prior_failures_1"]
     if fallbacks:
-        c -= 0.10
+        c -= penalty["any_fallback"]
     if task.has("unknown_root_cause"):
-        c -= 0.10
+        c -= penalty["unknown_root_cause"]
     return round(max(0.0, min(1.0, c)), 2)
 
 
@@ -1355,7 +1429,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     if history_note:
         worker_notes.append(history_note)
     effort, effort_notes = select_effort(task, band, policy)
-    if lp.get("minimum_effort") in policy.efforts:
+    if lp.get("minimum_effort") is not None:
         asked = lp["minimum_effort"]
         if policy.efforts.index(asked) > policy.efforts.index(effort):
             effort_notes.append(f"local_policy raised effort to {asked}")
@@ -1540,7 +1614,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         # the loop reading a preliminary resolve, then after the loop where the
         # post-conditions could not see the promotion. The plan and the decision
         # belong in the same iteration.
-        confidence = routing_confidence(task, fallbacks)
+        confidence = routing_confidence(task, fallbacks, cfg)
         threshold = cfg["router"]["confidence"]["extra_review_below"]
         # The policy is "raise the review band ONE level" — the loop exists so
         # the terminal decision sees the final confidence, not to change how
@@ -1671,7 +1745,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             seated = {policy.family_of[m] for m in resolved.values()}
             if len(seated) < int(lp["minimum_provider_families"]):
                 local_unsat = True
-        if lp.get("minimum_effort") in policy.efforts and resolved.get(worker):
+        if lp.get("minimum_effort") is not None and resolved.get(worker):
             ceiling = policy.ceiling_of.get(resolved[worker])
             if ceiling is not None and policy.efforts.index(ceiling) < policy.efforts.index(lp["minimum_effort"]):
                 local_unsat = True
@@ -1680,7 +1754,7 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # confidence that ships is the confidence of what ships. Round 16 found the
     # two disagreeing; round 17's fix put the correction after the
     # post-conditions and round 18 moved the whole plan below the loop instead.
-    confidence = routing_confidence(task, fallbacks)
+    confidence = routing_confidence(task, fallbacks, cfg)
 
     review_independence = independence(review, task)
     supplied = len({e.strip() for e in task.isolation_evidence if e.strip()})
@@ -2056,12 +2130,15 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "human_confirmation_deferred": deferred,
         "notes": worker_notes + effort_notes,
     }
-    result["rationale"] = explain(task, result)
+    result["rationale"] = explain(task, result, policy)
     return result
 
 
-def explain(task: Task, r: dict) -> str:
-    parts = [f"{task.task_class} scored {r['risk_score']}/18 "
+def explain(task: Task, r: dict, policy: Policy) -> str:
+    # The ceiling is the weights at their maximum, not the literal 18 that was
+    # typed here — a weight change used to leave every rationale quoting a
+    # denominator the scorer could no longer reach.
+    parts = [f"{task.task_class} scored {r['risk_score']}/{policy.max_risk_score} "
              f"(c={task.complexity} u={task.uncertainty} b={task.blast_radius} r={task.reversibility}) "
              f"-> band {r['risk_band']}."]
     if r["band_overrides_applied"]:
@@ -2209,13 +2286,12 @@ def task_from_request_v1(payload: dict) -> Task:
         if snap.get("isolation_evidence") and "isolation" not in snap:
             raise ValidationError("isolation_evidence requires isolation")
 
+    # Values are validated in `Task.validate`, which has the Policy this
+    # vocabulary is defined by; duplicating the checks here would be a second
+    # source of truth for the same contract.
     lp = payload.get("local_policy")
-    if lp is not None:
-        if not isinstance(lp, dict):
-            raise ValidationError("local_policy must be an object")
-        if (unknown := set(lp) - LOCAL_POLICY_KEYS):
-            raise ValidationError(
-                f"local_policy has unknown field(s): {', '.join(sorted(unknown))}")
+    if lp is not None and not isinstance(lp, dict):
+        raise ValidationError("local_policy must be an object")
 
     isolation = snap.get("isolation") if snap else None
     flags = payload.get("flags") or []

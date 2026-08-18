@@ -7,6 +7,26 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.1.0] — 2026-08-18 (설계·가격 감사)
+
+### 추가됨
+
+- `large_context`가 바인딩을 결정한다: 이 플래그가 붙은 작업은 `worker_balanced`를 Claude balanced 좌석으로 보낸다. xAI 좌석은 입력 200K 토큰을 넘기면 요청 전체를 두 배 요율로 청구하고, 컨텍스트 창도 500K 더 일찍 끝나기 때문이다.
+- 레지스트리가 xAI의 long-context 가격 구간과 컨텍스트 창을 기록하고, 모델 프로파일도 이 비교가 조건부라는 사실을 그대로 적는다.
+
+### 수정됨
+
+- `local_policy`의 키 이름뿐 아니라 값도 검증한다. 알 수 없는 effort 값은 적용된 하한으로 보고되면서 실제로는 조용히 무시됐고, 숫자가 아닌 tier는 내부 오류용 상태로 크래시했다. 둘 다 이제 잘못된 입력(exit 2)이다.
+- CLI locator가 문서화된 순서(env → root → Claude 캐시 → Codex 캐시)대로 해석한다. 알파벳 순서 때문에 `.codex`가 이기던 문제, 문자열 정렬로 `1.9.0`이 `1.10.0`을 이기던 문제, 소스 체크아웃 거부가 첫 단계에서만 걸리던 문제를 함께 고쳤다.
+- 알 수 없는 attempt id에 대한 `dispatch_agent.py status`가 traceback 대신 `cancel`과 같은 한 줄 메시지와 exit 2로 답한다.
+- 정책 파일과 어긋나 있던 문서: REVIEW/CRITICAL 워커, 빠져 있던 `concurrency_sensitive` 오버라이드, 빠져 있던 `termination_unconfirmed` 운영 플래그.
+- README가 PyYAML 요구 사항과, human-gate exit status가 3..255 범위에서 설정 가능하다는 사실을 명시한다.
+
+### 제거됨
+
+- `review.MEDIUM.reviewer_count`와 `review.MEDIUM.prefer_cross_family`: 둘 다 읽히기만 하고 아무 효과가 없었다. 이들이 서술하던 동작은 그대로이며, 처음부터 상수였다는 사실을 문서에 적었다.
+- 아무것도 선택하지 않던 `effort_by_work` 항목 3개와, 쓰이지 않던 `implementation_role` 작업 필드.
+
 ## [1.0.1] — 2026-08-17
 
 ### 수정됨

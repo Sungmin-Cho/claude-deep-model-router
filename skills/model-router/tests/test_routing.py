@@ -410,3 +410,85 @@ def test_ledger_does_not_overclaim():
     assert entries[codex_isolation]["status"] != "verified"
     worker_fast = next(k for k in entries if "worker_fast binding" in k)
     assert entries[worker_fast]["status"] == "price_verified_quality_unverified"
+
+
+# ---------------------------------------------------------------------------
+# Large context — the one deterministic fact that moves the worker_balanced
+# binding (audit 2026-08-18 §2.2)
+#
+# xAI bills the whole request at the long-context tier once the prompt reaches
+# 200K tokens, so the seat that is cheaper below that line is more expensive on
+# both axes above it — and its window ends at 500K where the alt seat's runs to
+# 1M. `large_context` was declared in `flags.context` and read by nothing.
+# ---------------------------------------------------------------------------
+
+def _balanced_task(**kw):
+    """A route whose worker is `worker_balanced` under the default binding."""
+    kw.setdefault("task_class", "REFACTORING")
+    kw.setdefault("complexity", 2)
+    kw.setdefault("uncertainty", 1)
+    kw.setdefault("blast_radius", 1)
+    return r(**kw)
+
+
+SEL = CFG["worker_balanced_selection"]
+PRIMARY_ID = CFG["models"][CFG["role_bindings"]["default"][SEL["prefer"]]]["id"]
+ALT_ID = CFG["models"][CFG["role_bindings"]["default"][SEL["alt"]]]["id"]
+
+
+def test_worker_balanced_defaults_to_the_primary_seat():
+    out = _balanced_task()
+    assert out["selected_role"] == "worker_balanced"
+    assert out["selected_model"] == PRIMARY_ID
+
+
+def test_large_context_moves_worker_balanced_to_the_alt_seat():
+    out = _balanced_task(flags=["large_context"])
+    assert out["selected_role"] == "worker_balanced"
+    assert out["selected_model"] == ALT_ID
+
+
+def test_large_context_swap_is_not_recorded_as_a_fallback():
+    """Nothing became unavailable — recording scarcity that did not happen is
+    the defect this module's docstring names first."""
+    out = _balanced_task(flags=["large_context"])
+    assert not [f for f in out["fallbacks_applied"] if "worker_balanced:" in f]
+    assert out["fallback_compensations_applied"] == []
+
+
+def test_large_context_falls_back_to_the_primary_when_the_alt_is_gone():
+    """With the alt unavailable the primary is the answer again — and THAT is a
+    real fallback, so it is recorded."""
+    out = _balanced_task(flags=["large_context"], unavailable_models=[ALT_ID])
+    assert out["selected_model"] == PRIMARY_ID
+    assert any("worker_balanced:" in f for f in out["fallbacks_applied"])
+
+
+def test_large_context_is_a_no_op_under_a_degraded_binding():
+    """`claude_only` names no alt seat, so there is nothing to prefer; the rule
+    must not invent one."""
+    a = _balanced_task(flags=["bridge_down"])
+    b = _balanced_task(flags=["bridge_down", "large_context"])
+    assert a["selected_model"] == b["selected_model"]
+
+
+def test_large_context_rule_is_actually_consumed():
+    """A perturbation, not a read: delete the rule and the route must move
+    back. `test_d14` only proves a key was looked at."""
+    without = {**CFG, "worker_balanced_selection": {
+        k: v for k, v in SEL.items() if k != "prefer_alt_when_flag"}}
+    out = route(Task(task_class="REFACTORING", complexity=2, uncertainty=1,
+                     blast_radius=1, reversibility=0, flags=["large_context"]),
+                without)
+    assert out["selected_model"] == PRIMARY_ID
+
+
+def test_long_context_pricing_is_recorded_where_the_price_is():
+    """The registry's `price_per_mtok` is documentation, and documentation that
+    states only the cheap half of a tiered price misleads exactly the reader it
+    exists for."""
+    xai = next(m for m in CFG["models"].values() if m["family"] == "xai")
+    tier = xai["price_per_mtok"]["long_context"]
+    assert tier["above_input_tokens"] == 200_000
+    assert tier["input"] > xai["price_per_mtok"]["input"]
+    assert tier["output"] > xai["price_per_mtok"]["output"]
