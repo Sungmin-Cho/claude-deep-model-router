@@ -41,15 +41,19 @@ Formatting, isolated UI, mechanical refactor, generated tests.
 ### `MEDIUM`
 
 ```yaml
-reviewer_count: 1
 candidates: [worker_balanced, senior_engineer, reasoning_specialist]
-prefer_cross_family: true
 effort: HIGH
 independent: true
 ```
 
 Exactly one independent reviewer, from a different family where available, and
-at least as strong as the implementer.
+at least as strong as the implementer. Both of those are constants in
+`select_review`, not settings: a `reviewer_count` key and a
+`prefer_cross_family` key used to sit in this block and neither was read —
+raising the count to 3 or clearing the preference produced byte-identical
+routes. Asking for a second reviewer means asking for `HIGH`, and the
+cross-family preference is the reason this band names candidates rather than
+one fixed reviewer.
 
 "At least as strong", not "stronger": the two frontier roles are peers, so once
 the implementer is already at the top of the ladder the reviewer can only be a
@@ -171,7 +175,12 @@ for the others.
 tool, and issue both dispatches **in a single message** so they run
 concurrently and neither can observe the other's result. Never include reviewer
 A's returned text in reviewer B's prompt. Subagent context isolation is the
-enforcement boundary.
+intended enforcement boundary — and the verification ledger records it as
+`assumed`, not verified: it is the Agent tool's documented behaviour, never
+probed here. That is a stronger position than the Codex and grok natives
+below, which are not documented to isolate at all, but it is not proof. Where
+the independence claim has to hold, dispatch the reviewers as bridged
+processes instead; those are isolated by construction.
 
 **Codex:** invoke each reviewer as a separate non-interactive execution with a
 fresh session. Do not reuse a session identifier across reviewers, and do not

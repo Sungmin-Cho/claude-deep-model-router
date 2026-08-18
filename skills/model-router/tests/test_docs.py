@@ -13,6 +13,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 SKILL = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL / "scripts"))
 
@@ -142,3 +144,167 @@ def test_skill_md_points_at_the_dispatch_layer():
     # the frontmatter description gained the background triggers
     frontmatter = text.split("---")[1]
     assert "background" in frontmatter
+
+
+# ---------------------------------------------------------------------------
+# B6 / B7 / B8 — the documents' tables and lists are compared to the config
+# cell by cell, not by substring
+#
+# The audit of 2026-08-18 found three drifts that every test in this file was
+# structurally unable to see: SKILL.md gave REVIEW x CRITICAL two workers where
+# the config gives one, both the SKILL.md and the routing-policy.md override
+# lists claimed to be complete while omitting `concurrency_sensitive`, and the
+# operational-flag list named one of the two flags the config declares. The
+# checks above are substring checks, and a substring check cannot notice a
+# missing row. These compare the parsed document against the parsed YAML, and
+# they are the reason routing-policy.md and model-profiles.md are opened here
+# at all — until now neither was.
+# ---------------------------------------------------------------------------
+
+SKILL_MD = (SKILL / "SKILL.md").read_text()
+ROUTING_POLICY_MD = (SKILL / "references" / "routing-policy.md").read_text()
+MODEL_PROFILES_MD = (SKILL / "references" / "model-profiles.md").read_text()
+
+
+def _fenced_after(text: str, marker: str) -> str:
+    """The first fenced block following `marker`."""
+    assert marker in text, f"anchor missing: {marker!r}"
+    tail = text[text.index(marker):]
+    m = re.search(r"```\n(.*?)```", tail, re.S)
+    assert m, f"no fenced block after {marker!r}"
+    return m.group(1)
+
+
+def _norm(s: str) -> str:
+    """Documents hyphenate what the config spells with an underscore."""
+    return s.replace("-", "_")
+
+
+def _md_table(text: str, marker: str) -> tuple[list[str], list[list[str]]]:
+    """(header cells, body rows) of the first pipe table after `marker`."""
+    assert marker in text, f"anchor missing: {marker!r}"
+    lines = text[text.index(marker):].splitlines()
+    rows = []
+    for line in lines:
+        if line.startswith("|"):
+            rows.append([c.strip() for c in line.strip("|").split("|")])
+        elif rows:
+            break
+    assert len(rows) >= 3, f"no table after {marker!r}"
+    return rows[0], rows[2:]
+
+
+def test_skill_md_worker_table_matches_the_config_cell_by_cell():
+    header, rows = _md_table(SKILL_MD, "### Worker by class and band")
+    bands = [c.strip("`") for c in header[1:]]
+    assert bands == sorted(CFG["router"]["bands"],
+                           key=lambda b: CFG["router"]["bands"][b]["ordinal"])
+    documented = {}
+    for row in rows:
+        task_class = row[0].strip("`")
+        for band, cell in zip(bands, row[1:]):
+            # Footnote markers carry prose, not policy: the cell is what routes.
+            value = cell.replace("†", "").replace("‡", "by_reasoning_centric").strip()
+            documented[(task_class, band)] = value
+    actual = {(c, b): v for c, row in CFG["worker_selection"].items()
+              for b, v in row.items()}
+    assert documented == actual
+
+
+def test_flag_groups_in_both_documents_match_the_config():
+    """Every group, in both documents. `termination_unconfirmed` was declared,
+    used, and explained in SKILL.md's own dispatch section while missing from
+    its flag inventory — a document contradicting itself within one file."""
+    block = _fenced_after(SKILL_MD, "**Flags** — detect all that apply:")
+    skill_groups: dict[str, set[str]] = {}
+    current = None
+    for line in block.splitlines():
+        if line.rstrip().endswith(":"):
+            current = _norm(line.split("(")[0].strip().rstrip(":").strip())
+            skill_groups[current] = set()
+        elif line.strip() and current:
+            skill_groups[current].update(line.split())
+    expected = {group: set(flags) for group, flags in CFG["flags"].items()}
+    assert skill_groups == expected
+
+    policy_groups = {
+        _norm(label.lower()): set(_fenced_after(ROUTING_POLICY_MD, f"**{label}**").split())
+        for label in ("Critical-domain", "Elevating", "Operational", "Context")
+    }
+    assert policy_groups == expected
+
+
+def test_skill_md_elevating_flag_effect_table_is_complete():
+    _, rows = _md_table(SKILL_MD, "What each elevating flag actually does")
+    assert {row[0].strip("`") for row in rows} == set(CFG["flags"]["elevating"])
+
+
+def _predicate_tokens(node) -> set[str]:
+    """Every flag, flag-group and dimension name a `when` predicate names."""
+    out: set[str] = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("flag", "any_flag_in"):
+                out.add(value)
+            elif key == "dimension_at_least":
+                out.update(value)
+            else:
+                out |= _predicate_tokens(value)
+    elif isinstance(node, list):
+        for item in node:
+            out |= _predicate_tokens(item)
+    return out
+
+
+@pytest.mark.parametrize("doc", ["SKILL.md", "routing-policy.md"])
+def test_override_lists_are_complete_and_in_config_order(doc):
+    text = SKILL_MD if doc == "SKILL.md" else ROUTING_POLICY_MD
+    lines = [l for l in _fenced_after(text, "for every task class:").splitlines() if l.strip()]
+    overrides = CFG["overrides"]
+    assert len(lines) == len(overrides), (
+        f"{doc} documents {len(lines)} override rules; the config declares "
+        f"{len(overrides)}. A list that claims to be unconditional and is "
+        f"short by one is worse than no list.")
+    for line, rule in zip(lines, overrides):
+        got = _norm(line)
+        for token in _predicate_tokens(rule["when"]):
+            assert token in got, (doc, rule["name"], token, line)
+        effect = rule["effect"]
+        if "band_at_least" in effect:
+            assert f"max(band, {effect['band_at_least']})" in line, (doc, rule["name"])
+        elif "band_exactly" in effect:
+            assert f"= {effect['band_exactly']}" in line, (doc, rule["name"])
+        else:
+            assert effect["route"] in line, (doc, rule["name"])
+
+
+def test_model_profiles_states_the_long_context_tier_the_config_records():
+    """A profile document that quotes only the cheap half of a tiered price
+    reads as an unconditional advantage — which is what it did until the
+    2026-08-18 audit. The numbers here are the config's."""
+    xai = next(m for m in CFG["models"].values() if m["family"] == "xai")
+    tier = xai["price_per_mtok"]["long_context"]
+    assert f"{tier['above_input_tokens'] // 1000}K" in MODEL_PROFILES_MD
+    for value in (tier["input"], tier["output"]):
+        assert f"${value:.2f}" in MODEL_PROFILES_MD, value
+    assert f"{xai['context_window'] // 1000}K" in MODEL_PROFILES_MD
+    sel = CFG["worker_balanced_selection"]
+    assert sel["prefer_alt_when_flag"] in MODEL_PROFILES_MD
+    assert sel["alt"] in MODEL_PROFILES_MD
+
+
+def test_review_policy_does_not_outclaim_the_ledger_on_subagent_isolation():
+    """C4/C6 (audit 2026-08-18). The ledger records Claude Code subagent
+    isolation as `assumed` — documented behaviour, never probed — while this
+    document called it "the enforcement boundary" flatly and then singled out
+    Codex and grok as the ones carrying an unverified assumption. Two of the
+    three natives were hedged and the third, which the default binding actually
+    uses, was not."""
+    ledger = {e["item"]: e for e in CFG["verification_ledger"]["entries"]}
+    entry = next(e for item, e in ledger.items() if "Claude Code subagent" in item)
+    assert entry["status"] != "verified", "ledger changed; re-read this test"
+    text = (SKILL / "references" / "review-policy.md").read_text()
+    assert "Subagent context isolation is the\nenforcement boundary." not in text
+    assert f"`{entry['status']}`" in text, (
+        f"the ledger records this as {entry['status']!r}; the document that "
+        f"tells a caller how to enforce isolation must use the same word")

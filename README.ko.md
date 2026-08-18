@@ -48,7 +48,7 @@ claude plugin add https://github.com/Sungmin-Cho/claude-deep-model-router.git
 # Codex — Codex 설정에서 로컬 경로를 plugin 디렉터리로 추가
 ```
 
-채점기와 dispatch supervisor는 Python 3가 필요합니다. supervisor는 POSIX 전용입니다(프로세스 그룹 제어). Node 런타임 의존성은 없습니다.
+채점기와 dispatch supervisor는 Python 3와 **PyYAML**이 필요합니다 — 정책이 YAML 파일이므로, PyYAML이 없는 환경에서는 첫 라우팅부터 실패합니다. 인터프리터에 없다면 `python3 -m pip install pyyaml`로 설치하세요. supervisor는 POSIX 전용입니다(프로세스 그룹 제어). Node 런타임 의존성은 없습니다.
 
 ---
 
@@ -115,7 +115,7 @@ critical-domain 플래그(auth, security, financial, data integrity)는 채점 �
 
 정책은 `skills/model-router/config/model-routing.yaml`에 있습니다. 모델 식별자는 여기에만 등장합니다. 스킬 본문과 `references/`는 스크립트가 실행하는 규칙과 같습니다.
 
-exit status도 계약입니다. **0** 디스패치 가능, **1** terminal, **2** 잘못된 입력, **3** 먼저 확인 필요, **4** production hotfix(배포 후 확인), **5** 내부 오류.
+exit status도 계약입니다. **0** 디스패치 가능, **1** terminal, **2** 잘못된 입력, **3** 먼저 확인 필요, **4** production hotfix(배포 후 확인), **5** 내부 오류. 이 중 3만 설정 가능합니다 — `human_in_the_loop.human_gate_exit_status`이며 3..255 범위의 값을 가질 수 있으므로, 3을 이미 다른 용도로 쓰는 호출자는 게이트 코드를 옮길 수 있습니다. 하드코딩하지 말고 config에서 읽으세요. 0·1·2는 이미 사용 중이고 255를 넘으면 성공 코드로 잘리기 때문에, 이 범위는 로드 시점에 검증합니다.
 
 ---
 

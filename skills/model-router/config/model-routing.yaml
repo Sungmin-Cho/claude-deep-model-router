@@ -47,6 +47,20 @@ router:
   confidence:
     escalate_below:     0.60   # re-classify at higher effort, or ask a human
     extra_review_below: 0.80   # execute, but raise the review band one level
+    # The value those two thresholds judge. Until the 2026-08-18 audit the
+    # thresholds lived here and the numbers producing the value lived in
+    # `routing_confidence`, so moving a threshold meant guessing at constants in
+    # another file — one policy split across two sources, which this file's
+    # header forbids. Confidence starts at `base` and each condition that holds
+    # subtracts its penalty; the result is clamped to 0..1 and rounded to 2dp.
+    base: 0.95
+    penalties:
+      uncertainty_3:           0.20
+      uncertainty_2:           0.08
+      prior_failures_2_or_more: 0.15
+      prior_failures_1:        0.05
+      any_fallback:            0.10
+      unknown_root_cause:      0.10
 
   floors:
     # Round 9. `critical_domain_review_band: HIGH` and `critical_domain_effort:
@@ -213,14 +227,19 @@ role_tiers:
 
 effort_levels: [MINIMAL, LOW, MEDIUM, HIGH, VERY_HIGH, MAX]
 
+# Every entry here is selected by `select_effort`. Round 22 removed three that
+# were not: `normal_feature` (a second spelling of `straightforward_impl`),
+# `difficult_debugging` (unreachable — hard debugging routes through
+# `unknown_root_cause`), and `orchestration` (a second copy of
+# `router.default_orchestrator_effort`). The whole subtree used to be excused as
+# "guidance for the caller", which was false — the router reads it — and the
+# blanket excuse is what let three dead keys sit here unseen.
 effort_by_work:
   formatting_rename:        LOW
   boilerplate:              LOW
   straightforward_impl:     MEDIUM
-  normal_feature:           MEDIUM
   multi_file_feature:       HIGH
   debugging:                HIGH
-  difficult_debugging:      VERY_HIGH
   refactoring:              HIGH
   multi_system_refactoring: VERY_HIGH
   architecture:             HIGH
@@ -228,7 +247,6 @@ effort_by_work:
   unknown_root_cause:       MAX
   standard_review:          HIGH
   adversarial_review:       MAX
-  orchestration:            HIGH
 
 # Floors override the table above — never the other way round.
 effort_floors:
@@ -251,11 +269,22 @@ review:
     independent: false
 
   MEDIUM:
-    reviewer_count: 1
     candidates: [worker_balanced, senior_engineer, reasoning_specialist]
-    prefer_cross_family: true
     effort: HIGH
     independent: true
+    # Depth is the reviewer LIST in every other band, and MEDIUM is no
+    # exception: exactly one candidate is seated. `reviewer_count: 1` and
+    # `prefer_cross_family: true` sat here until the 2026-08-18 audit measured
+    # them — setting the count to 3 and the preference to false produced
+    # identical routes, because `select_review` seats one reviewer and prefers
+    # a cross-family one unconditionally. They were not forgotten wiring; they
+    # were constants wearing a config file, the shape round 17 removed from
+    # `human_in_the_loop.on_retry_exhaustion`. Neither is worth making real:
+    #   * a second MEDIUM reviewer is HIGH's depth at MEDIUM's price, and the
+    #     way to ask for that is to raise the band — which is what bands are;
+    #   * cross-family-first is the REASON this band names candidates instead
+    #     of a fixed reviewer, so a key offering to turn it off is a safety
+    #     property with a switch on it.
     # First candidate that is both available and a different family from the
     # implementer wins.
     preferred_by_implementer:
@@ -442,7 +471,19 @@ models:
     capability_tier: 1
     effort_ceiling: VERY_HIGH   # probed: the CLI rejects `max`
     verified: true
-    price_per_mtok: { input: 2.00, output: 6.00, cached_input: 0.50 }
+    # Tiered, unlike every other row here. Once a prompt reaches
+    # `above_input_tokens`, xAI bills the ENTIRE request at the second tier —
+    # not just the tokens past the line. Recording only the first tier stated
+    # the half of the price that makes this seat look unconditionally cheaper
+    # than the claude balanced seat, which it is not: above the line it costs
+    # more on both axes. `worker_balanced_selection.prefer_alt_when_flag` is
+    # the rule that acts on this; see also `context_window`.
+    price_per_mtok:
+      input: 2.00
+      output: 6.00
+      cached_input: 0.50
+      long_context: { above_input_tokens: 200000, input: 4.00, output: 12.00, cached_input: 1.00 }
+    context_window: 500000
 
   # Unbound: suite already names this id, but P0 does not dispatch it.
   gemini_flash:
@@ -506,7 +547,19 @@ role_bindings:
 # point of the first escalation.
 worker_balanced_selection:
   prefer: worker_balanced
+  alt:    worker_balanced_alt
   use_alt_when: worker_balanced_unavailable
+  # The one deterministic fact that moves this binding. Below 200K input tokens
+  # the primary seat ties on input price and wins on output; at or above it,
+  # xAI re-bills the whole request at $4.00/$12.00 and the primary loses on
+  # BOTH axes while running out of window 500K earlier than the alt. A flag is
+  # the caller's statement about which side of that line this route is on —
+  # the router never sees a token count.
+  #
+  # This is a binding choice, not a fallback: the primary is available and the
+  # resolver must not record it as though scarcity had struck. If the alt is
+  # itself unavailable the primary comes back, and THAT is recorded.
+  prefer_alt_when_flag: large_context
 
 # ---------------------------------------------------------------------------
 # Runtime adapters
@@ -757,6 +810,17 @@ verification_ledger:
         treat a grok-native dual review as degraded unless both reviewers run
         as separate processes.
 
+    - item: "grok-4.6 long-context pricing tier"
+      status: verified
+      probed_on: 2026-08-18
+      evidence: >
+        Published rates: at or above 200K input tokens xAI bills the WHOLE
+        request at $4.00/$12.00 per MTok (cached $1.00), double the standard
+        tier, and grok-4.6's window ends at 500K. Claude 4.6+ models bill their
+        full 1M window at flat standard rates. Sourced from published pricing
+        summaries, not from a probe of a >200K request — the tier boundary
+        itself was not exercised here.
+
     - item: "worker_balanced binding: grok-4.6 over claude-sonnet-5"
       status: price_verified_quality_unverified
       probed_on: 2026-08-17
@@ -769,4 +833,6 @@ verification_ledger:
         established. No head-to-head was run here. The binding rests on the
         verified output-price advantage against a claimed frontier tier, not
         on a demonstrated quality advantage. capability_tier stays 1 for
-        that reason.
+        that reason. The output-price advantage holds BELOW 200K input tokens
+        only; see the long-context tier entry above, which is why
+        `worker_balanced_selection.prefer_alt_when_flag` exists.

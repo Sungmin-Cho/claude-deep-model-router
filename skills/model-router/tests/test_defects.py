@@ -12,6 +12,7 @@ without ever marking a model unavailable, so it could not have failed.
 Run:  python3 -m pytest skills/model-router/tests/ -q
 """
 
+import copy
 import itertools
 import json
 import re
@@ -1021,8 +1022,6 @@ DOCUMENTED_BUT_UNREAD = {
     "review.MEDIUM.preferred_by_implementer.reasoning_specialist": "read for "
         "the implementers that reach MEDIUM; these two do not in any probe",
     "review.MEDIUM.preferred_by_implementer.worker_balanced_alt": "see above",
-    "effort_by_work": "per-work-kind guidance for the caller; the router's own "
-                      "effort comes from effort_by_work entries that map to a band",
     "effort_map.claude.MINIMAL": "vocabulary completeness — no band or "
                                  "floor selects MINIMAL",
     "effort_map.openai.MINIMAL": "same",
@@ -1036,11 +1035,49 @@ DOCUMENTED_BUT_UNREAD = {
     "effort_map.gemini": "unbound family: registered for suite ID spelling, "
                          "dispatchable:false, never seated so effort_map.gemini "
                          "leaves are completeness-only",
-    "models": "ids/families/tiers are read; price_per_mtok and verified are "
-              "cost and provenance documentation for people",
     "transports": "how the CALLER invokes each model; the router names models, "
                   "it does not dispatch them",
 }
+
+# Per model and per leaf, not as a blanket `models` exemption. The audit of
+# 2026-08-18 found the blanket form giving `capability_tier` — which the router
+# reads on every strength comparison — the same excuse as `price_per_mtok`,
+# which it never reads. Naming the leaves means adding an unread one to the
+# registry requires saying so.
+DOCUMENTED_BUT_UNREAD.update({
+    f"models.{key}.{leaf}": reason
+    for key, model in CFG["models"].items()
+    for leaf, reason in (
+        ("price_per_mtok", "cost documentation for people; grep-verified to have "
+                           "no code consumer, so staleness misleads a reader "
+                           "rather than misrouting a task"),
+        ("verified", "provenance documentation; verification_ledger is the record"),
+        ("context_window", "documentation of the seat's limit; the router counts "
+                           "no tokens, so it cannot compare against it. The one "
+                           "decision this number drives is expressed as the "
+                           "`large_context` rule in worker_balanced_selection"),
+    )
+    if leaf in model
+})
+
+# A model no role binding and no fallback list names is never offered as a
+# candidate, so the one switch that would refuse it is never reached. Derived
+# rather than spelled with a model key: binding the model is what should make
+# this leaf required reading, and that must not depend on editing a test.
+_BOUND_MODEL_KEYS = (
+    {key for binding in CFG["role_bindings"].values() for key in binding.values()}
+    | {key for runtime in CFG["fallbacks"].values()
+       for candidates in runtime.values() for key in candidates}
+)
+DOCUMENTED_BUT_UNREAD.update({
+    f"models.{key}.dispatchable":
+        "the second lock on a model nothing binds: `_candidates` reads this for "
+        "every model it offers and never offers this one, since no role binding "
+        "and no fallback list names it. It becomes required reading the moment "
+        "something does bind it, which is exactly when it matters"
+    for key, model in CFG["models"].items()
+    if key not in _BOUND_MODEL_KEYS and "dispatchable" in model
+})
 
 
 class _Recording(Mapping):
@@ -1105,7 +1142,14 @@ def test_d14_every_config_rule_has_a_consumer_or_a_recorded_reason():
         for f in ([], ["auth_sensitive"], ["review_disagreement"], ["bridge_down"],
                   ["long_horizon"], ["migration", "data_integrity_sensitive"],
                   ["unknown_root_cause"], ["production_hotfix"], ["public_api_change"],
-                  ["concurrency_sensitive"], ["auth_sensitive", "review_disagreement"])
+                  ["concurrency_sensitive"], ["auth_sensitive", "review_disagreement"],
+                  # Context flags reach effort and binding leaves nothing else
+                  # does: `cross_service_change` is the only route to
+                  # `effort_by_work.multi_system_refactoring`, and
+                  # `large_context` the only route to the alt-seat rule. Both
+                  # were invisible while the subtrees holding them were excused
+                  # wholesale.
+                  ["cross_service_change"], ["large_context"])
         for rt in sorted(CFG["runtimes"])
         for pf, pm in ((0, []), (1, ["senior_engineer"]), (2, []), (5, []))
         for um in ([], ["claude-fable-5"], ["claude-opus-5", "gpt-5.6-sol"])
@@ -1151,6 +1195,138 @@ def test_d14_every_config_rule_has_a_consumer_or_a_recorded_reason():
     assert canary == {"router.floors.__canary__"}, (
         f"the guard did not surface a planted unread key under a read ancestor; "
         f"it reported {sorted(canary)}")
+
+
+# Review-band values whose perturbation is absorbed by design, each with the
+# reason. `DOCUMENTED_BUT_UNREAD` answers a different question — "was this key
+# ever looked at" — and B2 was two keys that WERE looked at and changed nothing.
+PERTURBATION_EXEMPT = {
+    "review.MEDIUM.preferred_by_implementer.reasoning_specialist":
+        "no probe puts this implementer in a MEDIUM review: the classes that "
+        "seat it are HIGH/CRITICAL, and a MEDIUM promotion reaching it would "
+        "have to come from a failed principal_architect, which is already the "
+        "ceiling. Uncovered, not inert.",
+    "review.MEDIUM.preferred_by_implementer.worker_balanced_alt":
+        "the alt is a binding target, not a role select_worker can return, so "
+        "it is never the implementer a MEDIUM review is picked against.",
+    "review.disagreement.code_local_dispute_judge":
+        "the recorded REAL GAP: the router always seats `default_judge` and "
+        "never inspects the dispute's kind. Wiring these needs a dispute-kind "
+        "input the request schema does not have.",
+    "review.disagreement.formal_reasoning_dispute_judge": "see above",
+    "review.disagreement.formal_reasoning_dispute_effort": "see above",
+}
+
+# Probes chosen so that every `preferred_by_implementer` key a route can reach
+# is actually reached — the four implementers that can hold a MEDIUM review,
+# including the two that only arrive there by promotion after a failure.
+_PERTURBATION_PROBES = [
+    dict(task_class="MECHANICAL", complexity=1, uncertainty=1, blast_radius=1, reversibility=1),
+    dict(task_class="MECHANICAL", complexity=0, uncertainty=0, blast_radius=0, reversibility=0),
+    dict(task_class="REFACTORING", complexity=2, uncertainty=1, blast_radius=1, reversibility=0),
+    dict(task_class="IMPLEMENTATION", complexity=3, uncertainty=3, blast_radius=3, reversibility=3),
+    dict(task_class="DEBUGGING", complexity=2, uncertainty=2, blast_radius=2, reversibility=0),
+    dict(task_class="OPERATIONS", complexity=2, uncertainty=2, blast_radius=1,
+         reversibility=1, flags=["auth_sensitive"]),
+    dict(task_class="TESTING", complexity=1, uncertainty=1, blast_radius=1,
+         reversibility=0, flags=["review_disagreement"]),
+    dict(task_class="REFACTORING", complexity=2, uncertainty=1, blast_radius=1,
+         reversibility=0, flags=["review_disagreement"]),
+    dict(task_class="REVIEW", complexity=2, uncertainty=1, blast_radius=1,
+         reversibility=0, prior_failures=1, prior_models=["grok-4.6"]),
+    dict(task_class="MECHANICAL", complexity=2, uncertainty=1, blast_radius=1,
+         reversibility=0, prior_failures=1, prior_models=["claude-opus-5"]),
+    dict(task_class="MECHANICAL", complexity=2, uncertainty=1, blast_radius=1,
+         reversibility=0, prior_failures=1, prior_models=["claude-fable-5"]),
+]
+
+
+def _routes_under(cfg):
+    out = []
+    for kw in _PERTURBATION_PROBES:
+        try:
+            out.append(route(Task(**kw), cfg))
+        except Exception as exc:  # noqa: BLE001 — a raise is itself an outcome
+            out.append({"raised": f"{type(exc).__name__}: {exc}"})
+    return out
+
+
+def _scalar_leaves(node, prefix=()):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _scalar_leaves(value, prefix + (str(key),))
+    elif not isinstance(node, list):
+        yield prefix, node
+
+
+def _alternatives(value, policy):
+    """Other values this leaf could legally hold. Every one of them, not one
+    neighbour: `default_judge` names the strongest role, so the single
+    next-role-along probe wrapped to the weakest and was corrected straight
+    back by the judge-seating rule — an effective key measured as inert."""
+    if isinstance(value, bool):
+        return [not value]
+    if isinstance(value, int):
+        return [value + 1, max(0, value - 1)]
+    if isinstance(value, str):
+        if value in policy.efforts:
+            return [e for e in policy.efforts if e != value]
+        if value in policy.roles:
+            return [r for r in policy.roles if r != value]
+    return []
+
+
+def _inert_review_leaves(cfg, baseline, policy):
+    """Leaves no legal perturbation of which moves any probe route."""
+    inert = set()
+    for path, value in _scalar_leaves(cfg["review"]):
+        name = "review." + ".".join(path)
+        if name in PERTURBATION_EXEMPT:
+            continue
+        alternatives = _alternatives(value, policy)
+        if not alternatives:
+            # Outside the perturbation vocabulary (a verdict-combination action,
+            # say). Not claimed to have an effect and not claimed to lack one.
+            continue
+        for alternative in alternatives:
+            probe_cfg = copy.deepcopy(cfg)
+            node = probe_cfg["review"]
+            for key in path[:-1]:
+                node = node[key]
+            node[path[-1]] = alternative
+            if _routes_under(probe_cfg) != baseline:
+                break
+        else:
+            inert.add(name)
+    return inert
+
+
+def test_d28_every_review_band_value_changes_a_route_when_perturbed():
+    """B2 (audit 2026-08-18). `test_d14` proves a key was READ, and reading is
+    not having an effect: `select_review` starts with `dict(cfg["review"][band])`,
+    which touches every key of the band at once, so `reviewer_count: 3` and
+    `prefer_cross_family: false` both passed d14 while producing byte-identical
+    routes. Only perturbation can tell the two apart — change the value, and if
+    nothing downstream moves, the key is decoration.
+
+    Scoped to `review` because that is where the defect was found and where the
+    "read the whole band spec" shape lives; widening it to the whole config is
+    a bigger job than this audit item, not a different one."""
+    baseline = _routes_under(CFG)
+    policy = Policy.of(CFG)
+    inert = _inert_review_leaves(CFG, baseline, policy)
+    assert inert == set(), (
+        f"review policy values no route depends on: {sorted(inert)}. Either wire "
+        f"them up, delete them, or record them in PERTURBATION_EXEMPT with the "
+        f"reason their perturbation is absorbed.")
+
+    # The same canary shape test_d14 uses, for the same reason: with the config
+    # clean the inert set is empty under a working check AND under one that
+    # silently skips everything. A planted key nothing can read must surface.
+    planted = copy.deepcopy(CFG)
+    planted["review"]["MEDIUM"]["__canary__"] = True
+    assert _inert_review_leaves(planted, _routes_under(planted), Policy.of(planted)) == {
+        "review.MEDIUM.__canary__"}
 
 
 def test_d14_every_declared_compensation_can_actually_be_emitted():
@@ -1607,7 +1783,7 @@ def test_d20_the_emitted_confidence_matches_the_emitted_fallbacks():
                              unavailable_models=list(scarce))
                 out = route(task, CFG)
                 assert out["routing_confidence"] == routing_confidence(
-                    task, out["fallbacks_applied"]), (
+                    task, out["fallbacks_applied"], CFG), (
                     f"{task_class}/{scarce}/{flags}: confidence "
                     f"{out['routing_confidence']} does not follow from the "
                     f"fallbacks it reports ({out['fallbacks_applied']})")
@@ -2512,3 +2688,34 @@ def test_d27_production_hotfix_combined_with_termination_unconfirmed_exits_3():
                "--flags", "production_hotfix,termination_unconfirmed")
     assert proc.returncode == 3
 
+
+
+def test_d29_a_router_post_condition_failure_never_borrows_a_route_status(monkeypatch):
+    """`RouterInvariantError` is raised in `route()` and no test ever provoked
+    it (audit 2026-08-18 §5), so the branch that distinguishes "this code
+    produced a state it promises never to produce" from "the caller's input is
+    wrong" was itself unexercised. The distinction is the point: exit 2 would
+    blame the caller for a defect here, and exit 1 would report a terminal
+    route that was never computed."""
+    import route_task
+
+    real_deconflict = route_task._deconflict
+
+    def leaves_a_stale_record(spec, worker, policy, resolver):
+        out = dict(real_deconflict(spec, worker, policy, resolver))
+        # A substitution record naming a seat the final roster does not hold —
+        # the exact state the post-condition exists to refuse.
+        out["self_review_avoided"] = [
+            {"replaced": "senior_engineer", "with": "a_role_no_seat_holds",
+             "reason": "planted by the test"}]
+        return out
+
+    monkeypatch.setattr(route_task, "_deconflict", leaves_a_stale_record)
+    hard = dict(task_class="IMPLEMENTATION", complexity=3, uncertainty=3,
+                blast_radius=3, reversibility=0)
+    with pytest.raises(route_task.RouterInvariantError):
+        route(_task(**hard), CFG)
+    assert route_task.main([
+        "--class", "IMPLEMENTATION", "--complexity", "3", "--uncertainty", "3",
+        "--blast-radius", "3", "--reversibility", "0", "--format", "json",
+    ]) == 5

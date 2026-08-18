@@ -164,11 +164,31 @@ fallback, so a dead bridge costs latency and money, not capability.
 
 The same posture as `worker_fast`, pointed at the first escalation.
 
-**Price — verified.** The xai frontier model is priced as a balanced-tier
-seat ($2.00 / $6.00 per million input/output tokens) against the Claude
-balanced model's $2.00 / $10.00, and against a claimed frontier tier. Input
-is now equal; the remaining advantage is output price. For the first
-escalation that difference is the point of the binding.
+**Price — verified, and tiered.** Below 200K input tokens the xai frontier
+model is priced as a balanced-tier seat ($2.00 / $6.00 per million
+input/output tokens) against the Claude balanced model's $2.00 / $10.00, and
+against a claimed frontier tier. Input is equal; the remaining advantage is
+output price. For the first escalation that difference is the point of the
+binding.
+
+**Above 200K input tokens the comparison inverts.** xAI re-bills the *entire*
+request at $4.00 / $12.00 (cached $1.00) once the prompt reaches that line —
+not just the tokens past it — while the Claude balanced model bills its full
+1M window at flat standard rates. So above 200K this seat costs more on both
+axes and runs out of window 500K earlier. The advantage is real and it is
+conditional; stating only the first half is what made the previous version of
+this section read as unconditional.
+
+That is one deterministic fact, so it is a rule rather than advice: a task
+flagged `large_context` binds `worker_balanced` to `worker_balanced_alt`
+(the Claude balanced seat) instead. The router never sees a token count, so
+the flag is the caller's statement about which side of the line the route is
+on — set it when the prompt, the retrieved context, or the files in scope
+plausibly reach 200K tokens. The swap is a binding choice, not a fallback:
+nothing became unavailable and nothing is recorded as though it had. If the
+alt seat is itself unavailable the primary comes back, and that *is* recorded
+as a fallback. Under a degraded (single-provider) binding there is no alt seat
+to prefer and the rule is a no-op.
 
 **Quality — not established.** No head-to-head was run here. A frontier claim
 is not a measured peer of the tier-2 seats.
