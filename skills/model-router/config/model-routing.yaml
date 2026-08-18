@@ -699,7 +699,7 @@ fallback_compensations:
 # building on sand. Do not promote a row without running the probe.
 
 verification_ledger:
-  probed_on: 2026-08-14
+  probed_on: 2026-08-18
   entries:
     - item: "Claude model ids (haiku-4-5-20251001, sonnet-5, opus-5, fable-5)"
       status: verified
@@ -750,18 +750,22 @@ verification_ledger:
         Confirm before claiming independent review.
 
     - item: "worker_fast binding: gpt-5.6-luna over claude-haiku-4-5"
-      status: price_verified_quality_unverified
-      probed_on: 2026-08-11
+      status: price_verified_quality_probed
+      probed_on: 2026-08-18
       evidence: >
         PRICE: verified from published rates — luna $0.20/$1.20 per MTok vs
         haiku $1.00/$5.00, i.e. 5x cheaper input and 4.2x cheaper output.
         Cached input $0.02 vs $0.10.
-        QUALITY: NOT established. A 5-task Tier 0/1 head-to-head (47 hidden
-        pytest assertions + 5 mutants, graded only on test results) scored
-        100% for both models and 308s vs 304s wall time — the task set did
-        not discriminate. No primary source puts both models on the same
-        benchmark. The binding rests on the verified price advantage, not on
-        a demonstrated quality advantage.
+        QUALITY: probed 2026-08-18 on a discriminating 446-node suite (see
+        the head-to-head entry below): haiku 442/446 vs luna 436/446 —
+        haiku marginally ahead (+1.3pp), one attempt per model, each
+        model's failures tracing to two spec-edge root causes. The gap is
+        small, recoverable by the escalation ladder, and does not overturn
+        the 5x price advantage for the volume seat; latency favours luna
+        (mean 19.6s vs 91.2s per task in the same harness). The binding
+        continues to rest on price, now with the measured quality cost on
+        record. The 2026-08-11 5-task probe (100% for both, no
+        discrimination) is superseded by this one.
 
     - item: "grok-4.6 model id"
       status: verified
@@ -822,17 +826,41 @@ verification_ledger:
         itself was not exercised here.
 
     - item: "worker_balanced binding: grok-4.6 over claude-sonnet-5"
-      status: price_verified_quality_unverified
-      probed_on: 2026-08-17
+      status: price_verified_quality_probed
+      probed_on: 2026-08-18
       evidence: >
         PRICE: verified from published rates — grok-4.6 $2.00/$6.00 per MTok
         vs sonnet-5 $2.00/$10.00. Anthropic made Sonnet 5's $2/$10
         introductory rate permanent on 2026-08-10; the previous $3.00/$15.00
         figure was the scheduled post-intro price and is now wrong. Input is
-        now equal; output remains cheaper on grok-4.6. QUALITY: NOT
-        established. No head-to-head was run here. The binding rests on the
-        verified output-price advantage against a claimed frontier tier, not
-        on a demonstrated quality advantage. capability_tier stays 1 for
-        that reason. The output-price advantage holds BELOW 200K input tokens
-        only; see the long-context tier entry above, which is why
-        `worker_balanced_selection.prefer_alt_when_flag` exists.
+        now equal; output remains cheaper on grok-4.6. QUALITY: probed
+        2026-08-18 (see the head-to-head entry below): grok-4.6 446/446 vs
+        sonnet-5 445/446 — tied at the suite's ceiling, one attempt per
+        model. No quality regression detected against the claimed frontier
+        tier; a single suite at ceiling is not grounds to raise
+        capability_tier, which stays 1 (raising it to 2 would move MEDIUM's
+        reviewer floor — a band change). The output-price advantage holds
+        BELOW 200K input tokens only; see the long-context tier entry
+        above, which is why `worker_balanced_selection.prefer_alt_when_flag`
+        exists.
+
+    - item: "Tier 0/1 binding quality head-to-head (8 tasks, 446 hidden test nodes)"
+      status: verified
+      probed_on: 2026-08-18
+      evidence: >
+        8 spec-dense stdlib tasks (glob, jsonptr, semver, intervals,
+        csvmini, wrap, debugfix, tokenbucket), each graded solely by a
+        hidden pytest suite validated 100% against an independently written
+        reference; 446 nodes total, one attempt per model, dispatched over
+        the same CLI transports the router uses (tier-0 pair at effort
+        medium, tier-1 pair at high). Scores: grok-4.6 446/446, sonnet-5
+        445/446, haiku-4-5 442/446, luna 436/446. Unlike the superseded
+        2026-08-11 set, 3 of 8 tasks discriminated, and the tier-1 pair
+        outscored the tier-0 pair — consistent with the registry's
+        capability_tier ordering. Failure modes: luna missed the long-word
+        hard-break rule (wrap, 7 nodes) and trailing-comma empty fields
+        (csvmini, 3); haiku accepted a trailing newline and a non-ASCII
+        digit in semver (2) and split on tab in wrap (2); sonnet-5 accepted
+        a non-ASCII digit in semver (1). Mean per-task wall time: luna
+        19.6s, sonnet-5 38.6s, haiku 91.2s, grok-4.6 103.2s. Bindings and
+        every capability_tier are unchanged by this probe.
