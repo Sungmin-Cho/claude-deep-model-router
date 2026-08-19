@@ -539,6 +539,11 @@ attempt whose process tree could not be confirmed dead blocks
 write-capable retries: re-route with `--flags termination_unconfirmed` and
 let the human gate hold it.
 
+Routing-dispatched seats carry the decision with them: pass the route's
+`decision_fingerprint` / `policy_sha256` to `dispatch_agent.py run`, then
+check `verify-evidence --expect-fingerprint --expect-models` — the review
+evidence chain, whose scope `references/adapters.md` ("Linkage scope") states.
+
 ## Before the first route in a session
 
 Establish what you can actually invoke. A route naming a model you cannot call

@@ -1092,3 +1092,48 @@ def test_expect_fingerprint_checks_every_receipt_and_grammar(tmp_path):
     _fake_receipt(tmp_path, "e7", "reviewer-1", "SUCCEEDED",
                   model_id="claude-opus-5", decision_fingerprint=None)
     assert _verify(tmp_path, "e7", 1, extra=["--expect-fingerprint", fp]) == 1
+
+
+def _run_fake_review(tmp_path, attempt_id, seat, model_id, extra=()):
+    """One supervised fake reviewer that prints a PASS verdict — the same
+    child the E2E above uses, with the caller's extra `run` args spliced in."""
+    fake = write_fake(tmp_path, f"{attempt_id}.py", HAPPY)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "run",
+         "--attempt-id", attempt_id,
+         "--receipt-dir", str(tmp_path / "receipts"),
+         "--deadline-seconds", "30", "--grace-seconds", "1",
+         "--seat", seat, "--model-id", model_id,
+         "--output-schema", "review", *extra,
+         "--", sys.executable, str(fake)],
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return attempt_id
+
+
+def test_route_fingerprint_flows_into_receipts_and_verify(tmp_path):
+    """design §4 B4: route JSON -> dispatch 인자 -> receipt -> verify-evidence
+    --expect-fingerprint/--expect-models 로 이어지는 리뷰 증거 사슬."""
+    sys.path.insert(0, str(SKILL / "scripts"))
+    from route_task import Task, route
+    out = route(Task(task_class="IMPLEMENTATION", complexity=2, uncertainty=1,
+                     blast_radius=2, reversibility=1,
+                     flags=["auth_sensitive"]))
+    fp = out["decision_fingerprint"]
+    models = out["review"]["reviewer_models"]
+    assert len(models) == 2 and len(set(models)) == 2
+    for i, model in enumerate(models, 1):
+        _run_fake_review(tmp_path, f"seat{i}", seat=f"reviewer-{i}",
+                         model_id=model,
+                         extra=["--decision-fingerprint", fp,
+                                "--policy-sha256", out["policy_sha256"]])
+    assert _verify(tmp_path, "seat1,seat2", 2,
+                   extra=["--expect-fingerprint", fp,
+                          "--expect-models", ",".join(models)]) == 0
+    # 불일치 주입: 다른 결정의 fingerprint는 거부된다
+    other = route(Task(task_class="MECHANICAL", complexity=0, uncertainty=0,
+                       blast_radius=0, reversibility=0))
+    assert other["decision_fingerprint"] != fp
+    assert _verify(tmp_path, "seat1,seat2", 2,
+                   extra=["--expect-fingerprint",
+                          other["decision_fingerprint"]]) == 1
