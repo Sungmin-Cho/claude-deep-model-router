@@ -38,12 +38,13 @@ happened.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import traceback
 from dataclasses import dataclass, field, fields, replace
 
-from policy_digest import policy_sha256
+from policy_digest import canonical_policy_sha256, policy_sha256
 from pathlib import Path
 from typing import Any
 
@@ -207,17 +208,28 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
 class Policy:
     """Everything derivable from a config, computed once per config."""
 
-    # Keyed on id(cfg). Safe because `__init__` stores `self.cfg = cfg`, so a
-    # cached Policy keeps its config alive and that id cannot be recycled while
-    # the entry exists. Round 9 added a redundant (cfg, policy) tuple to "fix"
-    # a hazard that this line already prevented, in the same commit that
-    # removed inert policy elsewhere — round 10 caught the irony. The cost that
-    # IS real: the cache is unbounded, so a process routing against many
-    # distinct config objects retains all of them.
-    _cache: dict[int, "Policy"] = {}
+    # id(cfg) -> (content digest, Policy): ONE entry per config object, holding
+    # its current revision. Identity keys are safe because `__init__` stores
+    # `self.cfg = cfg`, so the live entry keeps its config alive and that id
+    # cannot be recycled — which is why the entry is REPLACED rather than
+    # dropped when the content moves. Any future eviction must preserve that
+    # property: evicting the last entry for a live id reintroduces the
+    # id-recycling hazard this design has always depended on not having.
+    # Round 9 added a redundant (cfg, policy) tuple to "fix" a hazard that this
+    # line already prevented, in the same commit that removed inert policy
+    # elsewhere — round 10 caught the irony. The digest half arrived in 1.2.0:
+    # identity alone answered a mutated config from a stale entry while the
+    # emitted `policy_sha256` attested the new content. The cost that IS real:
+    # the cache is unbounded in the number of distinct config OBJECTS, so a
+    # process routing against many of them retains all of them — but no longer
+    # unbounded in how often any one of them is edited.
+    _cache: dict[int, tuple[str | None, "Policy"]] = {}
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        # Set by `of()`; None for a Policy built directly or from a non-dict
+        # Mapping, both of which have no content digest to publish.
+        self.content_sha: str | None = None
         self.bands: list[str] = sorted(cfg["router"]["bands"], key=lambda b: cfg["router"]["bands"][b]["ordinal"])
         self.efforts: list[str] = list(cfg["effort_levels"])
         self.roles: list[str] = list(cfg["role_tiers"])
@@ -275,6 +287,22 @@ class Policy:
                     f"{self.efforts}; a ceiling naming no real level cannot be "
                     f"compared and would be skipped in silence")
             self.ceiling_of[model["id"]] = ceiling
+
+        # served_model_caveats: a disclosure trigger list. Strict-loud like
+        # every other vocabulary — an unknown flag or a duplicate reads as
+        # policy and discloses nothing.
+        for key, model in cfg["models"].items():
+            caveats = model.get("served_model_caveats")
+            if caveats is None:
+                continue
+            if len(set(caveats)) != len(caveats):
+                raise ConfigError(f"models.{key}.served_model_caveats has duplicates")
+            unknown = set(caveats) - self.known_flags
+            if unknown:
+                raise ConfigError(
+                    f"models.{key}.served_model_caveats names unknown flag(s) "
+                    f"{sorted(unknown)}; a trigger outside the flags vocabulary "
+                    f"can never fire")
 
         # What each band demands of a reviewer, expressed as a model tier and
         # derived from the band's own configured reviewer roles under the
@@ -362,10 +390,32 @@ class Policy:
 
     @classmethod
     def of(cls, cfg: dict) -> "Policy":
-        key = id(cfg)
-        if key not in cls._cache:
-            cls._cache[key] = cls(cfg)
-        return cls._cache[key]
+        """Derived policy for `cfg`, rebuilt whenever its content moves.
+
+        Identity alone was not enough once `policy_sha256` became a CONTENT
+        digest (design §4 B1): a caller that mutates a cfg dict in place
+        between routes got semantics precomputed from the pre-mutation
+        content while the emitted digest attested the post-mutation content
+        — one fingerprint over two different decisions, which is precisely
+        what the fingerprint claims cannot happen.
+
+        The digest is computed once here and published as `content_sha`, so
+        `route()` emits the same value it keyed on instead of dumping the
+        same object a second time; two independent canonicalisations agreeing
+        only because nothing happened in between is not a guarantee.
+
+        A non-dict Mapping (test instrumentation) has no content digest —
+        `route()` routes those to the on-disk digest for the same reason —
+        so it keeps the identity-only behaviour it always had.
+        """
+        digest = canonical_policy_sha256(cfg) if isinstance(cfg, dict) else None
+        cached = cls._cache.get(id(cfg))
+        if cached is None or cached[0] != digest:
+            policy = cls(cfg)
+            policy.content_sha = digest
+            cls._cache[id(cfg)] = (digest, policy)
+            return policy
+        return cached[1]
 
     # ordered-enum helpers, bound to this policy's vocabulary
     def band_max(self, a, b): return self.bands[max(self.bands.index(a), self.bands.index(b))]
@@ -1390,6 +1440,60 @@ def _worker_effort_floor(task: Task, band: str, policy: Policy) -> tuple[str, st
     return max(applied, key=lambda pair: policy.efforts.index(pair[1]), default=None)
 
 
+def _canonical_json(obj) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def request_sha256_of(task: Task) -> str:
+    """The caller's request in canonical form, hashed — computed from the
+    ORIGINAL validated input, before route() blanks prior_models on a
+    history gap. Normalisation mirrors exactly how route() consumes each
+    field: set-semantics lists dedup+sort, isolation_evidence additionally
+    strips (route reads it as a stripped distinct set), prior_models keeps
+    multiplicity (two failures of one model are two entries), and
+    local_policy follows bool(lp): falsy (absent or {}) becomes null.
+    """
+    lp = task._local_policy
+    lp_norm = None
+    if lp:
+        lp_norm = {k: lp.get(k) for k in sorted(LOCAL_POLICY_KEYS)}
+        if lp_norm.get("allowed_families") is not None:
+            lp_norm["allowed_families"] = sorted(set(lp_norm["allowed_families"]))
+    canonical = {
+        "task_class": task.task_class,
+        "complexity": task.complexity,
+        "uncertainty": task.uncertainty,
+        "blast_radius": task.blast_radius,
+        "reversibility": task.reversibility,
+        "reasoning_centric": task.reasoning_centric,
+        "flags": sorted(set(task.flags)),
+        "prior_failures": task.prior_failures,
+        "prior_models": sorted(task.prior_models),
+        "runtime": task.runtime,
+        "unavailable_roles": sorted(set(task.unavailable_roles)),
+        "unavailable_models": sorted(set(task.unavailable_models)),
+        "isolation_available": task.isolation_available,
+        "isolation_evidence": sorted({e.strip() for e in task.isolation_evidence
+                                      if e.strip()}),
+        "local_policy": lp_norm,
+    }
+    return hashlib.sha256(_canonical_json(canonical).encode()).hexdigest()
+
+
+def decision_fingerprint_of(request_sha: str, policy_sha: str,
+                            version: str) -> str:
+    """Same request x same policy x same router version -> same decision.
+    Identifies the DECISION equivalence class, not the task instance —
+    instance linkage lives in the receipt's prompt_sha256 (see design §8).
+    """
+    return hashlib.sha256(_canonical_json({
+        "request_sha256": request_sha,
+        "policy_sha256": policy_sha,
+        "router_plugin_version": version,
+    }).encode()).hexdigest()
+
+
 def _clamp(policy: Policy, effort: str, model: str | None) -> str:
     """The highest level at or below `effort` that `model` will accept."""
     ceiling = policy.ceiling_of.get(model) if model else None
@@ -1403,6 +1507,18 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     cfg = cfg if cfg is not None else default_config()
     policy = Policy.of(cfg)
     task.validate(policy)
+
+    request_sha = request_sha256_of(task)
+    # The digest of the policy ACTUALLY IN USE — the same computation that
+    # keyed this Policy, not a second dump of the same object. A non-dict
+    # Mapping (test instrumentation such as test_d14's recorder) has no
+    # content digest and falls back to the on-disk one, so the digest walk
+    # cannot mark every config path as "read" and hollow out the consumer
+    # guard. Precondition, and the reason this reads a single value: `cfg`
+    # must not change during a `route()` call. The router never mutates it;
+    # a caller that does (from another thread, or a self-mutating Mapping)
+    # gets a decision this digest does not describe.
+    policy_hash = policy.content_sha or policy_sha256(CONFIG_PATH)
 
     lp = task._local_policy or {}
     local_unsat = False
@@ -1952,12 +2068,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             # gate" on a route that was terminal at exit 1.
             notified.append((key, why))
         else:
-            # No `else: treat it as the weakest action`. `Policy` validates this
-            # vocabulary, but `Policy.of` caches on config identity and the
-            # config is a mutable dict, so a value changed after the first route
-            # reaches here unvalidated — and defaulting an unknown word to
-            # "notify" is a control failing OPEN, which is the one direction it
-            # must never fail.
+            # No `else: treat it as the weakest action`. `Policy` validates
+            # this vocabulary at build time, and since 1.2.0 a dict config
+            # edited between routes is rebuilt (the content digest moved), so
+            # that path now raises in `Policy.__init__` and never reaches
+            # here. This stays as depth: the remaining way in is a non-dict
+            # Mapping, whose Policy is still cached on identity alone — and
+            # defaulting an unknown word to "notify" is a control failing
+            # OPEN, which is the one direction it must never fail.
             raise ConfigError(
                 f"human_in_the_loop.{key} = {action!r} is not an implemented action")
 
@@ -2028,6 +2146,30 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # worker left a consumer able to dispatch the reviewers from a route the
     # rationale said must not be executed.
     executable = terminal is None
+    if executable:
+        # Served-model caveat disclosure (design §4 B5): per MODEL once,
+        # registry key not model id (terminal withholding scans ids), the
+        # matched flags joined so multiple caveats stay one line.
+        disclosed: set[str] = set()
+        for role in dict.fromkeys([worker] + list(review["reviewers"])
+                                  + ([judge] if judge else [])):
+            model = resolved.get(role)
+            if not model or model in disclosed:
+                continue
+            disclosed.add(model)
+            key = policy.id_to_key[model]
+            caveats = cfg["models"][key].get("served_model_caveats") or []
+            matched = sorted(set(caveats) & set(task.flags))
+            if matched:
+                # The vendor comes from the SEATED model's family, never a
+                # literal: `served_model_caveats` is accepted on any registry
+                # row, so hard-coding one vendor is a false disclosure one
+                # config edit away (round-1 review F3). The registry key still
+                # does the identifying — model ids stay out of notes.
+                worker_notes.append(
+                    f"provider may substitute another {policy.family_of[model]} "
+                    f"model for {', '.join(matched)} content; the requested "
+                    f"identity of {key} is declared_only")
     effective_policy = {
         "minimum_capability_tier": lp.get("minimum_capability_tier"),
         "minimum_effort": lp.get("minimum_effort"),
@@ -2039,7 +2181,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     result = {
         "route_schema_version": ROUTE_SCHEMA_VERSION,
         "router_plugin_version": plugin_manifest_version(),
-        "policy_sha256": policy_sha256(CONFIG_PATH),
+        "policy_sha256": policy_hash,
+        "request_sha256": request_sha,
+        "decision_fingerprint": decision_fingerprint_of(
+            request_sha, policy_hash, plugin_manifest_version()),
         "effective_policy": effective_policy,
         "selected_capability_tier": (
             policy.tier_of[worker_model] if worker_model else None),
@@ -2118,6 +2263,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "escalation_count": task.prior_failures,
         "retry_count": task.prior_failures,
         "routing_confidence": confidence,
+        # A heuristic gate score (base minus penalties), NOT a calibrated
+        # success probability. The kind is emitted so no consumer has to
+        # guess which one it is reading.
+        "routing_confidence_kind": "heuristic_policy_score",
         "requires_human_confirmation": requires_human,
         # Which configurable controls fired, by cause rather than by prose. The
         # reason strings are for people; these are what a test can hold the

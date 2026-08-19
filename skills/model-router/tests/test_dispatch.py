@@ -823,17 +823,27 @@ def test_cancel_of_a_stale_running_receipt_removes_the_claim_too(tmp_path):
 
 
 def _fake_receipt(tmp_path, attempt_id, seat, state, output_schema="review",
-                   schema_valid=True):
+                   schema_valid=True, model_id=None, decision_fingerprint=None):
     receipts = tmp_path / "receipts"
     receipts.mkdir(exist_ok=True)
     payload = {
         "attempt_id": attempt_id, "seat": seat,
         "result": {"state": state},
         "output_schema": output_schema,
+        # design §4 B2/B3 — the declared model and the decision this seat
+        # was dispatched under. Both null unless a test names them, which is
+        # exactly the shape a caller that passed neither arg produces.
+        "model_id": model_id,
+        "decision_fingerprint": decision_fingerprint,
     }
     if schema_valid is not None:
         payload["result"]["schema_valid"] = schema_valid
     (receipts / f"{attempt_id}.json").write_text(json.dumps(payload))
+
+
+def _verify(tmp_path, ids, count, extra=()):
+    return _agent(["verify-evidence", "--ids", ids,
+                   "--expect-count", str(count), *extra], tmp_path).returncode
 
 
 def test_verify_evidence_accepts_exactly_the_valid_set(tmp_path):
@@ -926,6 +936,9 @@ RECEIPT_KEYS = {
     "attempt_id", "seat", "runtime", "model_id", "effort_native",
     "permission_mode", "argv", "prompt_sha256", "output_schema",
     "process", "timing", "result",
+    # design §4 B2 — decision linkage and the requested-vs-served slots.
+    "decision_fingerprint", "policy_sha256", "transport_id",
+    "host_cli_version", "observed_model_id", "observed_model_source",
 }
 RECEIPT_PROCESS_KEYS = {"pid", "process_group_id", "supervisor_pid"}
 RECEIPT_TIMING_KEYS = {"started_at", "deadline_at", "finished_at"}
@@ -1002,3 +1015,153 @@ def test_a_route_can_be_dispatched_and_verified_end_to_end(tmp_path):
          "--isolation", "available", "--isolation-evidence", ",".join(ids)],
         capture_output=True, text=True, timeout=60)
     assert json.loads(routed_back.stdout)["review"]["review_independence"] == "enforced"
+
+
+def test_new_linkage_args_round_trip_into_the_receipt(tmp_path):
+    """design §4 B2: 네 caller-supplied 값은 그대로 receipt에 실리고,
+    observed 쌍은 이 트랜치에서 항상 기본값이다 (자리 확정 — unknown을
+    verified로 승격하는 경로는 없다)."""
+    fp, ps = "ab" * 32, "cd" * 32
+    fake = write_fake(tmp_path, "rt.py", HAPPY)
+    proc, receipt = run_dispatch(
+        tmp_path, [sys.executable, fake], attempt_id="rt1",
+        extra=["--decision-fingerprint", fp, "--policy-sha256", ps,
+               "--transport-id", "claude_code.to_openai",
+               "--host-cli-version", "codex 0.148.0"])
+    assert proc.returncode == 0, proc.stderr
+    assert receipt["decision_fingerprint"] == fp
+    assert receipt["policy_sha256"] == ps
+    assert receipt["transport_id"] == "claude_code.to_openai"
+    assert receipt["host_cli_version"] == "codex 0.148.0"
+    assert receipt["observed_model_id"] is None
+    assert receipt["observed_model_source"] == "unavailable"
+
+
+def test_malformed_digest_args_are_refused_pre_spawn(tmp_path):
+    """오타가 receipt에 영구 기록되기 전에 죽는다 — 비-hex, 대문자, 길이
+    오류 전부 exit 2이고 receipt는 만들어지지 않는다."""
+    fake = write_fake(tmp_path, "bad.py", HAPPY)
+    # The trailing-newline case is round-1 review F1: Python's `$` also matches
+    # just before a final newline, so `^[0-9a-f]{64}$` passed a 65-char value
+    # and the malformed digest was written verbatim into the permanent
+    # receipt — the one outcome this gate exists to prevent.
+    for i, bad in enumerate(("xyz", "AB" * 32, "ab" * 31, "ab" * 32 + "\n")):
+        attempt = f"bad-{i}"
+        proc, receipt = run_dispatch(
+            tmp_path, [sys.executable, fake], attempt_id=attempt,
+            extra=["--decision-fingerprint", bad])
+        assert proc.returncode == 2, (bad, proc.stderr)
+        assert receipt is None, (
+            "a malformed digest must fail before any receipt exists")
+
+
+def test_expect_models_matches_declared_models_as_a_multiset(tmp_path):
+    _fake_receipt(tmp_path, "e1", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5")
+    _fake_receipt(tmp_path, "e2", "reviewer-2", "SUCCEEDED",
+                  model_id="gpt-5.6-sol")
+    ok = _verify(tmp_path, "e1,e2", 2,
+                 extra=["--expect-models", "gpt-5.6-sol,claude-opus-5"])
+    assert ok == 0                      # 순서 무관
+    bad = _verify(tmp_path, "e1,e2", 2,
+                  extra=["--expect-models", "claude-opus-5,grok-4.6"])
+    assert bad == 1                     # 불일치는 문제로 보고
+
+
+def test_expect_models_rejects_duplicates_empties_and_count_mismatch(tmp_path):
+    _fake_receipt(tmp_path, "e3", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5")
+    assert _verify(tmp_path, "e3", 1, extra=["--expect-models", "a,,b"]) == 2
+    assert _verify(tmp_path, "e3", 1, extra=["--expect-models", "a,a"]) == 2
+    assert _verify(tmp_path, "e3", 1, extra=["--expect-models", "a,b"]) == 2  # count 1 != 2
+
+
+def test_expect_models_flags_a_null_model_receipt(tmp_path):
+    _fake_receipt(tmp_path, "e4", "reviewer-1", "SUCCEEDED", model_id=None)
+    assert _verify(tmp_path, "e4", 1,
+                   extra=["--expect-models", "claude-opus-5"]) == 1
+
+
+def test_expect_fingerprint_checks_every_receipt_and_grammar(tmp_path):
+    fp = "ab" * 32
+    _fake_receipt(tmp_path, "e5", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5", decision_fingerprint=fp)
+    _fake_receipt(tmp_path, "e6", "reviewer-2", "SUCCEEDED",
+                  model_id="gpt-5.6-sol", decision_fingerprint=fp)
+    assert _verify(tmp_path, "e5,e6", 2, extra=["--expect-fingerprint", fp]) == 0
+    assert _verify(tmp_path, "e5,e6", 2,
+                   extra=["--expect-fingerprint", "cd" * 32]) == 1
+    assert _verify(tmp_path, "e5,e6", 2,
+                   extra=["--expect-fingerprint", "nothex"]) == 2
+    _fake_receipt(tmp_path, "e7", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5", decision_fingerprint=None)
+    assert _verify(tmp_path, "e7", 1, extra=["--expect-fingerprint", fp]) == 1
+
+
+def _run_fake_review(tmp_path, attempt_id, seat, model_id, extra=()):
+    """One supervised fake reviewer that prints a PASS verdict — the same
+    child the E2E above uses, with the caller's extra `run` args spliced in."""
+    fake = write_fake(tmp_path, f"{attempt_id}.py", HAPPY)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "run",
+         "--attempt-id", attempt_id,
+         "--receipt-dir", str(tmp_path / "receipts"),
+         "--deadline-seconds", "30", "--grace-seconds", "1",
+         "--seat", seat, "--model-id", model_id,
+         "--output-schema", "review", *extra,
+         "--", sys.executable, str(fake)],
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return attempt_id
+
+
+def test_route_fingerprint_flows_into_receipts_and_verify(tmp_path):
+    """design §4 B4: route JSON -> dispatch 인자 -> receipt -> verify-evidence
+    --expect-fingerprint/--expect-models 로 이어지는 리뷰 증거 사슬."""
+    sys.path.insert(0, str(SKILL / "scripts"))
+    from route_task import Task, route
+    out = route(Task(task_class="IMPLEMENTATION", complexity=2, uncertainty=1,
+                     blast_radius=2, reversibility=1,
+                     flags=["auth_sensitive"]))
+    fp = out["decision_fingerprint"]
+    models = out["review"]["reviewer_models"]
+    assert len(models) == 2 and len(set(models)) == 2
+    for i, model in enumerate(models, 1):
+        _run_fake_review(tmp_path, f"seat{i}", seat=f"reviewer-{i}",
+                         model_id=model,
+                         extra=["--decision-fingerprint", fp,
+                                "--policy-sha256", out["policy_sha256"]])
+    assert _verify(tmp_path, "seat1,seat2", 2,
+                   extra=["--expect-fingerprint", fp,
+                          "--expect-models", ",".join(models)]) == 0
+    # 불일치 주입: 다른 결정의 fingerprint는 거부된다
+    other = route(Task(task_class="MECHANICAL", complexity=0, uncertainty=0,
+                       blast_radius=0, reversibility=0))
+    assert other["decision_fingerprint"] != fp
+    assert _verify(tmp_path, "seat1,seat2", 2,
+                   extra=["--expect-fingerprint",
+                          other["decision_fingerprint"]]) == 1
+
+
+def test_expect_fingerprint_rejects_a_trailing_newline_as_usage_error(tmp_path):
+    """round-1 review F1, the verify side: a newline-terminated expectation
+    must be a usage error (2), not an evidence problem (1) — misreporting a
+    caller's typo as an integrity failure erases the distinction B3 draws."""
+    _fake_receipt(tmp_path, "nl1", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5", decision_fingerprint="ab" * 32)
+    assert _verify(tmp_path, "nl1", 1,
+                   extra=["--expect-fingerprint", "ab" * 32 + "\n"]) == 2
+
+
+def test_an_attempt_id_with_a_trailing_newline_is_refused(tmp_path):
+    """round-2 review (pre-existing, fixed here because it is the identical
+    `$` idiom two lines from the one this release introduced): a newline-
+    terminated attempt id passed `^...$` and went on to name a receipt FILE.
+    """
+    fake = write_fake(tmp_path, "nlid.py", HAPPY)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 attempt_id="ok-id\n")
+    assert proc.returncode == 2, proc.stderr
+    assert receipt is None
+    assert not list((tmp_path / "receipts").glob("*")) or not any(
+        "\n" in q.name for q in (tmp_path / "receipts").glob("*"))

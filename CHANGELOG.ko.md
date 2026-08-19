@@ -7,6 +7,21 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.2.0] — 2026-08-19 (증거 연결)
+
+### 추가됨
+
+- 모든 route가 `request_sha256`과 결정적 `decision_fingerprint`를 방출한다. dispatch receipt가 이 값을 실을 수 있고(`--decision-fingerprint`, `--policy-sha256`, `--transport-id`, `--host-cli-version`), `verify-evidence`가 `--expect-fingerprint` / `--expect-models`로 대조한다.
+- Receipt가 요청된 모델과 실제 서빙된 모델의 구분을 명시한다: `observed_model_id` / `observed_model_source` 자리(정직한 기본값 — 아직 어떤 transport도 서빙된 모델을 관측할 수 없다).
+- `routing_confidence_kind`가 confidence 값이 보정된 확률이 아니라 heuristic gate 점수임을 라벨로 밝힌다.
+- 레지스트리가 OpenAI GPT-5.6의 272K 장문맥 구간을 명시적 경계 어휘와 함께 기록하고, 모든 좌석의 표준 cached-input 요율과, 가격 경계 및 Fable 5의 공급자 측 모델 대체에 대한 원장 항목을 남긴다.
+- 서빙 모델 caveat가 선언된 모델이 좌석에 앉은 route는 대체 가능성을 notes에 공시한다.
+
+### 수정됨
+
+- `policy_sha256`이 실제로 사용된 정책을 해시한다. 라이브러리 API로 주입한 config가 더 이상 디스크의 해시로 보고되지 않고, route 사이에 그 자리에서 변경된 config도 캐시가 아니라 새 내용으로 다시 읽힌다 — 하나의 fingerprint는 하나의 결정을 가리킨다.
+- 모델 프로파일이 더 이상 워커 바인딩의 품질을 미측정으로 서술하지 않는다. effort 표에서 정책이 삭제한 작업 유형이 사라졌고, xAI 장문맥 경계는 "200K 이상"으로 읽힌다.
+
 ## [1.1.1] — 2026-08-18 (바인딩 품질 측정)
 
 ### 변경됨

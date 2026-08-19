@@ -17,6 +17,22 @@ def _canonical(obj):
 _DIGEST_CACHE: dict[str, tuple[int, str]] = {}
 
 
+def canonical_policy_sha256(cfg: dict) -> str:
+    """Content digest of a policy dict — the SSOT the file API delegates to.
+
+    No cache: a ~30KB canonical dump+sha256 is sub-millisecond, and an
+    id()-keyed cache would return a stale digest for an in-place-mutated
+    dict — reintroducing the defect this function exists to fix. Callers
+    must pass a real dict; non-dict Mappings (test instrumentation) are the
+    caller's job to route to the file digest instead.
+    """
+    blob = json.dumps(
+        cfg, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True, default=_canonical,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def policy_sha256(config_path: Path) -> str:
     path = Path(config_path)
     key = str(path.resolve())
@@ -24,11 +40,6 @@ def policy_sha256(config_path: Path) -> str:
     cached = _DIGEST_CACHE.get(key)
     if cached and cached[0] == mtime_ns:
         return cached[1]
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    blob = json.dumps(
-        raw, sort_keys=True, separators=(",", ":"),
-        ensure_ascii=True, default=_canonical,
-    )
-    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    digest = canonical_policy_sha256(yaml.safe_load(path.read_text(encoding="utf-8")))
     _DIGEST_CACHE[key] = (mtime_ns, digest)
     return digest

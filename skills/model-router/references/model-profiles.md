@@ -143,19 +143,27 @@ the registry.
 input/output tokens against the Claude fast tier's $1.00 / $5.00: five times
 cheaper on input, 4.2× on output, and $0.02 vs $0.10 on cached input. For the
 role that carries the volume, that difference compounds across every routine
-task.
+task. Both rates are the standard (≤272K-input) tier; above 272K input tokens
+the provider re-bills the whole request at 2×/1.5× — luna stays far cheaper
+than haiku on both sides of that line, so the binding direction is unchanged.
 
-**Quality — not established.** A five-task Tier 0/1 head-to-head (spec
-implementation with edge cases, a scoped bug fix, a multi-file API migration,
-test generation graded by mutants killed, and structural boilerplate — 47
-hidden assertions plus 5 mutants, scored only on test results) returned 100%
-for both models and 308s vs 304s wall time. The task set did not discriminate.
-No primary source puts the two on the same benchmark.
+**Quality — probed 2026-08-18, near ceiling.** A discriminating 446-node
+hidden-test head-to-head (8 spec-dense stdlib tasks, one attempt per model,
+the same CLI transports this router uses) scored haiku 442/446 and luna
+436/446 — haiku marginally ahead (+1.3pp), each model's failures tracing to
+two spec-edge root causes. Mean per-task wall time favoured luna 19.6s
+against haiku 91.2s. One attempt per model and correlated node failures make
+this suggestive, not decisive; the ledger records it as
+`price_verified_quality_probed`. The binding still rests on the verified
+price advantage, now with the measured quality cost on record.
 
 So the binding rests on the verified price advantage, not on a demonstrated
 quality advantage — which is exactly what the "cheapest capable model carries
-the volume" principle asks for. If a harder eval later separates them, change
-one line in the registry; the policy does not move.
+the volume" principle asks for. The 446-node probe did separate them, by 1.3pp
+against this seat, and the registry line stayed as it was: a gap that small,
+recoverable by the escalation ladder, does not outweigh a 5x price advantage.
+A larger measured gap is what would move the binding, and moving it is one
+line in the registry; the policy does not move either way.
 
 The Claude fast tier (`claude_worker_fast`) remains bound as the `claude_only`
 fallback, so a dead bridge costs latency and money, not capability.
@@ -171,13 +179,16 @@ against a claimed frontier tier. Input is equal; the remaining advantage is
 output price. For the first escalation that difference is the point of the
 binding.
 
-**Above 200K input tokens the comparison inverts.** xAI re-bills the *entire*
+**At or above 200K input tokens the comparison inverts.** xAI re-bills the *entire*
 request at $4.00 / $12.00 (cached $1.00) once the prompt reaches that line —
 not just the tokens past it — while the Claude balanced model bills its full
 1M window at flat standard rates. So above 200K this seat costs more on both
 axes and runs out of window 500K earlier. The advantage is real and it is
 conditional; stating only the first half is what made the previous version of
-this section read as unconditional.
+this section read as unconditional. (The OpenAI GPT-5.6 seats carry an
+analogous whole-request tier above 272K input; that boundary is recorded in
+the registry for reference and moves no binding — the `large_context` rule
+remains keyed to the xAI 200K line.)
 
 That is one deterministic fact, so it is a rule rather than advice: a task
 flagged `large_context` binds `worker_balanced` to `worker_balanced_alt`
@@ -190,11 +201,17 @@ alt seat is itself unavailable the primary comes back, and that *is* recorded
 as a fallback. Under a degraded (single-provider) binding there is no alt seat
 to prefer and the rule is a no-op.
 
-**Quality — not established.** No head-to-head was run here. A frontier claim
-is not a measured peer of the tier-2 seats.
+**Quality — probed 2026-08-18, tied at ceiling.** The same 446-node
+head-to-head scored the xai frontier model 446/446 and sonnet-5 445/446 — a
+tie at the suite's ceiling, one attempt per model (mean wall time: 103.2s for
+the xai seat against sonnet-5's 38.6s). No regression detected against the
+claimed frontier tier; a single suite at ceiling is not grounds to raise
+`capability_tier`.
 
-**`capability_tier` is 1 on purpose.** Honesty first: without a measured
-comparison, promoting the model to tier 2 would treat a claim as a result.
+**`capability_tier` is 1 on purpose.** Honesty first: the one measured
+comparison there is finished at the suite's ceiling, which separates nothing —
+promoting the model to tier 2 on it would treat an undiscriminating result as
+a demonstrated one.
 Side-effect second: MEDIUM's reviewer floor is the minimum nominal tier among
 `worker_balanced`, `senior_engineer`, and `reasoning_specialist` in the
 default binding. That minimum is currently 1. Raising this model to 2 would

@@ -308,3 +308,82 @@ def test_review_policy_does_not_outclaim_the_ledger_on_subagent_isolation():
     assert f"`{entry['status']}`" in text, (
         f"the ledger records this as {entry['status']!r}; the document that "
         f"tells a caller how to enforce isolation must use the same word")
+
+
+# ---------------------------------------------------------------------------
+# Tranche A (design §3 A4) — effort/review 표와 quality-evidence의 계약화.
+# 2026-08-19 설계 리뷰가 확인한 drift: effort 표의 유령 행(difficult
+# debugging, orchestration)과 model-profiles의 "not established" 서술은
+# substring 테스트가 볼 수 없었다.
+# ---------------------------------------------------------------------------
+
+EFFORT_ROW_TO_KEYS = {
+    "formatting, rename, boilerplate": ["formatting_rename", "boilerplate"],
+    "straightforward implementation": ["straightforward_impl"],
+    "multi-file feature, debugging, refactoring, architecture, standard review":
+        ["multi_file_feature", "debugging", "refactoring", "architecture",
+         "standard_review"],
+    "multi-system refactoring": ["multi_system_refactoring"],
+    "complex architecture, unknown root cause, adversarial review":
+        ["complex_architecture", "unknown_root_cause", "adversarial_review"],
+}
+
+
+def test_skill_md_effort_table_matches_effort_by_work():
+    """행 라벨→config 키 매핑으로 cell-by-cell 대조. 모든 effort_by_work
+    키가 정확히 한 번 커버됨을 함께 assert — 유령 행도 누락 행도 남지
+    못한다."""
+    text = (SKILL / "SKILL.md").read_text()
+    _, rows = _md_table(text, "### Effort")
+    covered = []
+    for row in rows:
+        label = row[0].strip("`")
+        keys = EFFORT_ROW_TO_KEYS.get(label)
+        assert keys is not None, (
+            f"SKILL.md effort row {label!r} maps to no effort_by_work key — "
+            f"a ghost row (design §3 A3)")
+        for key in keys:
+            assert CFG["effort_by_work"][key] == row[1].strip("`"), (label, key)
+            covered.append(key)
+    assert sorted(covered) == sorted(CFG["effort_by_work"]), (
+        "every effort_by_work key must appear exactly once in the table")
+
+
+def test_skill_md_review_table_matches_config():
+    """Step 3 표의 effort/independent를 strict 대조. reviewers 열은
+    LOW/HIGH/CRITICAL을 role 리스트로 대조하고, MEDIUM은 산문이므로
+    cross-family 토큰만 pin한다 (design §3 A4-2)."""
+    text = (SKILL / "SKILL.md").read_text()
+    _, rows = _md_table(text, "## Step 3")
+    by_band = {row[0].strip("`"): row for row in rows}
+    for band in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+        spec = CFG["review"][band]
+        row = by_band[band]
+        assert row[2].strip("`") == spec["effort"], band
+        assert (row[3].strip() == "yes") == spec["independent"], band
+        if band != "MEDIUM":
+            documented = [r.strip() for r in row[1].replace("`", "").split("+")]
+            assert documented == spec["reviewers"], band
+    assert "cross-family" in by_band["MEDIUM"][1]
+
+
+def test_model_profiles_quality_evidence_matches_ledger():
+    """두 binding entry가 price_verified_quality_probed인 동안, 문서는 '확립
+    안 됨' 서술을 가질 수 없고 head-to-head 수치가 모델 라벨과 같은 문장에
+    결합되어야 한다. ledger가 바뀌면 이 테스트를 다시 읽어라."""
+    ledger = {e["item"]: e for e in CFG["verification_ledger"]["entries"]}
+    for item in ("worker_fast binding: gpt-5.6-luna over claude-haiku-4-5",
+                 "worker_balanced binding: grok-4.6 over claude-sonnet-5"):
+        assert ledger[item]["status"] == "price_verified_quality_probed", (
+            "ledger changed; re-read this test")
+    assert "Quality — not established" not in MODEL_PROFILES_MD
+    # 수치는 해당 모델 라벨과 같은 문장 안에 결합되어야 한다: 문장 단위로
+    # 쪼개 (라벨, 점수) 쌍을 함께 담은 문장이 존재하는지 본다.
+    sentences = re.split(r"(?<=[.!?])\s+", MODEL_PROFILES_MD)
+    # 라벨은 registry id가 아니어야 한다 — `test_d8_model_ids_appear_only_in_
+    # the_registry`가 references/*.md에서 완전한 모델 id를 금지한다 (design §3
+    # A2의 "registry key로 지칭" 규율). grok-4.6은 완전한 id라 문서에 쓸 수
+    # 없으므로 문서가 이미 쓰는 좌석 라벨로 지칭한다.
+    for label, score in (("luna", "436/446"), ("haiku", "442/446"),
+                         ("xai frontier", "446/446"), ("sonnet-5", "445/446")):
+        assert any(label in s and score in s for s in sentences), (label, score)

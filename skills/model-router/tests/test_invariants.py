@@ -19,6 +19,7 @@ suite. The comment on each says which.
 Run:  python3 -m pytest skills/model-router/tests/test_invariants.py -q
 """
 
+import copy
 import itertools
 import json
 import sys
@@ -885,3 +886,63 @@ def test_the_rationale_always_names_the_band_and_any_fallback():
         assert out["risk_band"] in out["rationale"]
         if out["fallbacks_applied"]:
             assert "Fallback" in out["rationale"]
+
+
+_KEY_OF = {m["id"]: k for k, m in CFG["models"].items()}
+
+
+def _route_of(**kwargs):
+    return route(Task(**kwargs))
+
+
+def test_served_model_caveat_discloses_exactly_when_flag_and_seat_meet():
+    """design §4 B5: caveat flag ∧ 해당 모델 착석 ∧ executable일 때 모델당
+    정확히 1회 공시; 그 외에는 route가 기존과 동일. note는 registry key로
+    지칭한다 — 모델 id는 terminal-withholding invariant의 스캔 대상이다."""
+    marker = "may substitute another"
+    hit = _route_of(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                    blast_radius=3, reversibility=2, flags=["security_sensitive"])
+    # round-1 review I2: assert executability outright. Behind `if terminal is
+    # None` the only positive assertions this feature has would vacate in
+    # silence the day a policy change made this fixture terminal.
+    assert hit["terminal"] is None
+    assert hit["requires_human_confirmation"]
+    assert "claude_architect" in [_KEY_OF[m] for m in
+                                  [hit["selected_model"], *hit["review"]["reviewer_models"]]
+                                  if m], "fixture must seat the caveat-bearing model"
+    notes = [n for n in hit["notes"] if marker in n]
+    assert len(notes) == 1
+    assert "claude_architect" in notes[0]
+    assert "security_sensitive" in notes[0]
+    # The note names the seated model's FAMILY, never a model id (design §4 B5
+    # + round-1 review F3: a caveat on a non-claude row must not produce a note
+    # claiming "Claude").
+    assert "claude model" in notes[0]
+    assert "claude-fable-5" not in json.dumps(hit["notes"])
+    # 같은 좌석, flag 없음 -> 공시 없음
+    miss = _route_of(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                     blast_radius=3, reversibility=1, flags=[])
+    assert not any(marker in n for n in miss["notes"])
+    # terminal + security_sensitive -> 공시 없음 (withholding과 정합)
+    terminal = _route_of(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                         blast_radius=3, reversibility=2,
+                         flags=["security_sensitive", "bridge_down"],
+                         runtime="grok")
+    assert terminal["terminal"] == "INDEPENDENCE_UNAVAILABLE"
+    assert not any(marker in n for n in terminal["notes"])
+
+
+def test_a_caveat_on_a_non_claude_row_does_not_claim_the_wrong_vendor():
+    """round-1 review F3: `served_model_caveats` is accepted on ANY registry
+    row — Policy validates the flag vocabulary, never the family — so a note
+    that hard-codes one vendor is a factually false disclosure one config edit
+    away. The wording is derived from the seated model's family instead."""
+    cfg = copy.deepcopy(CFG)
+    cfg["models"]["openai_reasoning"]["served_model_caveats"] = ["security_sensitive"]
+    out = route(Task(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                     blast_radius=3, reversibility=2,
+                     flags=["security_sensitive"]), cfg)
+    assert out["terminal"] is None
+    notes = [n for n in out["notes"] if "may substitute another" in n]
+    assert any("openai_reasoning" in n and "openai model" in n for n in notes), notes
+    assert not any("openai_reasoning" in n and "claude model" in n for n in notes)

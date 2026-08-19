@@ -318,9 +318,8 @@ MINIMAL < LOW < MEDIUM < HIGH < VERY_HIGH < MAX
 | formatting, rename, boilerplate | `LOW` |
 | straightforward implementation | `MEDIUM` |
 | multi-file feature, debugging, refactoring, architecture, standard review | `HIGH` |
-| difficult debugging, multi-system refactoring | `VERY_HIGH` |
+| multi-system refactoring | `VERY_HIGH` |
 | complex architecture, unknown root cause, adversarial review | `MAX` |
-| orchestration (default) | `HIGH` |
 
 Floors override the table, never the reverse:
 
@@ -452,13 +451,18 @@ Every route reports:
 ```yaml
 task_class:  complexity:  uncertainty:  blast_radius:  reversibility:
 route_schema_version:  router_plugin_version:  policy_sha256:
+request_sha256:  decision_fingerprint:   # same request x policy x router
+                               # version -> same fingerprint; carried into
+                               # dispatch receipts and checked by
+                               # verify-evidence --expect-fingerprint
 effective_policy:  selected_capability_tier:  selected_families: []
 local_policy_applied:
 reasoning_centric:
 risk_score:  risk_band:   band_overrides_applied: []   critical_flags: []
 band_overrides_redundant: []   # fired, but another rule had already got there
 route_path:                    # null, or "disagreement"
-terminal:                      # null, or one of the four in the table above
+terminal:                      # null, or one of the terminal states in the
+                               # table above
 selected_role:  selected_model:  selected_effort:  selected_effort_effective:
 selected_effort_native:
 review:
@@ -483,7 +487,8 @@ fallback_compensations_applied: []
 unavailable_models: []
 excluded_prior_failures: []    # models withheld because they already failed
 escalation_count:  retry_count:
-routing_confidence:
+routing_confidence:  routing_confidence_kind:   # a heuristic gate score,
+                               # not a calibrated success probability
 requires_human_confirmation:
 human_confirmation_deferred:   # a production hotfix: dispatch now, confirm after
 human_control_causes: []       # which human_in_the_loop controls fired, by
@@ -533,6 +538,11 @@ invented id. A seat whose receipt ended without a verdict did not review
 attempt whose process tree could not be confirmed dead blocks
 write-capable retries: re-route with `--flags termination_unconfirmed` and
 let the human gate hold it.
+
+Routing-dispatched seats carry the decision with them: pass the route's
+`decision_fingerprint` / `policy_sha256` to `dispatch_agent.py run`, then
+check `verify-evidence --expect-fingerprint --expect-models` — the review
+evidence chain, whose scope `references/adapters.md` ("Linkage scope") states.
 
 ## Before the first route in a session
 

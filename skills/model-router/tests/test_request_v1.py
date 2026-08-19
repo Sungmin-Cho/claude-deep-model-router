@@ -402,3 +402,30 @@ def test_policy_digest_reuses_its_cache_and_notices_a_real_edit(tmp_path):
     before = len(_DIGEST_CACHE)
     assert policy_sha256(link) == policy_sha256(cfg)
     assert len(_DIGEST_CACHE) == before
+
+
+def test_routing_confidence_kind_is_emitted_as_heuristic():
+    """design §3 A5: 이 값은 gate용 heuristic이지 calibrated 성공 확률이
+    아니다 — kind 필드가 그 사실을 스키마에 고정한다."""
+    out = route(Task(task_class="MECHANICAL", complexity=0, uncertainty=0,
+                     blast_radius=0, reversibility=0))
+    assert out["routing_confidence_kind"] == "heuristic_policy_score"
+
+
+def test_canonical_policy_digest_matches_file_digest_and_tracks_mutation(tmp_path):
+    """design §4 B1: dict content-digest는 (i) 같은 내용의 파일 digest와
+    동일하고, (ii) in-place 변이를 즉시 반영해야 한다(캐시 없음 — id 캐시는
+    stale digest로 B1이 고치려는 결함을 재도입한다)."""
+    import yaml
+    from policy_digest import policy_sha256, canonical_policy_sha256
+    from route_task import CONFIG_PATH
+    raw = yaml.safe_load(CONFIG_PATH.read_text())
+    assert canonical_policy_sha256(raw) == policy_sha256(CONFIG_PATH)
+    before = canonical_policy_sha256(raw)
+    raw["router"]["default_worker"] = "worker_balanced"
+    assert canonical_policy_sha256(raw) != before, "mutation must change the digest"
+    # 내용이 같으면 같은 digest — 변이된 dict와 무관하게, 새로 읽은 사본은
+    # 변이 전 값으로 돌아온다 (D9: 항진 단언 금지이므로 실제로 대조한다).
+    copy = yaml.safe_load(CONFIG_PATH.read_text())
+    assert canonical_policy_sha256(copy) == before
+    assert canonical_policy_sha256(copy) == policy_sha256(CONFIG_PATH)

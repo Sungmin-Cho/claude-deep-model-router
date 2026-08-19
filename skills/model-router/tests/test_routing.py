@@ -496,3 +496,24 @@ def test_long_context_pricing_is_recorded_where_the_price_is():
     assert tier["above_input_tokens"] == 200_000
     assert tier["input"] > xai["price_per_mtok"]["input"]
     assert tier["output"] > xai["price_per_mtok"]["output"]
+
+
+def test_long_context_blocks_are_well_formed():
+    """design §3 A1: long_context를 가진 모든 모델은 boundary 어휘와 양수
+    요율을 갖추고, 장문맥 요율은 표준 요율보다 낮지 않다. 값 자체의 외부
+    정확성은 ledger의 재검증 의무가 담당한다 — 가격을 여기 복제하면 두 번째
+    진실 소스가 된다."""
+    seen = 0
+    for key, model in CFG["models"].items():
+        lc = model.get("price_per_mtok", {}).get("long_context")
+        if lc is None:
+            continue
+        seen += 1
+        assert lc["boundary"] in ("inclusive", "exclusive"), key
+        assert isinstance(lc["above_input_tokens"], int) and lc["above_input_tokens"] > 0, key
+        std = model["price_per_mtok"]
+        for axis in ("input", "output"):
+            assert lc[axis] >= std[axis] > 0, (key, axis)
+        if "cached_input" in std:
+            assert lc["cached_input"] >= std["cached_input"] > 0, key
+    assert seen >= 4, "xai + three openai models must carry a long_context tier"

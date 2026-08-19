@@ -142,7 +142,9 @@ Silent looping is the error. Silent stopping is nearly as bad.
 ## Routing confidence
 
 Emit your own confidence in the **routing decision**, 0.0–1.0. This is separate
-from the worker's confidence in its output.
+from the worker's confidence in its output. The emitted
+`routing_confidence_kind: heuristic_policy_score` states what this number is —
+a policy gate score, not a calibrated success probability.
 
 | Confidence | Action |
 |---|---|

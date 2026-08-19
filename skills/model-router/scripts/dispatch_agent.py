@@ -88,8 +88,17 @@ VERDICT_RE = re.compile(r"^verdict:\s*(PASS|PASS_WITH_CHANGES|FAIL)\b", re.M)
 
 # Safe identifier grammar for attempt-id: this string is interpolated
 # directly into filesystem paths, so it must never contain a path
-# separator or a traversal segment.
-ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# separator or a traversal segment. `\A`/`\Z` for the same reason the
+# digest grammar below uses them — `$` also matches just before a final
+# newline, which put a newline in a receipt FILENAME.
+ATTEMPT_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+# 64-hex digest grammar for the linkage args a route hands to a dispatch.
+# `\A`/`\Z`, not `^`/`$`: without re.MULTILINE, `$` still matches just before
+# a final newline, so `^[0-9a-f]{64}$` accepted a 65-char "<64 hex>\n" — a
+# value a programmatic caller produces by reading a file without stripping,
+# and one this gate then wrote verbatim into a permanent receipt.
+HEX64_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 def _utcnow() -> str:
@@ -230,6 +239,23 @@ def _new_receipt(args, stdout_path: Path, stderr_path: Path) -> dict:
         "model_id": args.model_id,
         "effort_native": args.effort_native,
         "permission_mode": args.permission_mode,
+        # Linkage back to the route decision (design §4 B2). All four are
+        # caller-supplied and null when absent — the supervisor probes
+        # nothing. model_id above is likewise the caller's DECLARED value:
+        # this supervisor never parses argv to cross-check it (transport-
+        # specific knowledge); the raw argv in this receipt is what an
+        # auditor checks it against.
+        "decision_fingerprint": args.decision_fingerprint,
+        "policy_sha256": args.policy_sha256,
+        "transport_id": args.transport_id,
+        "host_cli_version": args.host_cli_version,
+        # Requested vs served: no transport can observe the served model
+        # yet, so this pair stays at its defaults in this tranche. Contract
+        # (documented, unenforced until a producer exists): observed_model_id
+        # is null IFF observed_model_source == "unavailable"; the only
+        # source value this version defines is "unavailable".
+        "observed_model_id": None,
+        "observed_model_source": "unavailable",
         "argv": args.argv,
         "prompt_sha256": None,
         "output_schema": args.output_schema,
@@ -306,6 +332,12 @@ def cmd_run(args) -> int:
         print(f"--grace-seconds must be a finite number > 0, got "
               f"{args.grace_seconds!r}", file=sys.stderr)
         return 2
+    for name, value in (("--decision-fingerprint", args.decision_fingerprint),
+                        ("--policy-sha256", args.policy_sha256)):
+        if value is not None and not HEX64_RE.match(value):
+            print(f"{name} must be 64 lowercase hex chars, got {value!r}",
+                  file=sys.stderr)
+            return 2
 
     prompt_sha256 = None
     stdin_f = subprocess.DEVNULL
@@ -812,7 +844,29 @@ def cmd_verify_evidence(args) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    expected_models = None
+    if args.expect_models is not None:
+        expected_models = [m.strip() for m in args.expect_models.split(",")]
+        if any(not m for m in expected_models):
+            print("error: --expect-models contains an empty token", file=sys.stderr)
+            return 2
+        if len(set(expected_models)) != len(expected_models):
+            print("error: --expect-models contains duplicates — the route's "
+                  "reviewer_models are distinct by construction, so a "
+                  "duplicate expectation is always a caller mistake",
+                  file=sys.stderr)
+            return 2
+        if len(expected_models) != args.expect_count:
+            print(f"error: --expect-models names {len(expected_models)} "
+                  f"model(s) but --expect-count is {args.expect_count}",
+                  file=sys.stderr)
+            return 2
+    if args.expect_fingerprint is not None and not HEX64_RE.match(args.expect_fingerprint):
+        print("error: --expect-fingerprint must be 64 lowercase hex chars",
+              file=sys.stderr)
+        return 2
     problems = []
+    declared_models = []
     if len(set(ids)) != args.expect_count:
         problems.append(
             f"expected exactly {args.expect_count} distinct id(s), "
@@ -842,9 +896,27 @@ def cmd_verify_evidence(args) -> int:
                 f"{receipt.get('output_schema')!r}, not 'review'")
         if receipt.get("result", {}).get("schema_valid") is not True:
             problems.append(f"{attempt_id}: schema_valid is not true")
+        if expected_models is not None and receipt.get("model_id") is None:
+            problems.append(f"{attempt_id}: model_id is null — cannot match "
+                            f"--expect-models")
+        if args.expect_fingerprint is not None and \
+                receipt.get("decision_fingerprint") != args.expect_fingerprint:
+            problems.append(f"{attempt_id}: decision_fingerprint is "
+                            f"{receipt.get('decision_fingerprint')!r}, not the "
+                            f"expected value")
+        declared_models.append(receipt.get("model_id"))
         seats.append(receipt.get("seat"))
     if len(seats) != len(set(seats)):
         problems.append(f"seats are not distinct: {sorted(seats)}")
+    if expected_models is not None:
+        got = sorted(m for m in declared_models if m is not None)
+        # A null model_id is already reported per receipt above; comparing the
+        # multiset again there would say the same thing twice with a confusing
+        # "does not match" that names a shorter list than the caller supplied.
+        if not any("cannot match --expect-models" in p for p in problems) \
+                and got != sorted(expected_models):
+            problems.append(f"declared models {got} do not match expected "
+                            f"{sorted(expected_models)}")
     for problem in problems:
         print(problem, file=sys.stderr)
     return 1 if problems else 0
@@ -867,6 +939,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model-id", default=None)
     run.add_argument("--effort-native", default=None)
     run.add_argument("--permission-mode", default=None)
+    run.add_argument("--decision-fingerprint", default=None,
+                     help="route JSON's decision_fingerprint (64 lowercase hex)")
+    run.add_argument("--policy-sha256", dest="policy_sha256", default=None,
+                     help="route JSON's policy_sha256 (64 lowercase hex)")
+    run.add_argument("--transport-id", default=None,
+                     help="transports table path, e.g. claude_code.to_openai")
+    run.add_argument("--host-cli-version", default=None,
+                     help="caller-known CLI version; omit rather than probe")
     run.add_argument("--prompt-file", default=None,
                      help="fed to the child's stdin; omit for DEVNULL")
     run.add_argument("--output-schema", choices=["none", "review"],
@@ -891,6 +971,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="comma-separated attempt ids")
     verify.add_argument("--expect-count", type=int, required=True,
                         help="the route's reviewer seat count — exactly")
+    verify.add_argument("--expect-models", default=None,
+                        help="comma-separated DECLARED model ids — a multiset "
+                             "match against receipts' model_id (seat<->model "
+                             "pairing is deliberately not checked: --seat is a "
+                             "non-semantic label; independence needs N distinct "
+                             "models completing, not a label assignment). This "
+                             "checks the declared/requested identity, not the "
+                             "served one.")
+    verify.add_argument("--expect-fingerprint", default=None,
+                        help="route decision_fingerprint (64 lowercase hex) "
+                             "every receipt must carry")
     return p
 
 
