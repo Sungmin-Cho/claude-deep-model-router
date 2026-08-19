@@ -4,7 +4,6 @@
 리스트는 dedup+sort, isolation_evidence는 strip 포함, prior_models는
 multiplicity 보존, local_policy는 bool(lp) 의미론(falsy -> null).
 """
-import json
 import sys
 from pathlib import Path
 
@@ -12,7 +11,7 @@ SKILL = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL / "scripts"))
 
 from route_task import (  # noqa: E402
-    CONFIG_PATH, Task, default_config, route, request_sha256_of,
+    Task, default_config, load_config, route, request_sha256_of,
 )
 from policy_digest import canonical_policy_sha256  # noqa: E402
 import copy  # noqa: E402
@@ -88,3 +87,30 @@ def test_cfg_change_moves_policy_and_fingerprint_not_request():   # (g)
     assert a["policy_sha256"] != b["policy_sha256"]
     assert a["decision_fingerprint"] != b["decision_fingerprint"]
     assert b["policy_sha256"] == canonical_policy_sha256(injected)
+
+
+def test_a_mutated_cfg_cannot_share_a_fingerprint_with_a_fresh_one():
+    """round-1 review, 3/3 agreement: `policy_sha256` digests the cfg's CURRENT
+    content while `Policy.of` cached derived semantics on `id(cfg)`, so routing
+    the same object twice across an in-place mutation produced a decision built
+    from stale policy — and the new fingerprint attested it to the post-mutation
+    content. Same fingerprint, different decision breaks exactly what B1 claims.
+    """
+    # A task that actually seats claude_architect — the mutated row must be
+    # one the decision reads, or the test proves nothing.
+    task = Task(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                blast_radius=3, reversibility=2, flags=["review_disagreement"])
+    cfg = load_config()
+    route(task, cfg)                                   # seats the cache
+    cfg["models"]["claude_architect"]["capability_tier"] = 0
+    stale = route(task, cfg)
+
+    fresh_cfg = load_config()
+    fresh_cfg["models"]["claude_architect"]["capability_tier"] = 0
+    fresh = route(task, fresh_cfg)
+
+    assert stale["policy_sha256"] == fresh["policy_sha256"]
+    assert stale["decision_fingerprint"] == fresh["decision_fingerprint"]
+    assert stale == fresh, (
+        "one fingerprint must identify one decision; the cfg content is "
+        "identical, so every emitted field must be too")

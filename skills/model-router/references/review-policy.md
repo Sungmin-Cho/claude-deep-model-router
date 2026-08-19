@@ -249,8 +249,15 @@ canonical id is the dispatch receipt's `attempt_id`
 
 ```bash
 python3 "$SKILL_DIR"/scripts/dispatch_agent.py verify-evidence \
-    --receipt-dir receipts/ --ids r1-a7f3,r2-b2c9 --expect-count 2
+    --receipt-dir receipts/ --ids r1-a7f3,r2-b2c9 --expect-count 2 \
+    --expect-fingerprint <route decision_fingerprint> \
+    --expect-models <route review.reviewer_models, comma-separated>
 ```
+
+The two `--expect-*` options are optional in the grammar and **not optional
+for a routed review**: without them the check accepts any two completed review
+receipts, including receipts from a different decision or different models.
+Omit them only when the seats were not dispatched from a route.
 
 Per transport, the underlying session identifier is recorded in the receipt:
 `grok -p` takes a caller-chosen `-s <fresh-uuid>`; `codex exec` and the

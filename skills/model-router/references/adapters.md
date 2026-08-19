@@ -295,7 +295,11 @@ does not cover native in-process seats, which write no receipt — so an
 evidence-bearing review runs both seats as supervised CLIs. `model_id`
 is the caller's **declared** value; the supervisor never cross-checks it
 against argv — the raw argv recorded in the receipt is what an auditor
-checks instead. The four `run` arguments are all caller-supplied and probed
+checks instead. One deliberate convergence: `effective_policy.allowed_families`
+echoes the caller's list verbatim (order and duplicates included) while the
+fingerprint canonicalises it, because the router consumes that list purely as
+a membership set. Two requests differing only in that echo are one decision
+and share one fingerprint. The four `run` arguments are all caller-supplied and probed
 by nothing: `--decision-fingerprint` and `--policy-sha256` are copied from
 the route JSON's same-named fields, `--transport-id` is the path key in the
 config `transports` table (e.g. `claude_code.to_openai`), and
@@ -364,7 +368,10 @@ impossible. `status --attempt-id <id> --receipt-dir <dir>` polls;
 `cancel` kills from outside with the same confirmation ladder;
 `verify-evidence` checks receipt ids before they become
 `--isolation-evidence` (see `review-policy.md`, "Where the evidence id
-comes from").
+comes from"). For seats dispatched from a route, bind the decision as well —
+`verify-evidence ... --expect-fingerprint <route decision_fingerprint>
+--expect-models <route review.reviewer_models>` — since without those two the
+check cannot tell this decision's receipts from any other completed review's.
 
 ### Output is a contract
 

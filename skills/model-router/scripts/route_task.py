@@ -215,7 +215,7 @@ class Policy:
     # removed inert policy elsewhere — round 10 caught the irony. The cost that
     # IS real: the cache is unbounded, so a process routing against many
     # distinct config objects retains all of them.
-    _cache: dict[int, "Policy"] = {}
+    _cache: dict[tuple[int, str | None], "Policy"] = {}
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -379,7 +379,24 @@ class Policy:
 
     @classmethod
     def of(cls, cfg: dict) -> "Policy":
-        key = id(cfg)
+        """Derived policy for `cfg`, cached on (identity, content digest).
+
+        Identity alone was not enough once `policy_sha256` became a CONTENT
+        digest (design §4 B1): a caller that mutates a cfg dict in place
+        between routes got semantics precomputed from the pre-mutation
+        content while the emitted digest attested the post-mutation content
+        — one fingerprint over two different decisions, which is precisely
+        what the fingerprint claims cannot happen. Adding the digest to the
+        key rebuilds the policy exactly when the content moved. Identity
+        stays in the key so two equal-content dicts keep separate entries
+        rather than aliasing (cheap, and it keeps eviction per object).
+
+        A non-dict Mapping (test instrumentation) has no content digest —
+        `route()` routes those to the on-disk digest for the same reason —
+        so it keeps the identity-only behaviour it always had.
+        """
+        digest = canonical_policy_sha256(cfg) if isinstance(cfg, dict) else None
+        key = (id(cfg), digest)
         if key not in cls._cache:
             cls._cache[key] = cls(cfg)
         return cls._cache[key]
@@ -2122,10 +2139,15 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             caveats = cfg["models"][key].get("served_model_caveats") or []
             matched = sorted(set(caveats) & set(task.flags))
             if matched:
+                # The vendor comes from the SEATED model's family, never a
+                # literal: `served_model_caveats` is accepted on any registry
+                # row, so hard-coding one vendor is a false disclosure one
+                # config edit away (round-1 review F3). The registry key still
+                # does the identifying — model ids stay out of notes.
                 worker_notes.append(
-                    f"provider may substitute another Claude model for "
-                    f"{', '.join(matched)} content; the requested identity "
-                    f"of {key} is declared_only")
+                    f"provider may substitute another {policy.family_of[model]} "
+                    f"model for {', '.join(matched)} content; the requested "
+                    f"identity of {key} is declared_only")
     effective_policy = {
         "minimum_capability_tier": lp.get("minimum_capability_tier"),
         "minimum_effort": lp.get("minimum_effort"),

@@ -1041,7 +1041,11 @@ def test_malformed_digest_args_are_refused_pre_spawn(tmp_path):
     """오타가 receipt에 영구 기록되기 전에 죽는다 — 비-hex, 대문자, 길이
     오류 전부 exit 2이고 receipt는 만들어지지 않는다."""
     fake = write_fake(tmp_path, "bad.py", HAPPY)
-    for i, bad in enumerate(("xyz", "AB" * 32, "ab" * 31)):
+    # The trailing-newline case is round-1 review F1: Python's `$` also matches
+    # just before a final newline, so `^[0-9a-f]{64}$` passed a 65-char value
+    # and the malformed digest was written verbatim into the permanent
+    # receipt — the one outcome this gate exists to prevent.
+    for i, bad in enumerate(("xyz", "AB" * 32, "ab" * 31, "ab" * 32 + "\n")):
         attempt = f"bad-{i}"
         proc, receipt = run_dispatch(
             tmp_path, [sys.executable, fake], attempt_id=attempt,
@@ -1137,3 +1141,13 @@ def test_route_fingerprint_flows_into_receipts_and_verify(tmp_path):
     assert _verify(tmp_path, "seat1,seat2", 2,
                    extra=["--expect-fingerprint",
                           other["decision_fingerprint"]]) == 1
+
+
+def test_expect_fingerprint_rejects_a_trailing_newline_as_usage_error(tmp_path):
+    """round-1 review F1, the verify side: a newline-terminated expectation
+    must be a usage error (2), not an evidence problem (1) — misreporting a
+    caller's typo as an integrity failure erases the distinction B3 draws."""
+    _fake_receipt(tmp_path, "nl1", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5", decision_fingerprint="ab" * 32)
+    assert _verify(tmp_path, "nl1", 1,
+                   extra=["--expect-fingerprint", "ab" * 32 + "\n"]) == 2

@@ -92,7 +92,11 @@ VERDICT_RE = re.compile(r"^verdict:\s*(PASS|PASS_WITH_CHANGES|FAIL)\b", re.M)
 ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 # 64-hex digest grammar for the linkage args a route hands to a dispatch.
-HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+# `\A`/`\Z`, not `^`/`$`: without re.MULTILINE, `$` still matches just before
+# a final newline, so `^[0-9a-f]{64}$` accepted a 65-char "<64 hex>\n" — a
+# value a programmatic caller produces by reading a file without stripping,
+# and one this gate then wrote verbatim into a permanent receipt.
+HEX64_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 def _utcnow() -> str:

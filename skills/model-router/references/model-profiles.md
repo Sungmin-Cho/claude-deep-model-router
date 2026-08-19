@@ -159,8 +159,11 @@ price advantage, now with the measured quality cost on record.
 
 So the binding rests on the verified price advantage, not on a demonstrated
 quality advantage — which is exactly what the "cheapest capable model carries
-the volume" principle asks for. If a harder eval later separates them, change
-one line in the registry; the policy does not move.
+the volume" principle asks for. The 446-node probe did separate them, by 1.3pp
+against this seat, and the registry line stayed as it was: a gap that small,
+recoverable by the escalation ladder, does not outweigh a 5x price advantage.
+A larger measured gap is what would move the binding, and moving it is one
+line in the registry; the policy does not move either way.
 
 The Claude fast tier (`claude_worker_fast`) remains bound as the `claude_only`
 fallback, so a dead bridge costs latency and money, not capability.
@@ -205,8 +208,10 @@ the xai seat against sonnet-5's 38.6s). No regression detected against the
 claimed frontier tier; a single suite at ceiling is not grounds to raise
 `capability_tier`.
 
-**`capability_tier` is 1 on purpose.** Honesty first: without a measured
-comparison, promoting the model to tier 2 would treat a claim as a result.
+**`capability_tier` is 1 on purpose.** Honesty first: the one measured
+comparison there is finished at the suite's ceiling, which separates nothing —
+promoting the model to tier 2 on it would treat an undiscriminating result as
+a demonstrated one.
 Side-effect second: MEDIUM's reviewer floor is the minimum nominal tier among
 `worker_balanced`, `senior_engineer`, and `reasoning_specialist` in the
 default binding. That minimum is currently 1. Raising this model to 2 would
