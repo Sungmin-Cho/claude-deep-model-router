@@ -400,6 +400,15 @@ human_in_the_loop:
 # Every id below was probed in this environment. See verification_ledger.
 
 models:
+  # price_per_mtok is a REFERENCE record of published API rates — not the
+  # marginal cost of a dispatch that rides a subscription (Claude Max /
+  # ChatGPT Codex / SuperGrok). It records the input/output/cache-read axes
+  # only; other billing axes (e.g. OpenAI cache-write at 1.25x uncached
+  # input) are deliberately not recorded until a code consumer needs them.
+  # long_context.boundary vocabulary: `inclusive` — an input AT OR ABOVE the
+  # threshold re-bills the whole request at the second tier; `exclusive` —
+  # strictly above.
+  #
   # `capability_tier` is the model's strength as a *model*, independent of any
   # role it happens to be bound to. Every strength comparison in the router —
   # judge-vs-party, reviewer-vs-band-floor, substitution-vs-replaced — reads
@@ -424,42 +433,57 @@ models:
     family: claude
     capability_tier: 1
     verified: true
-    price_per_mtok: { input: 2.00, output: 10.00 }
+    price_per_mtok: { input: 2.00, output: 10.00, cached_input: 0.20 }
 
   claude_senior:
     id: claude-opus-5
     family: claude
     capability_tier: 2
     verified: true
-    price_per_mtok: { input: 5.00, output: 25.00 }
+    price_per_mtok: { input: 5.00, output: 25.00, cached_input: 0.50 }
 
   claude_architect:
     id: claude-fable-5
     family: claude
     capability_tier: 3
     verified: true
-    price_per_mtok: { input: 10.00, output: 50.00 }
+    price_per_mtok: { input: 10.00, output: 50.00, cached_input: 1.00 }
 
   openai_worker_fast:
     id: gpt-5.6-luna
     family: openai
     capability_tier: 0
     verified: true
-    price_per_mtok: { input: 0.20, output: 1.20, cached_input: 0.02 }
+    price_per_mtok:
+      input: 0.20
+      output: 1.20
+      cached_input: 0.02
+      long_context: { above_input_tokens: 272000, boundary: exclusive,
+                      input: 0.40, output: 1.80, cached_input: 0.04 }
 
   openai_worker_balanced:
     id: gpt-5.6-terra
     family: openai
     capability_tier: 1
     verified: true
-    price_per_mtok: { input: 2.00, output: 12.00 }
+    price_per_mtok:
+      input: 2.00
+      output: 12.00
+      cached_input: 0.20
+      long_context: { above_input_tokens: 272000, boundary: exclusive,
+                      input: 4.00, output: 18.00, cached_input: 0.40 }
 
   openai_reasoning:
     id: gpt-5.6-sol
     family: openai
     capability_tier: 2
     verified: true
-    price_per_mtok: { input: 5.00, output: 30.00 }
+    price_per_mtok:
+      input: 5.00
+      output: 30.00
+      cached_input: 0.50
+      long_context: { above_input_tokens: 272000, boundary: exclusive,
+                      input: 10.00, output: 45.00, cached_input: 1.00 }
 
   # Balanced-tier price with frontier-tier claims. `capability_tier: 1` is the
   # honest reading, not a measured one: no head-to-head was run here, and
@@ -482,7 +506,8 @@ models:
       input: 2.00
       output: 6.00
       cached_input: 0.50
-      long_context: { above_input_tokens: 200000, input: 4.00, output: 12.00, cached_input: 1.00 }
+      long_context: { above_input_tokens: 200000, boundary: inclusive,
+                      input: 4.00, output: 12.00, cached_input: 1.00 }
     context_window: 500000
 
   # Unbound: suite already names this id, but P0 does not dispatch it.
@@ -699,7 +724,7 @@ fallback_compensations:
 # building on sand. Do not promote a row without running the probe.
 
 verification_ledger:
-  probed_on: 2026-08-18
+  probed_on: 2026-08-19
   entries:
     - item: "Claude model ids (haiku-4-5-20251001, sonnet-5, opus-5, fable-5)"
       status: verified
@@ -864,3 +889,35 @@ verification_ledger:
         a non-ASCII digit in semver (1). Mean per-task wall time: luna
         19.6s, sonnet-5 38.6s, haiku 91.2s, grok-4.6 103.2s. Bindings and
         every capability_tier are unchanged by this probe.
+
+    - item: "OpenAI GPT-5.6 long-context pricing tier (272K, exclusive)"
+      status: verified
+      probed_on: 2026-08-19
+      evidence: >
+        Published rates: an input STRICTLY ABOVE 272K tokens re-bills the
+        WHOLE request at 2x input / 1.5x output / 2x cache-read for luna,
+        terra and sol (absolute rates recorded per model). Verified against
+        the official OpenAI model pages on 2026-08-19; the boundary itself
+        was not exercised by a probe. Distinct fact, same number: the codex
+        CLI's DEFAULT context window is also 272,000 (x95% = 258,400
+        effective), but that is a per-user harness setting
+        (~/.codex/config.toml model_context_window — this environment runs
+        1,000,000 -> clamped min(1M, 872K) x95% = 828,400), NOT the billing
+        boundary. A default-config Codex session cannot even reach the
+        billing tier. Effective windows are deployment-arm properties and
+        are deliberately NOT recorded in this registry.
+
+    - item: "Fable 5 provider-side model substitution (security/biology)"
+      status: verified
+      probed_on: 2026-08-19
+      evidence: >
+        Vendor documentation (not an execution probe): Fable 5 requests can
+        be substituted to another Claude model via the refusal-fallback
+        mechanism — cybersecurity to Opus 4.8, biology to Opus 5. The
+        substitution is conditional on the calling surface: default on
+        claude.ai, opt-in fallback configuration on the raw API (without it
+        a refused request stops), and harness-dependent for this router's
+        `claude -p` transport. Implication: under security_sensitive the
+        identity of a claude_architect seat is declared_only, and the
+        substitute (Opus 4.8) may not be in this registry.
+        `served_model_caveats` on claude_architect discloses this per route.
