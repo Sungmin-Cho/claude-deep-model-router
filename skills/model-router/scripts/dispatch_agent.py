@@ -838,7 +838,29 @@ def cmd_verify_evidence(args) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    expected_models = None
+    if args.expect_models is not None:
+        expected_models = [m.strip() for m in args.expect_models.split(",")]
+        if any(not m for m in expected_models):
+            print("error: --expect-models contains an empty token", file=sys.stderr)
+            return 2
+        if len(set(expected_models)) != len(expected_models):
+            print("error: --expect-models contains duplicates — the route's "
+                  "reviewer_models are distinct by construction, so a "
+                  "duplicate expectation is always a caller mistake",
+                  file=sys.stderr)
+            return 2
+        if len(expected_models) != args.expect_count:
+            print(f"error: --expect-models names {len(expected_models)} "
+                  f"model(s) but --expect-count is {args.expect_count}",
+                  file=sys.stderr)
+            return 2
+    if args.expect_fingerprint is not None and not HEX64_RE.match(args.expect_fingerprint):
+        print("error: --expect-fingerprint must be 64 lowercase hex chars",
+              file=sys.stderr)
+        return 2
     problems = []
+    declared_models = []
     if len(set(ids)) != args.expect_count:
         problems.append(
             f"expected exactly {args.expect_count} distinct id(s), "
@@ -868,9 +890,27 @@ def cmd_verify_evidence(args) -> int:
                 f"{receipt.get('output_schema')!r}, not 'review'")
         if receipt.get("result", {}).get("schema_valid") is not True:
             problems.append(f"{attempt_id}: schema_valid is not true")
+        if expected_models is not None and receipt.get("model_id") is None:
+            problems.append(f"{attempt_id}: model_id is null — cannot match "
+                            f"--expect-models")
+        if args.expect_fingerprint is not None and \
+                receipt.get("decision_fingerprint") != args.expect_fingerprint:
+            problems.append(f"{attempt_id}: decision_fingerprint is "
+                            f"{receipt.get('decision_fingerprint')!r}, not the "
+                            f"expected value")
+        declared_models.append(receipt.get("model_id"))
         seats.append(receipt.get("seat"))
     if len(seats) != len(set(seats)):
         problems.append(f"seats are not distinct: {sorted(seats)}")
+    if expected_models is not None:
+        got = sorted(m for m in declared_models if m is not None)
+        # A null model_id is already reported per receipt above; comparing the
+        # multiset again there would say the same thing twice with a confusing
+        # "does not match" that names a shorter list than the caller supplied.
+        if not any("cannot match --expect-models" in p for p in problems) \
+                and got != sorted(expected_models):
+            problems.append(f"declared models {got} do not match expected "
+                            f"{sorted(expected_models)}")
     for problem in problems:
         print(problem, file=sys.stderr)
     return 1 if problems else 0
@@ -925,6 +965,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="comma-separated attempt ids")
     verify.add_argument("--expect-count", type=int, required=True,
                         help="the route's reviewer seat count — exactly")
+    verify.add_argument("--expect-models", default=None,
+                        help="comma-separated DECLARED model ids — a multiset "
+                             "match against receipts' model_id (seat<->model "
+                             "pairing is deliberately not checked: --seat is a "
+                             "non-semantic label; independence needs N distinct "
+                             "models completing, not a label assignment). This "
+                             "checks the declared/requested identity, not the "
+                             "served one.")
+    verify.add_argument("--expect-fingerprint", default=None,
+                        help="route decision_fingerprint (64 lowercase hex) "
+                             "every receipt must carry")
     return p
 
 

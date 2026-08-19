@@ -841,6 +841,11 @@ def _fake_receipt(tmp_path, attempt_id, seat, state, output_schema="review",
     (receipts / f"{attempt_id}.json").write_text(json.dumps(payload))
 
 
+def _verify(tmp_path, ids, count, extra=()):
+    return _agent(["verify-evidence", "--ids", ids,
+                   "--expect-count", str(count), *extra], tmp_path).returncode
+
+
 def test_verify_evidence_accepts_exactly_the_valid_set(tmp_path):
     _fake_receipt(tmp_path, "r1", "reviewer-1", "SUCCEEDED")
     _fake_receipt(tmp_path, "r2", "reviewer-2", "SUCCEEDED")
@@ -1045,3 +1050,45 @@ def test_malformed_digest_args_are_refused_pre_spawn(tmp_path):
         assert receipt is None, (
             "a malformed digest must fail before any receipt exists")
 
+
+def test_expect_models_matches_declared_models_as_a_multiset(tmp_path):
+    _fake_receipt(tmp_path, "e1", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5")
+    _fake_receipt(tmp_path, "e2", "reviewer-2", "SUCCEEDED",
+                  model_id="gpt-5.6-sol")
+    ok = _verify(tmp_path, "e1,e2", 2,
+                 extra=["--expect-models", "gpt-5.6-sol,claude-opus-5"])
+    assert ok == 0                      # 순서 무관
+    bad = _verify(tmp_path, "e1,e2", 2,
+                  extra=["--expect-models", "claude-opus-5,grok-4.6"])
+    assert bad == 1                     # 불일치는 문제로 보고
+
+
+def test_expect_models_rejects_duplicates_empties_and_count_mismatch(tmp_path):
+    _fake_receipt(tmp_path, "e3", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5")
+    assert _verify(tmp_path, "e3", 1, extra=["--expect-models", "a,,b"]) == 2
+    assert _verify(tmp_path, "e3", 1, extra=["--expect-models", "a,a"]) == 2
+    assert _verify(tmp_path, "e3", 1, extra=["--expect-models", "a,b"]) == 2  # count 1 != 2
+
+
+def test_expect_models_flags_a_null_model_receipt(tmp_path):
+    _fake_receipt(tmp_path, "e4", "reviewer-1", "SUCCEEDED", model_id=None)
+    assert _verify(tmp_path, "e4", 1,
+                   extra=["--expect-models", "claude-opus-5"]) == 1
+
+
+def test_expect_fingerprint_checks_every_receipt_and_grammar(tmp_path):
+    fp = "ab" * 32
+    _fake_receipt(tmp_path, "e5", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5", decision_fingerprint=fp)
+    _fake_receipt(tmp_path, "e6", "reviewer-2", "SUCCEEDED",
+                  model_id="gpt-5.6-sol", decision_fingerprint=fp)
+    assert _verify(tmp_path, "e5,e6", 2, extra=["--expect-fingerprint", fp]) == 0
+    assert _verify(tmp_path, "e5,e6", 2,
+                   extra=["--expect-fingerprint", "cd" * 32]) == 1
+    assert _verify(tmp_path, "e5,e6", 2,
+                   extra=["--expect-fingerprint", "nothex"]) == 2
+    _fake_receipt(tmp_path, "e7", "reviewer-1", "SUCCEEDED",
+                  model_id="claude-opus-5", decision_fingerprint=None)
+    assert _verify(tmp_path, "e7", 1, extra=["--expect-fingerprint", fp]) == 1
