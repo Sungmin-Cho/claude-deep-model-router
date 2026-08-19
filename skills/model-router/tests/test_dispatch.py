@@ -1151,3 +1151,17 @@ def test_expect_fingerprint_rejects_a_trailing_newline_as_usage_error(tmp_path):
                   model_id="claude-opus-5", decision_fingerprint="ab" * 32)
     assert _verify(tmp_path, "nl1", 1,
                    extra=["--expect-fingerprint", "ab" * 32 + "\n"]) == 2
+
+
+def test_an_attempt_id_with_a_trailing_newline_is_refused(tmp_path):
+    """round-2 review (pre-existing, fixed here because it is the identical
+    `$` idiom two lines from the one this release introduced): a newline-
+    terminated attempt id passed `^...$` and went on to name a receipt FILE.
+    """
+    fake = write_fake(tmp_path, "nlid.py", HAPPY)
+    proc, receipt = run_dispatch(tmp_path, [sys.executable, fake],
+                                 attempt_id="ok-id\n")
+    assert proc.returncode == 2, proc.stderr
+    assert receipt is None
+    assert not list((tmp_path / "receipts").glob("*")) or not any(
+        "\n" in q.name for q in (tmp_path / "receipts").glob("*"))

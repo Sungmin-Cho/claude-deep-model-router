@@ -2038,22 +2038,53 @@ def test_d17_a_self_reviewing_route_is_gated_whatever_the_config_says():
 
 
 def test_d17_an_unimplemented_action_fails_closed_even_on_a_cached_config():
-    """Round 13. `Policy.of` caches on config identity and the config is a
-    mutable dict, so a value changed after the first route reaches the
+    """Round 13. `Policy.of` cached on config identity and the config is a
+    mutable dict, so a value changed after the first route reached the
     dispatcher unvalidated. The dispatcher treated anything that was not
     `terminal` or `require_human_confirmation` as `notify_human` — a control
-    failing OPEN, which is the one direction it must never fail."""
-    from route_task import ConfigError
+    failing OPEN, which is the one direction it must never fail.
+
+    1.2.0 moved WHERE this closes for a dict config: the content digest in the
+    cache key rebuilds the Policy, so the unknown word is now rejected at build
+    time and never reaches the dispatch block. Both are asserted separately —
+    a round-2 reviewer pointed out that keeping only the end-to-end assertion
+    would leave this named regression test green while no longer exercising the
+    guard it is named after.
+    """
+    from route_task import ConfigError, Policy
     cfg = load_config()
     probe = _task(task_class="MECHANICAL", complexity=0, uncertainty=3,
                   blast_radius=0, reversibility=0, flags=["auth_sensitive"])
     assert route(probe, cfg)["requires_human_confirmation"], "probe drifted"
 
     # Mutate the SAME object the Policy cache is keyed on, as a caller sharing
-    # a config dict across calls would.
+    # a config dict across calls would. Still fails closed, end to end.
     cfg["human_in_the_loop"]["on_any_critical_review"] = "notify_the_human"
     with pytest.raises(ConfigError):
         route(probe, cfg)
+
+    # Where it closes now: rebuild-on-content-change, at Policy build time.
+    with pytest.raises(ConfigError, match="this router implements"):
+        Policy.of(cfg)
+
+    # And the dispatch-time guard itself, which stays as depth for the one
+    # path that is still identity-cached — a non-dict Mapping. Reached
+    # directly, since no cfg mutation can route through it any more.
+    good = load_config()
+    policy = Policy.of(good)
+    good["human_in_the_loop"]["on_any_critical_review"] = "notify_the_human"
+    with pytest.raises(ConfigError):
+        route(probe, _StaleMapping(good, policy))
+
+
+class _StaleMapping(dict):
+    """A config whose Policy is already built — the shape a non-dict Mapping
+    presents to `Policy.of`: cached on identity, so a later content change is
+    not seen at build time and only the dispatch-time guard is left."""
+
+    def __init__(self, data, policy):
+        super().__init__(data)
+        Policy._cache[id(self)] = (None, policy)
 
 
 def test_d17_an_alias_in_prior_models_identifies_nothing_and_routes_nothing():

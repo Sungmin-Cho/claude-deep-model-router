@@ -208,17 +208,28 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
 class Policy:
     """Everything derivable from a config, computed once per config."""
 
-    # Keyed on id(cfg). Safe because `__init__` stores `self.cfg = cfg`, so a
-    # cached Policy keeps its config alive and that id cannot be recycled while
-    # the entry exists. Round 9 added a redundant (cfg, policy) tuple to "fix"
-    # a hazard that this line already prevented, in the same commit that
-    # removed inert policy elsewhere — round 10 caught the irony. The cost that
-    # IS real: the cache is unbounded, so a process routing against many
-    # distinct config objects retains all of them.
-    _cache: dict[tuple[int, str | None], "Policy"] = {}
+    # id(cfg) -> (content digest, Policy): ONE entry per config object, holding
+    # its current revision. Identity keys are safe because `__init__` stores
+    # `self.cfg = cfg`, so the live entry keeps its config alive and that id
+    # cannot be recycled — which is why the entry is REPLACED rather than
+    # dropped when the content moves. Any future eviction must preserve that
+    # property: evicting the last entry for a live id reintroduces the
+    # id-recycling hazard this design has always depended on not having.
+    # Round 9 added a redundant (cfg, policy) tuple to "fix" a hazard that this
+    # line already prevented, in the same commit that removed inert policy
+    # elsewhere — round 10 caught the irony. The digest half arrived in 1.2.0:
+    # identity alone answered a mutated config from a stale entry while the
+    # emitted `policy_sha256` attested the new content. The cost that IS real:
+    # the cache is unbounded in the number of distinct config OBJECTS, so a
+    # process routing against many of them retains all of them — but no longer
+    # unbounded in how often any one of them is edited.
+    _cache: dict[int, tuple[str | None, "Policy"]] = {}
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        # Set by `of()`; None for a Policy built directly or from a non-dict
+        # Mapping, both of which have no content digest to publish.
+        self.content_sha: str | None = None
         self.bands: list[str] = sorted(cfg["router"]["bands"], key=lambda b: cfg["router"]["bands"][b]["ordinal"])
         self.efforts: list[str] = list(cfg["effort_levels"])
         self.roles: list[str] = list(cfg["role_tiers"])
@@ -379,27 +390,32 @@ class Policy:
 
     @classmethod
     def of(cls, cfg: dict) -> "Policy":
-        """Derived policy for `cfg`, cached on (identity, content digest).
+        """Derived policy for `cfg`, rebuilt whenever its content moves.
 
         Identity alone was not enough once `policy_sha256` became a CONTENT
         digest (design §4 B1): a caller that mutates a cfg dict in place
         between routes got semantics precomputed from the pre-mutation
         content while the emitted digest attested the post-mutation content
         — one fingerprint over two different decisions, which is precisely
-        what the fingerprint claims cannot happen. Adding the digest to the
-        key rebuilds the policy exactly when the content moved. Identity
-        stays in the key so two equal-content dicts keep separate entries
-        rather than aliasing (cheap, and it keeps eviction per object).
+        what the fingerprint claims cannot happen.
+
+        The digest is computed once here and published as `content_sha`, so
+        `route()` emits the same value it keyed on instead of dumping the
+        same object a second time; two independent canonicalisations agreeing
+        only because nothing happened in between is not a guarantee.
 
         A non-dict Mapping (test instrumentation) has no content digest —
         `route()` routes those to the on-disk digest for the same reason —
         so it keeps the identity-only behaviour it always had.
         """
         digest = canonical_policy_sha256(cfg) if isinstance(cfg, dict) else None
-        key = (id(cfg), digest)
-        if key not in cls._cache:
-            cls._cache[key] = cls(cfg)
-        return cls._cache[key]
+        cached = cls._cache.get(id(cfg))
+        if cached is None or cached[0] != digest:
+            policy = cls(cfg)
+            policy.content_sha = digest
+            cls._cache[id(cfg)] = (digest, policy)
+            return policy
+        return cached[1]
 
     # ordered-enum helpers, bound to this policy's vocabulary
     def band_max(self, a, b): return self.bands[max(self.bands.index(a), self.bands.index(b))]
@@ -1493,12 +1509,16 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     task.validate(policy)
 
     request_sha = request_sha256_of(task)
-    # The digest of the policy ACTUALLY IN USE. dict -> content digest;
-    # a non-dict Mapping (test instrumentation such as test_d14's recorder)
-    # falls back to the on-disk digest so the digest walk cannot mark every
-    # config path as "read" and hollow out the consumer guard.
-    policy_hash = (canonical_policy_sha256(cfg) if isinstance(cfg, dict)
-                   else policy_sha256(CONFIG_PATH))
+    # The digest of the policy ACTUALLY IN USE — the same computation that
+    # keyed this Policy, not a second dump of the same object. A non-dict
+    # Mapping (test instrumentation such as test_d14's recorder) has no
+    # content digest and falls back to the on-disk one, so the digest walk
+    # cannot mark every config path as "read" and hollow out the consumer
+    # guard. Precondition, and the reason this reads a single value: `cfg`
+    # must not change during a `route()` call. The router never mutates it;
+    # a caller that does (from another thread, or a self-mutating Mapping)
+    # gets a decision this digest does not describe.
+    policy_hash = policy.content_sha or policy_sha256(CONFIG_PATH)
 
     lp = task._local_policy or {}
     local_unsat = False
@@ -2048,12 +2068,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
             # gate" on a route that was terminal at exit 1.
             notified.append((key, why))
         else:
-            # No `else: treat it as the weakest action`. `Policy` validates this
-            # vocabulary, but `Policy.of` caches on config identity and the
-            # config is a mutable dict, so a value changed after the first route
-            # reaches here unvalidated — and defaulting an unknown word to
-            # "notify" is a control failing OPEN, which is the one direction it
-            # must never fail.
+            # No `else: treat it as the weakest action`. `Policy` validates
+            # this vocabulary at build time, and since 1.2.0 a dict config
+            # edited between routes is rebuilt (the content digest moved), so
+            # that path now raises in `Policy.__init__` and never reaches
+            # here. This stays as depth: the remaining way in is a non-dict
+            # Mapping, whose Policy is still cached on identity alone — and
+            # defaulting an unknown word to "notify" is a control failing
+            # OPEN, which is the one direction it must never fail.
             raise ConfigError(
                 f"human_in_the_loop.{key} = {action!r} is not an implemented action")
 

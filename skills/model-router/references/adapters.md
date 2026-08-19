@@ -370,7 +370,7 @@ impossible. `status --attempt-id <id> --receipt-dir <dir>` polls;
 `--isolation-evidence` (see `review-policy.md`, "Where the evidence id
 comes from"). For seats dispatched from a route, bind the decision as well —
 `verify-evidence ... --expect-fingerprint <route decision_fingerprint>
---expect-models <route review.reviewer_models>` — since without those two the
+--expect-models <route review.reviewer_models, comma-separated>` — since without those two the
 check cannot tell this decision's receipts from any other completed review's.
 
 ### Output is a contract

@@ -101,7 +101,7 @@ def test_a_mutated_cfg_cannot_share_a_fingerprint_with_a_fresh_one():
     task = Task(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
                 blast_radius=3, reversibility=2, flags=["review_disagreement"])
     cfg = load_config()
-    route(task, cfg)                                   # seats the cache
+    baseline = route(task, cfg)                        # seats the cache
     cfg["models"]["claude_architect"]["capability_tier"] = 0
     stale = route(task, cfg)
 
@@ -109,8 +109,49 @@ def test_a_mutated_cfg_cannot_share_a_fingerprint_with_a_fresh_one():
     fresh_cfg["models"]["claude_architect"]["capability_tier"] = 0
     fresh = route(task, fresh_cfg)
 
+    # The mutated row must reach the decision, asserted rather than assumed:
+    # the day this fixture stops seating claude_architect, `stale == fresh`
+    # starts passing vacuously and this guard disappears in silence — the
+    # same failure shape the B5 positive test was fixed for.
+    assert fresh["selected_model"] == baseline["selected_model"]
+    assert baseline["selected_capability_tier"] == 3
+    assert fresh["selected_capability_tier"] == 0
+
     assert stale["policy_sha256"] == fresh["policy_sha256"]
     assert stale["decision_fingerprint"] == fresh["decision_fingerprint"]
     assert stale == fresh, (
         "one fingerprint must identify one decision; the cfg content is "
         "identical, so every emitted field must be too")
+
+
+def test_repeated_mutation_of_one_cfg_keeps_the_policy_cache_bounded():
+    """round-2 review, 3/3 agreement: keying the Policy cache on
+    (identity, digest) fixed the staleness but made a long-lived library
+    process retain one Policy per historical revision of the same config
+    object. One identity keeps ONE entry — the current revision — which also
+    keeps the strong `self.cfg` reference that stops the id being recycled.
+    """
+    from route_task import Policy
+    task = Task(**BASE)
+    cfg = load_config()
+    before = len(Policy._cache)
+    for i in range(1, 26):
+        cfg["router"]["confidence"]["escalate_below"] = 0.5 + i * 0.001
+        route(task, cfg)
+    assert len(Policy._cache) - before == 1, (
+        "25 revisions of one config object must not leave 25 cached policies")
+    # Bounded, and still correct: the last revision routes like a fresh load.
+    fresh = load_config()
+    fresh["router"]["confidence"]["escalate_below"] = 0.5 + 25 * 0.001
+    assert route(task, cfg) == route(task, fresh)
+
+
+def test_the_cache_key_digest_is_the_digest_the_route_emits():
+    """round-2 review A4/I2: the cache key and the emitted `policy_sha256`
+    used to be two independent canonical dumps of the same object, agreeing
+    only because nothing happened between them. One computation now feeds
+    both, so they cannot diverge."""
+    from route_task import Policy
+    cfg = load_config()
+    out = route(Task(**BASE), cfg)
+    assert Policy.of(cfg).content_sha == out["policy_sha256"]

@@ -88,8 +88,10 @@ VERDICT_RE = re.compile(r"^verdict:\s*(PASS|PASS_WITH_CHANGES|FAIL)\b", re.M)
 
 # Safe identifier grammar for attempt-id: this string is interpolated
 # directly into filesystem paths, so it must never contain a path
-# separator or a traversal segment.
-ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# separator or a traversal segment. `\A`/`\Z` for the same reason the
+# digest grammar below uses them — `$` also matches just before a final
+# newline, which put a newline in a receipt FILENAME.
+ATTEMPT_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 # 64-hex digest grammar for the linkage args a route hands to a dispatch.
 # `\A`/`\Z`, not `^`/`$`: without re.MULTILINE, `$` still matches just before
