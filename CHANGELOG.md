@@ -7,6 +7,21 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-08-19 (evidence linkage)
+
+### Added
+
+- Every route now emits `request_sha256` and a deterministic `decision_fingerprint`; dispatch receipts can carry them (`--decision-fingerprint`, `--policy-sha256`, `--transport-id`, `--host-cli-version`) and `verify-evidence` checks them with `--expect-fingerprint` / `--expect-models`.
+- Receipts declare requested-vs-served identity explicitly: `observed_model_id` / `observed_model_source` slots (honest defaults — no transport can observe the served model yet).
+- `routing_confidence_kind` labels the confidence value as a heuristic gate score, not a calibrated probability.
+- The registry records the OpenAI GPT-5.6 272K long-context tier with an explicit boundary vocabulary, standard cached-input rates for all seats, and ledger entries for the pricing boundary and Fable 5's provider-side substitution.
+- Routes seating a model with a declared served-model caveat disclose the substitution possibility in their notes.
+
+### Fixed
+
+- `policy_sha256` now digests the policy actually in use, so a config injected through the library API no longer reports the on-disk digest.
+- Model profiles no longer describe worker bindings' quality as unmeasured; the effort table no longer lists work types the policy removed; the xAI long-context boundary reads "at or above 200K".
+
 ## [1.1.1] — 2026-08-18 (binding quality probed)
 
 ### Changed
