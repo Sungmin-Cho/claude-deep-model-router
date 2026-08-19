@@ -402,3 +402,11 @@ def test_policy_digest_reuses_its_cache_and_notices_a_real_edit(tmp_path):
     before = len(_DIGEST_CACHE)
     assert policy_sha256(link) == policy_sha256(cfg)
     assert len(_DIGEST_CACHE) == before
+
+
+def test_routing_confidence_kind_is_emitted_as_heuristic():
+    """design §3 A5: 이 값은 gate용 heuristic이지 calibrated 성공 확률이
+    아니다 — kind 필드가 그 사실을 스키마에 고정한다."""
+    out = route(Task(task_class="MECHANICAL", complexity=0, uncertainty=0,
+                     blast_radius=0, reversibility=0))
+    assert out["routing_confidence_kind"] == "heuristic_policy_score"

@@ -457,7 +457,8 @@ reasoning_centric:
 risk_score:  risk_band:   band_overrides_applied: []   critical_flags: []
 band_overrides_redundant: []   # fired, but another rule had already got there
 route_path:                    # null, or "disagreement"
-terminal:                      # null, or one of the four in the table above
+terminal:                      # null, or one of the terminal states in the
+                               # table above
 selected_role:  selected_model:  selected_effort:  selected_effort_effective:
 selected_effort_native:
 review:
@@ -482,7 +483,8 @@ fallback_compensations_applied: []
 unavailable_models: []
 excluded_prior_failures: []    # models withheld because they already failed
 escalation_count:  retry_count:
-routing_confidence:
+routing_confidence:  routing_confidence_kind:   # a heuristic gate score,
+                               # not a calibrated success probability
 requires_human_confirmation:
 human_confirmation_deferred:   # a production hotfix: dispatch now, confirm after
 human_control_causes: []       # which human_in_the_loop controls fired, by

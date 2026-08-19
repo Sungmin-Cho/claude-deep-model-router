@@ -2118,6 +2118,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
         "escalation_count": task.prior_failures,
         "retry_count": task.prior_failures,
         "routing_confidence": confidence,
+        # A heuristic gate score (base minus penalties), NOT a calibrated
+        # success probability. The kind is emitted so no consumer has to
+        # guess which one it is reading.
+        "routing_confidence_kind": "heuristic_policy_score",
         "requires_human_confirmation": requires_human,
         # Which configurable controls fired, by cause rather than by prose. The
         # reason strings are for people; these are what a test can hold the
