@@ -2,15 +2,15 @@
 
 # deep-model-router
 
-![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/claude-deep-model-router?label=version)
-![license](https://img.shields.io/github/license/Sungmin-Cho/claude-deep-model-router)
-[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/claude-deep-suite)
+![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/deep-model-router?label=version)
+![license](https://img.shields.io/github/license/Sungmin-Cho/deep-model-router)
+[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/deep-suite)
 
 Deterministic model / effort / review router for Claude Code, Codex, and Grok.
 
 Classify a delegated software-engineering task, then let the scorer pick the worker, reasoning effort, and review depth from risk — not from file count, token count, or which model you happen to have open. Review depth is a function of the risk band alone; the worker choice cannot quietly weaken it.
 
-Part of the [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) ecosystem. [deep-work](https://github.com/Sungmin-Cho/claude-deep-work) and [deep-loop](https://github.com/Sungmin-Cho/claude-deep-loop) depend on this plugin as the shared decision plane. See the [CHANGELOG](CHANGELOG.md) for release history.
+Part of the [deep-suite](https://github.com/Sungmin-Cho/deep-suite) ecosystem. [deep-work](https://github.com/Sungmin-Cho/deep-work) and [deep-loop](https://github.com/Sungmin-Cho/deep-loop) depend on this plugin as the shared decision plane. See the [CHANGELOG](CHANGELOG.md) for release history.
 
 ---
 
@@ -31,11 +31,11 @@ It does not implement the work, and it does not claim a control it did not enfor
 
 ```text
 # Claude Code
-/plugin marketplace add Sungmin-Cho/claude-deep-suite
+/plugin marketplace add Sungmin-Cho/deep-suite
 /plugin install deep-model-router@claude-deep-suite
 
 # Codex
-codex plugin marketplace add Sungmin-Cho/claude-deep-suite
+codex plugin marketplace add Sungmin-Cho/deep-suite
 codex plugin add deep-model-router@claude-deep-suite
 ```
 
@@ -43,7 +43,7 @@ codex plugin add deep-model-router@claude-deep-suite
 
 ```text
 # Claude Code
-claude plugin add https://github.com/Sungmin-Cho/claude-deep-model-router.git
+claude plugin add https://github.com/Sungmin-Cho/deep-model-router.git
 
 # Codex — add the local path as a plugin directory in your Codex config
 ```
@@ -123,17 +123,17 @@ Exit status is part of the contract: **0** dispatchable, **1** terminal, **2** i
 
 | Plugin | Role |
 |---|---|
-| [deep-model-router](https://github.com/Sungmin-Cho/claude-deep-model-router) | This plugin — shared decision plane |
-| [deep-work](https://github.com/Sungmin-Cho/claude-deep-work) | Phased implementation orchestrator |
-| [deep-review](https://github.com/Sungmin-Cho/claude-deep-review) | Independent evaluator with an APPROVE verdict |
-| [deep-loop](https://github.com/Sungmin-Cho/claude-deep-loop) | Durable multi-session control plane |
-| [deep-goal](https://github.com/Sungmin-Cho/claude-deep-goal) | Goal condition compiler |
-| [deep-evolve](https://github.com/Sungmin-Cho/claude-deep-evolve) | Autonomous fitness-metric experiment loop |
-| [deep-docs](https://github.com/Sungmin-Cho/claude-deep-docs) | Document gardening agent |
-| [deep-wiki](https://github.com/Sungmin-Cho/claude-deep-wiki) | Knowledge base ingest and management |
-| [deep-memory](https://github.com/Sungmin-Cho/claude-deep-memory) | Cross-project semantic memory |
-| [deep-dashboard](https://github.com/Sungmin-Cho/claude-deep-dashboard) | Harness diagnostics and suite telemetry |
-| [deep-suite (marketplace)](https://github.com/Sungmin-Cho/claude-deep-suite) | Unified marketplace and harness matrix |
+| [deep-model-router](https://github.com/Sungmin-Cho/deep-model-router) | This plugin — shared decision plane |
+| [deep-work](https://github.com/Sungmin-Cho/deep-work) | Phased implementation orchestrator |
+| [deep-review](https://github.com/Sungmin-Cho/deep-review) | Independent evaluator with an APPROVE verdict |
+| [deep-loop](https://github.com/Sungmin-Cho/deep-loop) | Durable multi-session control plane |
+| [deep-goal](https://github.com/Sungmin-Cho/deep-goal) | Goal condition compiler |
+| [deep-evolve](https://github.com/Sungmin-Cho/deep-evolve) | Autonomous fitness-metric experiment loop |
+| [deep-docs](https://github.com/Sungmin-Cho/deep-docs) | Document gardening agent |
+| [deep-wiki](https://github.com/Sungmin-Cho/deep-wiki) | Knowledge base ingest and management |
+| [deep-memory](https://github.com/Sungmin-Cho/deep-memory) | Cross-project semantic memory |
+| [deep-dashboard](https://github.com/Sungmin-Cho/deep-dashboard) | Harness diagnostics and suite telemetry |
+| [deep-suite (marketplace)](https://github.com/Sungmin-Cho/deep-suite) | Unified marketplace and harness matrix |
 
 ## Links
 
@@ -141,7 +141,7 @@ Exit status is part of the contract: **0** dispatchable, **1** terminal, **2** i
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)
 - [Locator](docs/locator.md)
-- [deep-suite marketplace](https://github.com/Sungmin-Cho/claude-deep-suite)
+- [deep-suite marketplace](https://github.com/Sungmin-Cho/deep-suite)
 
 ## License
 

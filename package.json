@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Sungmin-Cho/claude-deep-model-router.git"
+    "url": "https://github.com/Sungmin-Cho/deep-model-router.git"
   },
   "scripts": {
     "test": "python3 -m pytest skills/model-router/tests/ -q",

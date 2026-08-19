@@ -2,15 +2,15 @@
 
 # deep-model-router
 
-![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/claude-deep-model-router?label=version)
-![license](https://img.shields.io/github/license/Sungmin-Cho/claude-deep-model-router)
-[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/claude-deep-suite)
+![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/deep-model-router?label=version)
+![license](https://img.shields.io/github/license/Sungmin-Cho/deep-model-router)
+[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/deep-suite)
 
 Claude Code, Codex, Grok를 위한 결정적 모델 / effort / 리뷰 라우터.
 
 위임할 소프트웨어 엔지니어링 작업을 분류하면, 채점기가 파일 수·토큰 수·지금 열려 있는 모델이 아니라 리스크에 따라 워커, reasoning effort, 리뷰 깊이를 고릅니다. 리뷰 깊이는 리스크 밴드만의 함수이며, 워커 선택이 몰래 약화시킬 수 없습니다.
 
-[deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) 에코시스템의 일원입니다. [deep-work](https://github.com/Sungmin-Cho/claude-deep-work)와 [deep-loop](https://github.com/Sungmin-Cho/claude-deep-loop)가 공유 결정 평면으로 이 플러그인에 의존합니다. 릴리스 이력은 [CHANGELOG](CHANGELOG.md)를 참고하세요.
+[deep-suite](https://github.com/Sungmin-Cho/deep-suite) 에코시스템의 일원입니다. [deep-work](https://github.com/Sungmin-Cho/deep-work)와 [deep-loop](https://github.com/Sungmin-Cho/deep-loop)가 공유 결정 평면으로 이 플러그인에 의존합니다. 릴리스 이력은 [CHANGELOG](CHANGELOG.md)를 참고하세요.
 
 ---
 
@@ -31,11 +31,11 @@ deep-model-router는 **결정 평면**입니다. 형제 플러그인은 집행, 
 
 ```text
 # Claude Code
-/plugin marketplace add Sungmin-Cho/claude-deep-suite
+/plugin marketplace add Sungmin-Cho/deep-suite
 /plugin install deep-model-router@claude-deep-suite
 
 # Codex
-codex plugin marketplace add Sungmin-Cho/claude-deep-suite
+codex plugin marketplace add Sungmin-Cho/deep-suite
 codex plugin add deep-model-router@claude-deep-suite
 ```
 
@@ -43,7 +43,7 @@ codex plugin add deep-model-router@claude-deep-suite
 
 ```text
 # Claude Code
-claude plugin add https://github.com/Sungmin-Cho/claude-deep-model-router.git
+claude plugin add https://github.com/Sungmin-Cho/deep-model-router.git
 
 # Codex — Codex 설정에서 로컬 경로를 plugin 디렉터리로 추가
 ```
@@ -123,17 +123,17 @@ exit status도 계약입니다. **0** 디스패치 가능, **1** terminal, **2**
 
 | 플러그인 | 역할 |
 |---|---|
-| [deep-model-router](https://github.com/Sungmin-Cho/claude-deep-model-router) | 이 플러그인 — 공유 결정 평면 |
-| [deep-work](https://github.com/Sungmin-Cho/claude-deep-work) | 단계별 구현 오케스트레이터 |
-| [deep-review](https://github.com/Sungmin-Cho/claude-deep-review) | APPROVE 판정의 독립 평가자 |
-| [deep-loop](https://github.com/Sungmin-Cho/claude-deep-loop) | 다중 세션 durable 제어 평면 |
-| [deep-goal](https://github.com/Sungmin-Cho/claude-deep-goal) | goal 조건 컴파일러 |
-| [deep-evolve](https://github.com/Sungmin-Cho/claude-deep-evolve) | 자율 fitness metric 실험 루프 |
-| [deep-docs](https://github.com/Sungmin-Cho/claude-deep-docs) | 문서 정비 에이전트 |
-| [deep-wiki](https://github.com/Sungmin-Cho/claude-deep-wiki) | 지식 베이스 수집·관리 |
-| [deep-memory](https://github.com/Sungmin-Cho/claude-deep-memory) | 프로젝트 간 시맨틱 메모리 |
-| [deep-dashboard](https://github.com/Sungmin-Cho/claude-deep-dashboard) | 하네스 진단과 스위트 텔레메트리 |
-| [deep-suite (마켓플레이스)](https://github.com/Sungmin-Cho/claude-deep-suite) | 통합 마켓플레이스와 하네스 매트릭스 |
+| [deep-model-router](https://github.com/Sungmin-Cho/deep-model-router) | 이 플러그인 — 공유 결정 평면 |
+| [deep-work](https://github.com/Sungmin-Cho/deep-work) | 단계별 구현 오케스트레이터 |
+| [deep-review](https://github.com/Sungmin-Cho/deep-review) | APPROVE 판정의 독립 평가자 |
+| [deep-loop](https://github.com/Sungmin-Cho/deep-loop) | 다중 세션 durable 제어 평면 |
+| [deep-goal](https://github.com/Sungmin-Cho/deep-goal) | goal 조건 컴파일러 |
+| [deep-evolve](https://github.com/Sungmin-Cho/deep-evolve) | 자율 fitness metric 실험 루프 |
+| [deep-docs](https://github.com/Sungmin-Cho/deep-docs) | 문서 정비 에이전트 |
+| [deep-wiki](https://github.com/Sungmin-Cho/deep-wiki) | 지식 베이스 수집·관리 |
+| [deep-memory](https://github.com/Sungmin-Cho/deep-memory) | 프로젝트 간 시맨틱 메모리 |
+| [deep-dashboard](https://github.com/Sungmin-Cho/deep-dashboard) | 하네스 진단과 스위트 텔레메트리 |
+| [deep-suite (마켓플레이스)](https://github.com/Sungmin-Cho/deep-suite) | 통합 마켓플레이스와 하네스 매트릭스 |
 
 ## 링크
 
@@ -141,7 +141,7 @@ exit status도 계약입니다. **0** 디스패치 가능, **1** terminal, **2**
 - [기여 안내](CONTRIBUTING.md)
 - [보안](SECURITY.md)
 - [Locator](docs/locator.md)
-- [deep-suite 마켓플레이스](https://github.com/Sungmin-Cho/claude-deep-suite)
+- [deep-suite 마켓플레이스](https://github.com/Sungmin-Cho/deep-suite)
 
 ## 라이선스
 

@@ -1,7 +1,7 @@
 # Contributing to deep-model-router
 
 Thanks for improving **deep-model-router**, the shared decision plane for the
-[Deep Suite](https://github.com/Sungmin-Cho/claude-deep-suite) plugin family
+[Deep Suite](https://github.com/Sungmin-Cho/deep-suite) plugin family
 across Claude Code, Codex, and Grok.
 
 This plugin ships one skill, a YAML policy, and two Python CLIs. Keep routing
@@ -18,8 +18,8 @@ emit the same RouteDecisionV1 for the same inputs.
 ## Getting started
 
 ```text
-git clone https://github.com/Sungmin-Cho/claude-deep-model-router.git
-cd claude-deep-model-router
+git clone https://github.com/Sungmin-Cho/deep-model-router.git
+cd deep-model-router
 ```
 
 There are no package dependencies to install for the router itself.
