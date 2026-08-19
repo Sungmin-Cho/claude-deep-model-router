@@ -380,6 +380,10 @@ def test_model_profiles_quality_evidence_matches_ledger():
     # 수치는 해당 모델 라벨과 같은 문장 안에 결합되어야 한다: 문장 단위로
     # 쪼개 (라벨, 점수) 쌍을 함께 담은 문장이 존재하는지 본다.
     sentences = re.split(r"(?<=[.!?])\s+", MODEL_PROFILES_MD)
+    # 라벨은 registry id가 아니어야 한다 — `test_d8_model_ids_appear_only_in_
+    # the_registry`가 references/*.md에서 완전한 모델 id를 금지한다 (design §3
+    # A2의 "registry key로 지칭" 규율). grok-4.6은 완전한 id라 문서에 쓸 수
+    # 없으므로 문서가 이미 쓰는 좌석 라벨로 지칭한다.
     for label, score in (("luna", "436/446"), ("haiku", "442/446"),
-                         ("grok-4.6", "446/446"), ("sonnet-5", "445/446")):
+                         ("xai frontier", "446/446"), ("sonnet-5", "445/446")):
         assert any(label in s and score in s for s in sentences), (label, score)

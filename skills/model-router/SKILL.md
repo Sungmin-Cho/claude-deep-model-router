@@ -318,9 +318,8 @@ MINIMAL < LOW < MEDIUM < HIGH < VERY_HIGH < MAX
 | formatting, rename, boilerplate | `LOW` |
 | straightforward implementation | `MEDIUM` |
 | multi-file feature, debugging, refactoring, architecture, standard review | `HIGH` |
-| difficult debugging, multi-system refactoring | `VERY_HIGH` |
+| multi-system refactoring | `VERY_HIGH` |
 | complex architecture, unknown root cause, adversarial review | `MAX` |
-| orchestration (default) | `HIGH` |
 
 Floors override the table, never the reverse:
 
