@@ -451,6 +451,10 @@ Every route reports:
 ```yaml
 task_class:  complexity:  uncertainty:  blast_radius:  reversibility:
 route_schema_version:  router_plugin_version:  policy_sha256:
+request_sha256:  decision_fingerprint:   # same request x policy x router
+                               # version -> same fingerprint; carried into
+                               # dispatch receipts and checked by
+                               # verify-evidence --expect-fingerprint
 effective_policy:  selected_capability_tier:  selected_families: []
 local_policy_applied:
 reasoning_centric:

@@ -1241,11 +1241,23 @@ _PERTURBATION_PROBES = [
 ]
 
 
+# Config-identity digests, not routing outcomes. Since design §4 B1 made
+# `policy_sha256` a CONTENT digest of the cfg actually in use, every legal
+# perturbation moves it — and `decision_fingerprint` with it. Comparing them
+# here would make every review key look effective and leave this test unable
+# to find an inert one ever again (its own canary catches exactly that). The
+# question this test asks is whether a value changes a routing DECISION, so
+# the decision is what gets compared.
+_PERTURBATION_IGNORED_KEYS = ("policy_sha256", "decision_fingerprint")
+
+
 def _routes_under(cfg):
     out = []
     for kw in _PERTURBATION_PROBES:
         try:
-            out.append(route(Task(**kw), cfg))
+            decision = route(Task(**kw), cfg)
+            out.append({k: v for k, v in decision.items()
+                        if k not in _PERTURBATION_IGNORED_KEYS})
         except Exception as exc:  # noqa: BLE001 — a raise is itself an outcome
             out.append({"raised": f"{type(exc).__name__}: {exc}"})
     return out

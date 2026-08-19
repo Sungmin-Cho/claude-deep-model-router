@@ -38,12 +38,13 @@ happened.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import traceback
 from dataclasses import dataclass, field, fields, replace
 
-from policy_digest import policy_sha256
+from policy_digest import canonical_policy_sha256, policy_sha256
 from pathlib import Path
 from typing import Any
 
@@ -1390,6 +1391,60 @@ def _worker_effort_floor(task: Task, band: str, policy: Policy) -> tuple[str, st
     return max(applied, key=lambda pair: policy.efforts.index(pair[1]), default=None)
 
 
+def _canonical_json(obj) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def request_sha256_of(task: Task) -> str:
+    """The caller's request in canonical form, hashed — computed from the
+    ORIGINAL validated input, before route() blanks prior_models on a
+    history gap. Normalisation mirrors exactly how route() consumes each
+    field: set-semantics lists dedup+sort, isolation_evidence additionally
+    strips (route reads it as a stripped distinct set), prior_models keeps
+    multiplicity (two failures of one model are two entries), and
+    local_policy follows bool(lp): falsy (absent or {}) becomes null.
+    """
+    lp = task._local_policy
+    lp_norm = None
+    if lp:
+        lp_norm = {k: lp.get(k) for k in sorted(LOCAL_POLICY_KEYS)}
+        if lp_norm.get("allowed_families") is not None:
+            lp_norm["allowed_families"] = sorted(set(lp_norm["allowed_families"]))
+    canonical = {
+        "task_class": task.task_class,
+        "complexity": task.complexity,
+        "uncertainty": task.uncertainty,
+        "blast_radius": task.blast_radius,
+        "reversibility": task.reversibility,
+        "reasoning_centric": task.reasoning_centric,
+        "flags": sorted(set(task.flags)),
+        "prior_failures": task.prior_failures,
+        "prior_models": sorted(task.prior_models),
+        "runtime": task.runtime,
+        "unavailable_roles": sorted(set(task.unavailable_roles)),
+        "unavailable_models": sorted(set(task.unavailable_models)),
+        "isolation_available": task.isolation_available,
+        "isolation_evidence": sorted({e.strip() for e in task.isolation_evidence
+                                      if e.strip()}),
+        "local_policy": lp_norm,
+    }
+    return hashlib.sha256(_canonical_json(canonical).encode()).hexdigest()
+
+
+def decision_fingerprint_of(request_sha: str, policy_sha: str,
+                            version: str) -> str:
+    """Same request x same policy x same router version -> same decision.
+    Identifies the DECISION equivalence class, not the task instance —
+    instance linkage lives in the receipt's prompt_sha256 (see design §8).
+    """
+    return hashlib.sha256(_canonical_json({
+        "request_sha256": request_sha,
+        "policy_sha256": policy_sha,
+        "router_plugin_version": version,
+    }).encode()).hexdigest()
+
+
 def _clamp(policy: Policy, effort: str, model: str | None) -> str:
     """The highest level at or below `effort` that `model` will accept."""
     ceiling = policy.ceiling_of.get(model) if model else None
@@ -1403,6 +1458,14 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     cfg = cfg if cfg is not None else default_config()
     policy = Policy.of(cfg)
     task.validate(policy)
+
+    request_sha = request_sha256_of(task)
+    # The digest of the policy ACTUALLY IN USE. dict -> content digest;
+    # a non-dict Mapping (test instrumentation such as test_d14's recorder)
+    # falls back to the on-disk digest so the digest walk cannot mark every
+    # config path as "read" and hollow out the consumer guard.
+    policy_hash = (canonical_policy_sha256(cfg) if isinstance(cfg, dict)
+                   else policy_sha256(CONFIG_PATH))
 
     lp = task._local_policy or {}
     local_unsat = False
@@ -2039,7 +2102,10 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     result = {
         "route_schema_version": ROUTE_SCHEMA_VERSION,
         "router_plugin_version": plugin_manifest_version(),
-        "policy_sha256": policy_sha256(CONFIG_PATH),
+        "policy_sha256": policy_hash,
+        "request_sha256": request_sha,
+        "decision_fingerprint": decision_fingerprint_of(
+            request_sha, policy_hash, plugin_manifest_version()),
         "effective_policy": effective_policy,
         "selected_capability_tier": (
             policy.tier_of[worker_model] if worker_model else None),
