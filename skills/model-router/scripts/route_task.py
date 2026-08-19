@@ -277,6 +277,22 @@ class Policy:
                     f"compared and would be skipped in silence")
             self.ceiling_of[model["id"]] = ceiling
 
+        # served_model_caveats: a disclosure trigger list. Strict-loud like
+        # every other vocabulary — an unknown flag or a duplicate reads as
+        # policy and discloses nothing.
+        for key, model in cfg["models"].items():
+            caveats = model.get("served_model_caveats")
+            if caveats is None:
+                continue
+            if len(set(caveats)) != len(caveats):
+                raise ConfigError(f"models.{key}.served_model_caveats has duplicates")
+            unknown = set(caveats) - self.known_flags
+            if unknown:
+                raise ConfigError(
+                    f"models.{key}.served_model_caveats names unknown flag(s) "
+                    f"{sorted(unknown)}; a trigger outside the flags vocabulary "
+                    f"can never fire")
+
         # What each band demands of a reviewer, expressed as a model tier and
         # derived from the band's own configured reviewer roles under the
         # canonical binding. Computed, never written down twice: a floor kept
@@ -2091,6 +2107,25 @@ def route(task: Task, cfg: dict | None = None) -> dict:
     # worker left a consumer able to dispatch the reviewers from a route the
     # rationale said must not be executed.
     executable = terminal is None
+    if executable:
+        # Served-model caveat disclosure (design §4 B5): per MODEL once,
+        # registry key not model id (terminal withholding scans ids), the
+        # matched flags joined so multiple caveats stay one line.
+        disclosed: set[str] = set()
+        for role in dict.fromkeys([worker] + list(review["reviewers"])
+                                  + ([judge] if judge else [])):
+            model = resolved.get(role)
+            if not model or model in disclosed:
+                continue
+            disclosed.add(model)
+            key = policy.id_to_key[model]
+            caveats = cfg["models"][key].get("served_model_caveats") or []
+            matched = sorted(set(caveats) & set(task.flags))
+            if matched:
+                worker_notes.append(
+                    f"provider may substitute another Claude model for "
+                    f"{', '.join(matched)} content; the requested identity "
+                    f"of {key} is declared_only")
     effective_policy = {
         "minimum_capability_tier": lp.get("minimum_capability_tier"),
         "minimum_effort": lp.get("minimum_effort"),

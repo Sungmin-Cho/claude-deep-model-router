@@ -885,3 +885,34 @@ def test_the_rationale_always_names_the_band_and_any_fallback():
         assert out["risk_band"] in out["rationale"]
         if out["fallbacks_applied"]:
             assert "Fallback" in out["rationale"]
+
+
+def _route_of(**kwargs):
+    return route(Task(**kwargs))
+
+
+def test_served_model_caveat_discloses_exactly_when_flag_and_seat_meet():
+    """design §4 B5: caveat flag ∧ 해당 모델 착석 ∧ executable일 때 모델당
+    정확히 1회 공시; 그 외에는 route가 기존과 동일. note는 registry key로
+    지칭한다 — 모델 id는 terminal-withholding invariant의 스캔 대상이다."""
+    marker = "may substitute another Claude model"
+    hit = _route_of(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                    blast_radius=3, reversibility=2, flags=["security_sensitive"])
+    assert hit["terminal"] is None or hit["requires_human_confirmation"]
+    if hit["terminal"] is None:
+        notes = [n for n in hit["notes"] if marker in n]
+        assert len(notes) == 1
+        assert "claude_architect" in notes[0]
+        assert "security_sensitive" in notes[0]
+        assert "claude-fable-5" not in json.dumps(hit["notes"])
+    # 같은 좌석, flag 없음 -> 공시 없음
+    miss = _route_of(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                     blast_radius=3, reversibility=1, flags=[])
+    assert not any(marker in n for n in miss["notes"])
+    # terminal + security_sensitive -> 공시 없음 (withholding과 정합)
+    terminal = _route_of(task_class="ARCHITECTURE", complexity=3, uncertainty=3,
+                         blast_radius=3, reversibility=2,
+                         flags=["security_sensitive", "bridge_down"],
+                         runtime="grok")
+    assert terminal["terminal"] == "INDEPENDENCE_UNAVAILABLE"
+    assert not any(marker in n for n in terminal["notes"])

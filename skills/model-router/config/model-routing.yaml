@@ -447,6 +447,13 @@ models:
     family: claude
     capability_tier: 3
     verified: true
+    # Provider-side substitution disclosure (see the 2026-08-19 ledger
+    # entry): flags listed here that a task carries produce a per-model
+    # note when this model is seated on an executable route. Values must
+    # be members of the flags vocabulary; biology-class substitution has
+    # no flag in this software-work router on purpose — the ledger owns
+    # that record (an intentional asymmetry, design §4 B5).
+    served_model_caveats: [security_sensitive]
     price_per_mtok: { input: 10.00, output: 50.00, cached_input: 1.00 }
 
   openai_worker_fast:
