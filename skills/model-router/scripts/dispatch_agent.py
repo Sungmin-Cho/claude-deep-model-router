@@ -91,6 +91,9 @@ VERDICT_RE = re.compile(r"^verdict:\s*(PASS|PASS_WITH_CHANGES|FAIL)\b", re.M)
 # separator or a traversal segment.
 ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+# 64-hex digest grammar for the linkage args a route hands to a dispatch.
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -230,6 +233,23 @@ def _new_receipt(args, stdout_path: Path, stderr_path: Path) -> dict:
         "model_id": args.model_id,
         "effort_native": args.effort_native,
         "permission_mode": args.permission_mode,
+        # Linkage back to the route decision (design §4 B2). All four are
+        # caller-supplied and null when absent — the supervisor probes
+        # nothing. model_id above is likewise the caller's DECLARED value:
+        # this supervisor never parses argv to cross-check it (transport-
+        # specific knowledge); the raw argv in this receipt is what an
+        # auditor checks it against.
+        "decision_fingerprint": args.decision_fingerprint,
+        "policy_sha256": args.policy_sha256,
+        "transport_id": args.transport_id,
+        "host_cli_version": args.host_cli_version,
+        # Requested vs served: no transport can observe the served model
+        # yet, so this pair stays at its defaults in this tranche. Contract
+        # (documented, unenforced until a producer exists): observed_model_id
+        # is null IFF observed_model_source == "unavailable"; the only
+        # source value this version defines is "unavailable".
+        "observed_model_id": None,
+        "observed_model_source": "unavailable",
         "argv": args.argv,
         "prompt_sha256": None,
         "output_schema": args.output_schema,
@@ -306,6 +326,12 @@ def cmd_run(args) -> int:
         print(f"--grace-seconds must be a finite number > 0, got "
               f"{args.grace_seconds!r}", file=sys.stderr)
         return 2
+    for name, value in (("--decision-fingerprint", args.decision_fingerprint),
+                        ("--policy-sha256", args.policy_sha256)):
+        if value is not None and not HEX64_RE.match(value):
+            print(f"{name} must be 64 lowercase hex chars, got {value!r}",
+                  file=sys.stderr)
+            return 2
 
     prompt_sha256 = None
     stdin_f = subprocess.DEVNULL
@@ -867,6 +893,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model-id", default=None)
     run.add_argument("--effort-native", default=None)
     run.add_argument("--permission-mode", default=None)
+    run.add_argument("--decision-fingerprint", default=None,
+                     help="route JSON's decision_fingerprint (64 lowercase hex)")
+    run.add_argument("--policy-sha256", dest="policy_sha256", default=None,
+                     help="route JSON's policy_sha256 (64 lowercase hex)")
+    run.add_argument("--transport-id", default=None,
+                     help="transports table path, e.g. claude_code.to_openai")
+    run.add_argument("--host-cli-version", default=None,
+                     help="caller-known CLI version; omit rather than probe")
     run.add_argument("--prompt-file", default=None,
                      help="fed to the child's stdin; omit for DEVNULL")
     run.add_argument("--output-schema", choices=["none", "review"],

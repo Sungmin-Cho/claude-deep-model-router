@@ -823,13 +823,18 @@ def test_cancel_of_a_stale_running_receipt_removes_the_claim_too(tmp_path):
 
 
 def _fake_receipt(tmp_path, attempt_id, seat, state, output_schema="review",
-                   schema_valid=True):
+                   schema_valid=True, model_id=None, decision_fingerprint=None):
     receipts = tmp_path / "receipts"
     receipts.mkdir(exist_ok=True)
     payload = {
         "attempt_id": attempt_id, "seat": seat,
         "result": {"state": state},
         "output_schema": output_schema,
+        # design §4 B2/B3 — the declared model and the decision this seat
+        # was dispatched under. Both null unless a test names them, which is
+        # exactly the shape a caller that passed neither arg produces.
+        "model_id": model_id,
+        "decision_fingerprint": decision_fingerprint,
     }
     if schema_valid is not None:
         payload["result"]["schema_valid"] = schema_valid
@@ -926,6 +931,9 @@ RECEIPT_KEYS = {
     "attempt_id", "seat", "runtime", "model_id", "effort_native",
     "permission_mode", "argv", "prompt_sha256", "output_schema",
     "process", "timing", "result",
+    # design §4 B2 — decision linkage and the requested-vs-served slots.
+    "decision_fingerprint", "policy_sha256", "transport_id",
+    "host_cli_version", "observed_model_id", "observed_model_source",
 }
 RECEIPT_PROCESS_KEYS = {"pid", "process_group_id", "supervisor_pid"}
 RECEIPT_TIMING_KEYS = {"started_at", "deadline_at", "finished_at"}
@@ -1002,3 +1010,38 @@ def test_a_route_can_be_dispatched_and_verified_end_to_end(tmp_path):
          "--isolation", "available", "--isolation-evidence", ",".join(ids)],
         capture_output=True, text=True, timeout=60)
     assert json.loads(routed_back.stdout)["review"]["review_independence"] == "enforced"
+
+
+def test_new_linkage_args_round_trip_into_the_receipt(tmp_path):
+    """design §4 B2: 네 caller-supplied 값은 그대로 receipt에 실리고,
+    observed 쌍은 이 트랜치에서 항상 기본값이다 (자리 확정 — unknown을
+    verified로 승격하는 경로는 없다)."""
+    fp, ps = "ab" * 32, "cd" * 32
+    fake = write_fake(tmp_path, "rt.py", HAPPY)
+    proc, receipt = run_dispatch(
+        tmp_path, [sys.executable, fake], attempt_id="rt1",
+        extra=["--decision-fingerprint", fp, "--policy-sha256", ps,
+               "--transport-id", "claude_code.to_openai",
+               "--host-cli-version", "codex 0.148.0"])
+    assert proc.returncode == 0, proc.stderr
+    assert receipt["decision_fingerprint"] == fp
+    assert receipt["policy_sha256"] == ps
+    assert receipt["transport_id"] == "claude_code.to_openai"
+    assert receipt["host_cli_version"] == "codex 0.148.0"
+    assert receipt["observed_model_id"] is None
+    assert receipt["observed_model_source"] == "unavailable"
+
+
+def test_malformed_digest_args_are_refused_pre_spawn(tmp_path):
+    """오타가 receipt에 영구 기록되기 전에 죽는다 — 비-hex, 대문자, 길이
+    오류 전부 exit 2이고 receipt는 만들어지지 않는다."""
+    fake = write_fake(tmp_path, "bad.py", HAPPY)
+    for i, bad in enumerate(("xyz", "AB" * 32, "ab" * 31)):
+        attempt = f"bad-{i}"
+        proc, receipt = run_dispatch(
+            tmp_path, [sys.executable, fake], attempt_id=attempt,
+            extra=["--decision-fingerprint", bad])
+        assert proc.returncode == 2, (bad, proc.stderr)
+        assert receipt is None, (
+            "a malformed digest must fail before any receipt exists")
+
