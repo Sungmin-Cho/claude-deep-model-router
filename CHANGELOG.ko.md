@@ -7,6 +7,12 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.2.1] — 2026-08-20 (balanced-seat 반복 측정)
+
+### 변경됨
+
+- worker_balanced 쌍(grok-4.6 vs sonnet-5)을 6개 멀티파일 태스크 × 3회 반복으로 재측정했다: 품질은 각각 15/18로 여전히 동률이고, 모든 태스크 유형에서 sonnet의 중앙값 지연이 더 낮아 latency-sensitive 라우팅 규칙은 이제 설계 후보가 됐다 — 구현하지 않았으며, 180K/230K 후속 셀(태스크 2개 × 1회 × 2모델)도 품질 동률이었다. 바인딩과 capability_tier는 변경 없음.
+
 ## [1.2.0] — 2026-08-19 (증거 연결)
 
 ### 추가됨
