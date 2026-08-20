@@ -127,14 +127,17 @@ bridge_down  termination_unconfirmed
 never the band:
 
 ```
-unfamiliar_codebase  cross_service_change  long_horizon  large_context  tool_heavy
+unfamiliar_codebase  cross_service_change  long_horizon  large_context
+latency_sensitive  tool_heavy
 ```
 
-`large_context` is the one the router itself acts on: it rebinds
-`worker_balanced` to `worker_balanced_alt`, a same-tier seat, because the
-primary's price doubles and its window runs out past 200K input tokens. Same
-band, same review, different model — which is exactly what a context flag is
-allowed to move.
+`large_context` and `latency_sensitive` are the two the router itself acts
+on: each rebinds `worker_balanced` to `worker_balanced_alt`, a same-tier
+seat. The first because the primary's price doubles and its window runs out
+past 200K input tokens; the second because a quality-tied measurement found
+the alt faster on wall-clock p50 in every probed task type. Same band, same
+review, different model — which is exactly what a context flag is allowed
+to move. Carrying both flags is the same swap, not a conflict.
 
 The distinction matters. Context flags describe the working conditions; letting
 them move the band would inflate risk assessments for tasks that are merely

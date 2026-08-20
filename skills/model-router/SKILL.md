@@ -70,7 +70,7 @@ elevating (each one has an observable effect — see the table below):
 
 context (inform decomposition and model choice, never the band):
   unfamiliar_codebase  cross_service_change  long_horizon
-  large_context  tool_heavy
+  large_context  latency_sensitive  tool_heavy
 
 operational (state of the runtime, not of the task):
   bridge_down  termination_unconfirmed
@@ -88,12 +88,12 @@ the system does not keep, so this table is enforced by test:
 | `unknown_root_cause` | effort `MAX`, worker promotion, confidence penalty |
 | `review_disagreement` | routes to the disagreement path and binds a judge |
 
-One context flag also has a deterministic effect, on the model rather than the
-band: `large_context` binds `worker_balanced` to `worker_balanced_alt`, because
-the primary seat's provider re-bills the whole request at double rate past 200K
-input tokens and its window ends earlier. Set it when the prompt, the retrieved
-context, or the files in scope plausibly reach that size —
-`references/model-profiles.md` carries the numbers.
+Two context flags also have a deterministic effect, on the model rather than
+the band: `large_context` and `latency_sensitive` each bind `worker_balanced`
+to `worker_balanced_alt`. The first is the caller's statement that the prompt
+is at or past the primary's 200K whole-request price line; the second, that
+first-escalation wall-clock latency outweighs output price. Numbers and the
+latency evidence: `references/model-profiles.md`.
 
 **`reasoning_centric`** — one boolean that decides between the two frontier
 roles:

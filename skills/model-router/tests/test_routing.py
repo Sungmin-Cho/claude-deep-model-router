@@ -480,11 +480,91 @@ def test_large_context_rule_is_actually_consumed():
     """A perturbation, not a read: delete the rule and the route must move
     back. `test_d14` only proves a key was looked at."""
     without = {**CFG, "worker_balanced_selection": {
-        k: v for k, v in SEL.items() if k != "prefer_alt_when_flag"}}
+        k: v for k, v in SEL.items() if k != "prefer_alt_when_flags"}}
     out = route(Task(task_class="REFACTORING", complexity=2, uncertainty=1,
                      blast_radius=1, reversibility=0, flags=["large_context"]),
                 without)
     assert out["selected_model"] == PRIMARY_ID
+
+
+def test_prefer_alt_when_flags_is_a_list_and_the_singular_key_is_gone():
+    """Two flags, one list. Keeping the old singular key beside it would be
+    two places holding one policy — the drift this config's header forbids."""
+    assert "prefer_alt_when_flag" not in SEL
+    assert isinstance(SEL["prefer_alt_when_flags"], list)
+    assert SEL["prefer_alt_when_flags"] == ["large_context", "latency_sensitive"]
+
+
+def test_latency_sensitive_moves_worker_balanced_to_the_alt_seat():
+    out = _balanced_task(flags=["latency_sensitive"])
+    assert out["selected_role"] == "worker_balanced"
+    assert out["selected_model"] == ALT_ID
+
+
+def test_latency_sensitive_swap_is_not_recorded_as_a_fallback():
+    """Nothing became unavailable — recording scarcity that did not happen is
+    the defect this module's docstring names first."""
+    out = _balanced_task(flags=["latency_sensitive"])
+    assert not [f for f in out["fallbacks_applied"] if "worker_balanced:" in f]
+    assert out["fallback_compensations_applied"] == []
+
+
+def test_latency_sensitive_falls_back_to_the_primary_when_the_alt_is_gone():
+    """With the alt unavailable the primary is the answer again — and THAT is a
+    real fallback, so it is recorded."""
+    out = _balanced_task(flags=["latency_sensitive"], unavailable_models=[ALT_ID])
+    assert out["selected_model"] == PRIMARY_ID
+    assert any("worker_balanced:" in f for f in out["fallbacks_applied"])
+
+
+def test_latency_sensitive_is_a_no_op_under_a_degraded_binding():
+    """`claude_only` names no alt seat, so there is nothing to prefer; the rule
+    must not invent one."""
+    a = _balanced_task(flags=["bridge_down"])
+    b = _balanced_task(flags=["bridge_down", "latency_sensitive"])
+    assert a["selected_model"] == b["selected_model"]
+
+
+def test_latency_sensitive_rule_is_actually_consumed():
+    """A perturbation, not a read: delete the list and the route must move
+    back. `test_d14` only proves a key was looked at."""
+    without = {**CFG, "worker_balanced_selection": {
+        k: v for k, v in SEL.items() if k != "prefer_alt_when_flags"}}
+    out = route(Task(task_class="REFACTORING", complexity=2, uncertainty=1,
+                     blast_radius=1, reversibility=0, flags=["latency_sensitive"]),
+                without)
+    assert out["selected_model"] == PRIMARY_ID
+
+
+def test_both_prefer_alt_flags_select_the_same_alt_seat():
+    """The two flags name the same swap. Carrying both is composition, not a
+    conflict, and still must not be recorded as scarcity."""
+    a = _balanced_task(flags=["large_context"])
+    b = _balanced_task(flags=["latency_sensitive"])
+    both = _balanced_task(flags=["large_context", "latency_sensitive"])
+    assert a["selected_model"] == ALT_ID
+    assert b["selected_model"] == ALT_ID
+    assert both["selected_model"] == ALT_ID
+    assert not [f for f in both["fallbacks_applied"] if "worker_balanced:" in f]
+
+
+def test_prefer_alt_flags_rebind_the_role_including_a_reviewer_seat():
+    """The flags rebind the `worker_balanced` ROLE, not a review-policy path.
+    A MEDIUM `worker_fast` implementer keeps its worker; the reviewer that
+    holds `worker_balanced` moves to the alt, and both flags do the same
+    swap. Reviewer-only latency preference would be a different rule."""
+    kw = dict(task_class="MECHANICAL", complexity=0, uncertainty=0,
+              blast_radius=1, reversibility=2)
+    base = r(**kw)
+    latency = r(**kw, flags=["latency_sensitive"])
+    large = r(**kw, flags=["large_context"])
+    assert base["selected_role"] == "worker_fast"
+    assert base["selected_model"] == latency["selected_model"] == large["selected_model"]
+    assert base["review"]["reviewers"] == ["worker_balanced"]
+    assert base["review"]["reviewer_models"] == [PRIMARY_ID]
+    assert latency["review"]["reviewer_models"] == [ALT_ID]
+    assert large["review"]["reviewer_models"] == [ALT_ID]
+    assert not [f for f in latency["fallbacks_applied"] if "worker_balanced:" in f]
 
 
 def test_long_context_pricing_is_recorded_where_the_price_is():
