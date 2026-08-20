@@ -1,0 +1,50 @@
+{
+  "schema_version": "1.0",
+  "envelope": {
+    "producer": "deep-loop",
+    "producer_version": "1.0.0",
+    "artifact_kind": "route-observation",
+    "run_id": "run-01",
+    "generated_at": "2026-08-20T10:00:00Z",
+    "schema": {"name": "route-observation", "version": "1.0"},
+    "git": {"head": "abcdef1", "branch": "main", "dirty": false},
+    "provenance": {
+      "source_artifacts": [{"path": "events/ep-01.json", "run_id": "run-01"}],
+      "tool_versions": {"deep-loop": "1.0.0"}
+    }
+  },
+  "payload": {
+    "contract": {"plugin": "deep-model-router", "observation_schema_version": 1},
+    "decision": {
+      "route_schema_version": 1,
+      "router_plugin_version": "1.3.0",
+      "policy_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "request_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "decision_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "linkage_quality": "full"
+    },
+    "subject": {
+      "producer": "deep-loop",
+      "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "artifact_id": "ep-01",
+      "subject_sha256": "a1a6ccd20d42089aa5bdacfba8e80f6176f785383be380961597e856b9d3966c",
+      "base_commit": null
+    },
+    "attempts": [{
+      "attempt_id": "att-1",
+      "evidence_kind": "dispatch_receipt",
+      "evidence_ref": {"path": "receipts/att-1.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+      "prompt_sha256": null,
+      "seat": "worker",
+      "seat_source": {"producer": "deep-loop", "value": "maker"},
+      "expected_model_id": null,
+      "observed_model_id": null,
+      "observed_model_source": "unavailable",
+      "runtime": "codex",
+      "transport_id": null,
+      "effort_native": null,
+      "state": "succeeded",
+      "state_source": {"producer": "deep-loop", "value": "SUCCEEDED"}
+    }]
+  }
+}
