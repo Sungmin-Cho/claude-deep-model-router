@@ -201,6 +201,13 @@ alt seat is itself unavailable the primary comes back, and that *is* recorded
 as a fallback. Under a degraded (single-provider) binding there is no alt seat
 to prefer and the rule is a no-op.
 
+The same alt-seat rule also fires for `latency_sensitive`. The 2026-08-20
+B.1 repeat eval (6 multi-file tasks × 3 reps) tied quality 15/18 each and
+recorded a lower Claude-balanced SUCCEEDED p50 in every task type. That is
+not a quality win for the alt; it is a latency fact at a quality tie, so a
+caller who values first-escalation wall-clock delay over output price can
+opt into the same swap. Bindings and `capability_tier` stay where they are.
+
 **Quality — probed 2026-08-18, tied at ceiling.** The same 446-node
 head-to-head scored the xai frontier model 446/446 and sonnet-5 445/446 — a
 tie at the suite's ceiling, one attempt per model (mean wall time: 103.2s for

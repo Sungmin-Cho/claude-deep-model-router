@@ -7,6 +7,12 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.3.0] — 2026-08-20 (latency-sensitive 바인딩)
+
+### 추가됨
+
+- `latency_sensitive`가 `large_context`와 같은 바인딩을 결정한다: 이 플래그가 붙은 작업은 `worker_balanced`를 Claude balanced 좌석으로 보낸다. 2026-08-20 B.1 반복 측정에서 품질은 15/18 동률이었고 모든 태스크 유형에서 sonnet 중앙값 지연이 더 낮았다. 기본 바인딩과 capability_tier는 변경 없음.
+
 ## [1.2.1] — 2026-08-20 (balanced-seat 반복 측정)
 
 ### 변경됨

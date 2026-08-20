@@ -289,7 +289,8 @@ def test_model_profiles_states_the_long_context_tier_the_config_records():
         assert f"${value:.2f}" in MODEL_PROFILES_MD, value
     assert f"{xai['context_window'] // 1000}K" in MODEL_PROFILES_MD
     sel = CFG["worker_balanced_selection"]
-    assert sel["prefer_alt_when_flag"] in MODEL_PROFILES_MD
+    for flag in sel["prefer_alt_when_flags"]:
+        assert flag in MODEL_PROFILES_MD
     assert sel["alt"] in MODEL_PROFILES_MD
 
 

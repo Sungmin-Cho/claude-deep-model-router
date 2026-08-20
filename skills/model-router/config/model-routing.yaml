@@ -102,6 +102,7 @@ flags:
     - cross_service_change
     - long_horizon
     - large_context
+    - latency_sensitive   # B.1 2026-08-20: quality tie 15/18, sonnet p50 lower in every type; binds worker_balanced to alt
     - tool_heavy
 
   # Operational state of the runtime, not a property of the task. `bridge_down`
@@ -507,7 +508,7 @@ models:
     # not just the tokens past the line. Recording only the first tier stated
     # the half of the price that makes this seat look unconditionally cheaper
     # than the claude balanced seat, which it is not: above the line it costs
-    # more on both axes. `worker_balanced_selection.prefer_alt_when_flag` is
+    # more on both axes. `worker_balanced_selection.prefer_alt_when_flags` is
     # the rule that acts on this; see also `context_window`.
     price_per_mtok:
       input: 2.00
@@ -581,17 +582,24 @@ worker_balanced_selection:
   prefer: worker_balanced
   alt:    worker_balanced_alt
   use_alt_when: worker_balanced_unavailable
-  # The one deterministic fact that moves this binding. Below 200K input tokens
-  # the primary seat ties on input price and wins on output; at or above it,
-  # xAI re-bills the whole request at $4.00/$12.00 and the primary loses on
-  # BOTH axes while running out of window 500K earlier than the alt. A flag is
-  # the caller's statement about which side of that line this route is on —
-  # the router never sees a token count.
+  # Deterministic facts that move this binding to the alt seat. Any flag in
+  # the list is enough; carrying more than one is the same swap, not a
+  # conflict. Below 200K input tokens the primary seat ties on input price
+  # and wins on output; at or above it, xAI re-bills the whole request at
+  # $4.00/$12.00 and the primary loses on BOTH axes while running out of
+  # window 500K earlier than the alt. `large_context` is the caller's
+  # statement about which side of that line this route is on — the router
+  # never sees a token count. `latency_sensitive` is the caller's statement
+  # that first-escalation wall-clock latency outweighs output price; the
+  # 2026-08-20 B.1 repeat eval tied quality 15/18 and recorded a lower
+  # sonnet SUCCEEDED p50 in every task type. Neither is a quality win.
   #
   # This is a binding choice, not a fallback: the primary is available and the
   # resolver must not record it as though scarcity had struck. If the alt is
   # itself unavailable the primary comes back, and THAT is recorded.
-  prefer_alt_when_flag: large_context
+  prefer_alt_when_flags:
+    - large_context
+    - latency_sensitive
 
 # ---------------------------------------------------------------------------
 # Runtime adapters
@@ -872,14 +880,15 @@ verification_ledger:
         worker_balanced repeat eval entry): grok 15/18 vs sonnet 15/18
         clean-pass, tied; cfggraph 0/3 both on the same
         test_absolute_entry miss; sonnet SUCCEEDED p50 lower in all
-        three types. The latency-sensitive routing rule is a
-        design-session candidate, not shipped. No quality regression
+        three types. At probe time the latency-sensitive routing
+        rule was a design-session candidate, not shipped; 1.3.0
+        ships it as `prefer_alt_when_flags`. No quality regression
         detected against the claimed frontier tier; a single suite at
         ceiling is not grounds to raise capability_tier, which stays 1
         (raising it to 2 would move MEDIUM's reviewer floor — a band
         change). The output-price advantage holds BELOW 200K input tokens
         only; see the long-context tier entry above, which is why
-        `worker_balanced_selection.prefer_alt_when_flag` exists.
+        `worker_balanced_selection.prefer_alt_when_flags` exists.
 
     - item: "Tier 0/1 binding quality head-to-head (8 tasks, 446 hidden test nodes)"
       status: verified
@@ -920,9 +929,10 @@ verification_ledger:
         debugging 102 vs 143, refactor 104 vs 139). Timeout rate 3/36 (all
         grok cfggraph). Three TERMINATION_UNCONFIRMED receipts from the host
         bash 10-minute cap killing the supervisor; workdirs still graded.
-        Bindings and capability_tier unchanged. Latency-rule verdict:
-        도입 제안 (design session for latency_sensitive → sonnet; not
-        implemented here). Full writeup is the local research note
+        Bindings and capability_tier unchanged. Latency-rule verdict
+        at probe time: 도입 제안 (design session for latency_sensitive
+        → sonnet; not implemented in this probe). Shipped in 1.3.0 as
+        `prefer_alt_when_flags`. Full writeup is the local research note
         docs/research/2026-08-20-b1-balanced-seat-repeat-eval.md.
 
         User-approved long-context follow-up (same transports, 540s

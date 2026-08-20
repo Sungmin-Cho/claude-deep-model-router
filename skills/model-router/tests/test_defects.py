@@ -1055,7 +1055,8 @@ DOCUMENTED_BUT_UNREAD.update({
         ("context_window", "documentation of the seat's limit; the router counts "
                            "no tokens, so it cannot compare against it. The one "
                            "decision this number drives is expressed as the "
-                           "`large_context` rule in worker_balanced_selection"),
+                           "`large_context` / `latency_sensitive` rule in "
+                           "worker_balanced_selection"),
     )
     if leaf in model
 })
@@ -1146,10 +1147,11 @@ def test_d14_every_config_rule_has_a_consumer_or_a_recorded_reason():
                   # Context flags reach effort and binding leaves nothing else
                   # does: `cross_service_change` is the only route to
                   # `effort_by_work.multi_system_refactoring`, and
-                  # `large_context` the only route to the alt-seat rule. Both
-                  # were invisible while the subtrees holding them were excused
-                  # wholesale.
-                  ["cross_service_change"], ["large_context"])
+                  # `large_context` / `latency_sensitive` are the routes to
+                  # the alt-seat rule. Both were invisible while the subtrees
+                  # holding them were excused wholesale.
+                  ["cross_service_change"], ["large_context"],
+                  ["latency_sensitive"])
         for rt in sorted(CFG["runtimes"])
         for pf, pm in ((0, []), (1, ["senior_engineer"]), (2, []), (5, []))
         for um in ([], ["claude-fable-5"], ["claude-opus-5", "gpt-5.6-sol"])

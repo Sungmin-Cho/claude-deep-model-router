@@ -1250,12 +1250,13 @@ class Resolver:
         """The registry key this role binds to FOR THIS TASK.
 
         `worker_balanced_selection` moves the first escalation to its alt seat
-        when the task carries the configured flag: the primary seat's provider
+        when the task carries any configured flag: the primary seat's provider
         re-bills the entire request at a doubled rate past a context threshold
         and its window ends earlier, so above that line the cheaper seat is the
-        more expensive one. The threshold is a token count the router never
-        sees; the flag is the caller's statement about which side of it this
-        route is on.
+        more expensive one; separately, a quality-tied latency measurement can
+        make the alt the faster same-tier seat. The threshold is a token count
+        the router never sees; each flag is the caller's statement about which
+        side of that comparison this route is on.
 
         It is a binding decision and not a fallback, which is why it lives here
         rather than in the candidate ladder alone: `resolve` compares what was
@@ -1263,8 +1264,10 @@ class Resolver:
         policy made on purpose must not be reported as a model going missing.
         """
         sel = self.policy.cfg.get("worker_balanced_selection") or {}
-        flag = sel.get("prefer_alt_when_flag")
-        if flag and role == sel.get("prefer") and self.task.has(flag):
+        flags = sel.get("prefer_alt_when_flags") or []
+        if (role == sel.get("prefer")
+                and isinstance(flags, list)
+                and any(self.task.has(f) for f in flags)):
             # A degraded binding names no alt seat. Nothing to prefer, so the
             # rule is a no-op there rather than an invented substitution.
             if (alt := self.binding.get(sel.get("alt"))):
