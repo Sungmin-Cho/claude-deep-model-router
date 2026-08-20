@@ -7,6 +7,10 @@ __pycache__/
 .deep-docs/
 .deep-evolve/
 .deep-dashboard/
+# deep-loop runtime (runs, insights, event-log) and convention worktrees — never committed.
+.deep-loop/
+.worktrees/
+.claude/worktrees/
 
 # Development docs (specs, plans, handoffs, backlog) — local-only.
 # Re-include published consumer contracts with ! exceptions.
