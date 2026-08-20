@@ -731,7 +731,7 @@ fallback_compensations:
 # building on sand. Do not promote a row without running the probe.
 
 verification_ledger:
-  probed_on: 2026-08-19
+  probed_on: 2026-08-20
   entries:
     - item: "Claude model ids (haiku-4-5-20251001, sonnet-5, opus-5, fable-5)"
       status: verified
@@ -859,7 +859,7 @@ verification_ledger:
 
     - item: "worker_balanced binding: grok-4.6 over claude-sonnet-5"
       status: price_verified_quality_probed
-      probed_on: 2026-08-18
+      probed_on: 2026-08-20
       evidence: >
         PRICE: verified from published rates — grok-4.6 $2.00/$6.00 per MTok
         vs sonnet-5 $2.00/$10.00. Anthropic made Sonnet 5's $2/$10
@@ -868,13 +868,18 @@ verification_ledger:
         now equal; output remains cheaper on grok-4.6. QUALITY: probed
         2026-08-18 (see the head-to-head entry below): grok-4.6 446/446 vs
         sonnet-5 445/446 — tied at the suite's ceiling, one attempt per
-        model. No quality regression detected against the claimed frontier
-        tier; a single suite at ceiling is not grounds to raise
-        capability_tier, which stays 1 (raising it to 2 would move MEDIUM's
-        reviewer floor — a band change). The output-price advantage holds
-        BELOW 200K input tokens only; see the long-context tier entry
-        above, which is why `worker_balanced_selection.prefer_alt_when_flag`
-        exists.
+        model. Repeated 2026-08-20 (6 tasks × 3 reps; see the
+        worker_balanced repeat eval entry): grok 15/18 vs sonnet 15/18
+        clean-pass, tied; cfggraph 0/3 both on the same
+        test_absolute_entry miss; sonnet SUCCEEDED p50 lower in all
+        three types. The latency-sensitive routing rule is a
+        design-session candidate, not shipped. No quality regression
+        detected against the claimed frontier tier; a single suite at
+        ceiling is not grounds to raise capability_tier, which stays 1
+        (raising it to 2 would move MEDIUM's reviewer floor — a band
+        change). The output-price advantage holds BELOW 200K input tokens
+        only; see the long-context tier entry above, which is why
+        `worker_balanced_selection.prefer_alt_when_flag` exists.
 
     - item: "Tier 0/1 binding quality head-to-head (8 tasks, 446 hidden test nodes)"
       status: verified
@@ -896,6 +901,29 @@ verification_ledger:
         a non-ASCII digit in semver (1). Mean per-task wall time: luna
         19.6s, sonnet-5 38.6s, haiku 91.2s, grok-4.6 103.2s. Bindings and
         every capability_tier are unchanged by this probe.
+
+    - item: "worker_balanced repeat eval"
+      status: verified
+      probed_on: 2026-08-20
+      evidence: >
+        Repeat head-to-head of the worker_balanced pair (grok-4.6 @ high vs
+        claude-sonnet-5 @ high), 6 spec-dense multi-file tasks × 3 reps = 36
+        dispatches under dispatch_agent.py (deadline 540s, grace 15s). Task
+        types: multi-file implementation (kvtxn, cfggraph), debugging
+        (journal, jobsched), tool-heavy refactor (splitpkg, ports). Grading:
+        hidden pytest, task-level clean pass, suites admitted only after
+        reference 100%. Quality: both models 15/18 (kvtxn/journal/jobsched/
+        splitpkg/ports 3/3 each; cfggraph 0/3 each — all six attempts failed
+        the same test, test_extends.py::test_absolute_entry). SUCCEEDED wall
+        p50 (TERMINATION_UNCONFIRMED excluded): sonnet 122s (n=17) vs grok
+        150s (n=13). Per type sonnet p50 < grok p50 (multi-file 223 vs 368,
+        debugging 102 vs 143, refactor 104 vs 139). Timeout rate 3/36 (all
+        grok cfggraph). Three TERMINATION_UNCONFIRMED receipts from the host
+        bash 10-minute cap killing the supervisor; workdirs still graded.
+        Bindings and capability_tier unchanged. Latency-rule verdict:
+        도입 제안 (design session for latency_sensitive → sonnet; not
+        implemented here). Full writeup is the local research note
+        docs/research/2026-08-20-b1-balanced-seat-repeat-eval.md.
 
     - item: "OpenAI GPT-5.6 long-context pricing tier (272K, exclusive)"
       status: verified
