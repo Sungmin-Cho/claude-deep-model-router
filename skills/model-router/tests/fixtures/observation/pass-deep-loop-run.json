@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0",
+  "envelope": {
+    "producer": "deep-loop",
+    "producer_version": "1.0.0",
+    "artifact_kind": "route-observation",
+    "run_id": "run-01",
+    "generated_at": "2026-08-20T10:00:00Z",
+    "schema": {"name": "route-observation", "version": "1.0"},
+    "git": {"head": "abcdef1", "branch": "main", "dirty": false},
+    "provenance": {"source_artifacts": [], "tool_versions": {}}
+  },
+  "payload": {
+    "contract": {"plugin": "deep-model-router", "observation_schema_version": 1},
+    "decision": {
+      "route_schema_version": null,
+      "router_plugin_version": null,
+      "policy_sha256": null,
+      "request_sha256": null,
+      "decision_fingerprint": null,
+      "linkage_quality": "none"
+    },
+    "subject": {
+      "producer": "deep-loop",
+      "run_id": "run-01",
+      "artifact_id": "run",
+      "subject_sha256": "a65727dc1104e793736529a1a5cf88dc85d49cbecfc6d5d554434a1b18bc32a5",
+      "base_commit": null
+    },
+    "attempts": [],
+    "final": {
+      "implementation_attempts": {
+        "slices_total": 1,
+        "rework_total": 0,
+        "test_retries": 0,
+        "episodes_done": 2
+      }
+    }
+  }
+}

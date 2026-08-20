@@ -146,6 +146,22 @@ def test_skill_md_points_at_the_dispatch_layer():
     assert "background" in frontmatter
 
 
+def test_skill_md_points_at_observation_contract():
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert "references/observation.md" in text
+
+
+def test_observation_md_invokes_validator_skill_dir_prefixed():
+    path = SKILL / "references" / "observation.md"
+    assert path.is_file()
+    text = path.read_text(encoding="utf-8")
+    assert not re.search(r"python3 scripts/validate_observation\.py", text)
+    assert 'python3 "$SKILL_DIR/scripts/validate_observation.py"' in text
+    assert "--root" in text
+    assert "--check-refs" in text
+    assert "--check-receipts" in text
+
+
 # ---------------------------------------------------------------------------
 # B6 / B7 / B8 — the documents' tables and lists are compared to the config
 # cell by cell, not by substring

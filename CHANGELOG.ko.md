@@ -7,6 +7,12 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.4.0] — 2026-08-20 (RouteObservationV1)
+
+### 추가됨
+
+- RouteObservationV1 레코드 검증기: 관측 스키마를 검사하고, 원문 산출물을 복사하지 않은 채 참조 파일과 dispatch receipt를 확인할 수 있다.
+
 ## [1.3.0] — 2026-08-20 (latency-sensitive 바인딩)
 
 ### 추가됨

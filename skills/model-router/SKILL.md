@@ -571,6 +571,7 @@ Read these when the situation calls for them; not needed for a routine route.
   model is unavailable, before a background dispatch, or when you cross the bridge.
 - **`references/examples.md`** — worked routing decisions, including the four cases an
   earlier version of this policy got wrong.
+- **`references/observation.md`** — RouteObservationV1 (`validate_observation.py`).
 
 Configuration lives in `config/model-routing.yaml`. Model identifiers appear
 there and nowhere else — when models or prices change, update the registry and
