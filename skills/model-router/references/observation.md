@@ -1,6 +1,15 @@
 # RouteObservationV1
 
-`RouteObservationV1` is the schema and validator contract owned by `deep-model-router`; orchestrators emit observation records, while this plugin validates them and does not emit, store, aggregate, or route observations. Invoke it with `python3 "$SKILL_DIR/scripts/validate_observation.py" --file <obs.json> --root <dir>`; exit `0` means valid, `1` means the record violates an invariant, and `2` means invalid usage. The validator enforces I-JSON, I-STRUCT, I-CONTRACT, I-ACCEPTED, I-OWNER, I-NO-RAW-KEYS, I-STRING, I-NO-DIFF, I-SIZE, I-SUBJECT, I-GRAIN, I-LINK, I-OBS-MODEL, I-ATTEMPT, I-DIGEST, I-GATES, I-REFS, and I-RECEIPTS.
+`RouteObservationV1` is the schema and validator contract owned by `deep-model-router`; orchestrators emit observation records, while this plugin validates them and does not emit, store, aggregate, or route observations. Invoke it with:
+
+```
+python3 "$SKILL_DIR/scripts/validate_observation.py" --file <obs.json> --root <dir>
+python3 "$SKILL_DIR/scripts/validate_observation.py" --file <obs.json> --root <dir> --check-refs
+python3 "$SKILL_DIR/scripts/validate_observation.py" --file <obs.json> --root <dir> \
+    --check-refs --check-receipts <receipt-dir>
+```
+
+Exit `0` means valid, `1` means the record violates an invariant, and `2` means invalid usage. `--check-receipts` requires `--check-refs`. The validator enforces I-JSON, I-STRUCT, I-CONTRACT, I-ACCEPTED, I-OWNER, I-NO-RAW-KEYS, I-STRING, I-NO-DIFF, I-SIZE, I-SUBJECT, I-GRAIN, I-LINK, I-OBS-MODEL, I-ATTEMPT, I-DIGEST, I-GATES, I-REFS, and I-RECEIPTS.
 
 Worked subject hashes:
 

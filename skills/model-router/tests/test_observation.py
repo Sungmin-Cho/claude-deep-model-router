@@ -1,7 +1,9 @@
 """RouteObservationV1 contract and validator-core tests."""
 
 import copy
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -304,3 +306,201 @@ def test_i_root_required(tmp_path):
     result = subprocess.run([sys.executable, str(SCRIPT), "--file", str(path)],
                             capture_output=True, text=True)
     assert result.returncode == 2
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _run_cli(obs, root, *extra):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--file", str(obs), "--root", str(root), *extra],
+        capture_output=True, text=True,
+    )
+
+
+def _materialize(tmp_path, document, files):
+    root = tmp_path / "root"
+    root.mkdir()
+    for rel, data in files.items():
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    obs = tmp_path / "obs.json"
+    obs.write_text(json.dumps(document), encoding="utf-8")
+    return obs, root
+
+
+def _with_digest(document, rel, digest):
+    document["envelope"]["provenance"]["source_artifacts"].append({"path": rel})
+    document["payload"].setdefault("artifact_digests", []).append(
+        {"path": rel, "sha256": digest})
+    return document
+
+
+def _receipt_bytes(attempt_id="att-1", fingerprint="f" * 64, prompt=None, policy="a" * 64):
+    body = {
+        "attempt_id": attempt_id,
+        "decision_fingerprint": fingerprint,
+        "prompt_sha256": prompt,
+        "policy_sha256": policy,
+        "result": {"stdout_path": "stdout.txt"},
+    }
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
+def test_i_refs_root_escape_dotdot(tmp_path):
+    doc = _with_digest(_load(), "../outside", "0" * 64)
+    obs, root = _materialize(tmp_path, doc, {})
+    result = _run_cli(obs, root, "--check-refs")
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_refs_absolute_path_outside_root(tmp_path):
+    doc = _with_digest(_load(), "/etc/passwd", "0" * 64)
+    obs, root = _materialize(tmp_path, doc, {})
+    result = _run_cli(obs, root, "--check-refs")
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_refs_leaf_symlink(tmp_path):
+    data = b"leaf-target"
+    doc = _with_digest(_load(), "link.txt", _sha(data))
+    obs, root = _materialize(tmp_path, doc, {"real.txt": data})
+    os.symlink(root / "real.txt", root / "link.txt")
+    result = _run_cli(obs, root, "--check-refs")
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_refs_intermediate_symlink(tmp_path):
+    data = b"nested"
+    doc = _with_digest(_load(), "alias/file.txt", _sha(data))
+    obs, root = _materialize(tmp_path, doc, {"real/file.txt": data})
+    os.symlink(root / "real", root / "alias")
+    result = _run_cli(obs, root, "--check-refs")
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_receipts_evidence_path_mismatch(tmp_path):
+    raw = _receipt_bytes()
+    doc = _load()
+    doc["payload"]["attempts"][0]["evidence_ref"] = {
+        "path": "receipts/wrong.json", "sha256": _sha(raw)}
+    obs, root = _materialize(tmp_path, doc, {
+        "receipts/wrong.json": raw,
+        "receipts/att-1.json": raw,
+    })
+    result = _run_cli(obs, root, "--check-refs", "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_receipts_attempt_id_field_mismatch(tmp_path):
+    raw = _receipt_bytes(attempt_id="other")
+    doc = _load()
+    doc["payload"]["attempts"][0]["evidence_ref"] = {
+        "path": "receipts/att-1.json", "sha256": _sha(raw)}
+    obs, root = _materialize(tmp_path, doc, {"receipts/att-1.json": raw})
+    result = _run_cli(obs, root, "--check-refs", "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_receipts_full_fingerprint_null(tmp_path):
+    raw = _receipt_bytes(fingerprint=None)
+    doc = _load()
+    doc["payload"]["attempts"][0]["evidence_ref"] = {
+        "path": "receipts/att-1.json", "sha256": _sha(raw)}
+    obs, root = _materialize(tmp_path, doc, {"receipts/att-1.json": raw})
+    result = _run_cli(obs, root, "--check-refs", "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_receipts_prompt_sha_mismatch(tmp_path):
+    raw = _receipt_bytes(prompt="c" * 64)
+    doc = _load()
+    doc["payload"]["attempts"][0]["prompt_sha256"] = "d" * 64
+    doc["payload"]["attempts"][0]["evidence_ref"] = {
+        "path": "receipts/att-1.json", "sha256": _sha(raw)}
+    obs, root = _materialize(tmp_path, doc, {"receipts/att-1.json": raw})
+    result = _run_cli(obs, root, "--check-refs", "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_receipts_does_not_read_stdout(tmp_path):
+    raw = _receipt_bytes()
+    doc = _load()
+    doc["payload"]["attempts"][0]["evidence_ref"] = {
+        "path": "receipts/att-1.json", "sha256": _sha(raw)}
+    obs, root = _materialize(tmp_path, doc, {
+        "receipts/att-1.json": raw,
+        "stdout.txt": b"diff --git a/secret b/secret\n@@ -1,1 +1,1 @@\n",
+    })
+    result = _run_cli(obs, root, "--check-refs", "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 0, result.stderr
+
+
+def test_i_receipts_identity_only_policy_null_ok(tmp_path):
+    raw = _receipt_bytes(fingerprint=None, policy=None)
+    doc = _load("pass-identity-only")
+    attempt = copy.deepcopy(_load()["payload"]["attempts"][0])
+    attempt["evidence_ref"] = {"path": "receipts/att-1.json", "sha256": _sha(raw)}
+    doc["payload"]["attempts"] = [attempt]
+    obs, root = _materialize(tmp_path, doc, {"receipts/att-1.json": raw})
+    result = _run_cli(obs, root, "--check-refs", "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 0, result.stderr
+
+
+def test_i_refs_digest_mismatch(tmp_path):
+    data = b"actual-bytes"
+    doc = _with_digest(_load(), "blob.bin", "0" * 64)
+    obs, root = _materialize(tmp_path, doc, {"blob.bin": data})
+    result = _run_cli(obs, root, "--check-refs")
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_receipts_sha256_mismatch(tmp_path):
+    raw = _receipt_bytes()
+    doc = _load()
+    doc["payload"]["attempts"][0]["evidence_ref"] = {
+        "path": "receipts/att-1.json", "sha256": "0" * 64}
+    obs, root = _materialize(tmp_path, doc, {"receipts/att-1.json": raw})
+    result = _run_cli(obs, root, "--check-refs", "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_refs_file_over_8mib(tmp_path):
+    data = b"x" * (8 * 1024 * 1024 + 1)
+    doc = _with_digest(_load(), "big.bin", _sha(data))
+    obs, root = _materialize(tmp_path, doc, {"big.bin": data})
+    result = _run_cli(obs, root, "--check-refs")
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_refs_duplicate_digest_path(tmp_path):
+    data = b"dup"
+    digest = _sha(data)
+    doc = _with_digest(_load(), "dup.bin", digest)
+    doc["payload"]["artifact_digests"].append({"path": "dup.bin", "sha256": digest})
+    obs, root = _materialize(tmp_path, doc, {"dup.bin": data})
+    result = _run_cli(obs, root, "--check-refs")
+    assert result.returncode == 1, result.stderr
+
+
+def test_i_check_receipts_requires_check_refs(tmp_path):
+    doc = _load()
+    obs, root = _materialize(tmp_path, doc, {})
+    result = _run_cli(obs, root, "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 2, result.stderr
+
+
+def test_i_check_receipts_skips_none_and_producer_record(tmp_path):
+    doc = _load("pass-native-none-attempt")
+    producer = copy.deepcopy(doc["payload"]["attempts"][0])
+    producer.update(
+        evidence_kind="producer_record",
+        attempt_id="producer-1",
+        evidence_ref={"path": "records/missing.json", "sha256": "e" * 64},
+    )
+    doc["payload"]["attempts"].append(producer)
+    obs, root = _materialize(tmp_path, doc, {})
+    result = _run_cli(obs, root, "--check-refs", "--check-receipts", str(root / "receipts"))
+    assert result.returncode == 0, result.stderr

@@ -158,8 +158,8 @@ def test_observation_md_invokes_validator_skill_dir_prefixed():
     assert not re.search(r"python3 scripts/validate_observation\.py", text)
     assert 'python3 "$SKILL_DIR/scripts/validate_observation.py"' in text
     assert "--root" in text
-    assert "--check-refs" not in text
-    assert "--check-receipts" not in text
+    assert "--check-refs" in text
+    assert "--check-receipts" in text
 
 
 # ---------------------------------------------------------------------------

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Validate a RouteObservationV1 JSON record.
 
-CLI (Task 1): --file and --root are required. Unknown flags are argparse
-usage errors (exit 2). Invariant failures exit 1. The record is never
-modified. --check-refs / --check-receipts are added in a later task.
+CLI: --file and --root are required. Invariant failures exit 1. Usage
+errors (missing --root, --check-receipts without --check-refs) exit 2.
+The record is never modified and raw producer files are never copied in.
 """
 
 from __future__ import annotations
@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -28,6 +30,7 @@ DIFF_HUNK_RE = re.compile(r"(?m)^@@ -[0-9]+")
 DIFF_GIT_RE = re.compile(r"(?m)^diff --git ")
 
 MAX_FILE_BYTES = 32 * 1024
+MAX_REF_BYTES = 8 * 1024 * 1024
 FORBIDDEN_KEYS = frozenset({
     "git_diff", "stdout", "stderr", "report_body", "prompt",
     "task_description", "changes", "diff", "body", "output_text",
@@ -739,23 +742,169 @@ def validate(document, root=None):
     return document
 
 
-def validate_path(file_path: Path, root: Path):
+def _split_rel(rel):
+    if not isinstance(rel, str) or rel == "" or "\x00" in rel:
+        raise ValidateError("I-REFS: empty or NUL path")
+    if rel.startswith("/") or rel.startswith("\\"):
+        raise ValidateError("I-REFS: absolute path")
+    parts = []
+    for part in rel.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ValidateError("I-REFS: path escapes root")
+        parts.append(part)
+    if not parts:
+        raise ValidateError("I-REFS: empty path")
+    return parts
+
+
+def _hash_fd(fd, size):
+    digest = hashlib.sha256()
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        digest.update(chunk)
+        remaining -= len(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def open_under_root(root, rel):
+    """Open `rel` under `root` with O_NOFOLLOW. Caller owns the returned fd."""
+    parts = _split_rel(rel)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    root_fd = os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY)
+    owned = [root_fd]
+    try:
+        current = root_fd
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            try:
+                nxt = os.open(part, file_flags if last else dir_flags, dir_fd=current)
+            except OSError as exc:
+                raise ValidateError(f"I-REFS: cannot open {part!r}: {exc.strerror}") from exc
+            owned.append(nxt)
+            st = os.fstat(nxt)
+            if last:
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValidateError("I-REFS: not a regular file")
+                if st.st_size > MAX_REF_BYTES:
+                    raise ValidateError("I-REFS: file exceeds 8MiB")
+                digest = _hash_fd(nxt, st.st_size)
+                owned.remove(nxt)
+                return nxt, st, digest
+            if not stat.S_ISDIR(st.st_mode):
+                raise ValidateError("I-REFS: intermediate not a directory")
+            current = nxt
+        raise ValidateError("I-REFS: empty path")
+    finally:
+        for fd in owned:
+            os.close(fd)
+
+
+def _check_refs(document, root):
+    digests = (document.get("payload") or {}).get("artifact_digests") or []
+    for item in digests:
+        fd, _st, digest = open_under_root(root, item["path"])
+        try:
+            if digest != item["sha256"]:
+                raise ValidateError("I-REFS: digest mismatch")
+        finally:
+            os.close(fd)
+
+
+def _receipt_field(receipt, key):
+    if not isinstance(receipt, dict):
+        return None
+    if key in receipt:
+        return receipt[key]
+    result = receipt.get("result")
+    if isinstance(result, dict) and key in result:
+        return result[key]
+    return None
+
+
+def _check_receipts(document, root, receipts_dir):
+    payload = document["payload"]
+    decision = payload["decision"]
+    quality = decision["linkage_quality"]
+    for attempt in payload.get("attempts") or []:
+        if attempt.get("evidence_kind") != "dispatch_receipt":
+            continue
+        ref = attempt["evidence_ref"]
+        attempt_id = attempt["attempt_id"]
+        rel = ref["path"]
+        base = rel.rsplit("/", 1)[-1]
+        if base != f"{attempt_id}.json":
+            raise ValidateError("I-RECEIPTS: evidence_ref basename must be {attempt_id}.json")
+        fd1, st1, digest1 = open_under_root(root, rel)
+        try:
+            if digest1 != ref["sha256"]:
+                raise ValidateError("I-RECEIPTS: evidence_ref.sha256 mismatch")
+            fd2, st2, _digest2 = open_under_root(receipts_dir, f"{attempt_id}.json")
+            try:
+                if (st1.st_dev, st1.st_ino) != (st2.st_dev, st2.st_ino):
+                    raise ValidateError("I-RECEIPTS: receipt is not the evidence_ref file")
+                raw = os.read(fd2, st2.st_size)
+                try:
+                    receipt = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValidateError(f"I-RECEIPTS: receipt is not JSON: {exc.msg}") from exc
+                if _receipt_field(receipt, "attempt_id") != attempt_id:
+                    raise ValidateError("I-RECEIPTS: receipt attempt_id mismatch")
+                rec_fp = _receipt_field(receipt, "decision_fingerprint")
+                rec_policy = _receipt_field(receipt, "policy_sha256")
+                rec_prompt = _receipt_field(receipt, "prompt_sha256")
+                if quality == "full":
+                    if rec_fp is None or rec_fp != decision["decision_fingerprint"]:
+                        raise ValidateError("I-RECEIPTS: full fingerprint mismatch")
+                elif quality == "identity_only":
+                    if rec_policy is not None and rec_policy != decision["policy_sha256"]:
+                        raise ValidateError("I-RECEIPTS: identity_only policy mismatch")
+                obs_prompt = attempt.get("prompt_sha256")
+                if rec_prompt != obs_prompt:
+                    raise ValidateError("I-RECEIPTS: prompt_sha256 mismatch")
+            finally:
+                os.close(fd2)
+        finally:
+            os.close(fd1)
+
+
+def validate_path(file_path: Path, root: Path, *, check_refs=False, check_receipts=None):
     document = _load(file_path)
-    return validate(document, root=root)
+    validate(document, root=root)
+    if check_refs:
+        _check_refs(document, root)
+    if check_receipts is not None:
+        _check_receipts(document, root, check_receipts)
+    return document
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="validate_observation.py")
     parser.add_argument("--file", required=True)
     parser.add_argument("--root", required=True)
+    parser.add_argument("--check-refs", action="store_true")
+    parser.add_argument("--check-receipts", default=None)
     args = parser.parse_args(argv)
+    if args.check_receipts is not None and not args.check_refs:
+        print("usage: --check-receipts requires --check-refs", file=sys.stderr)
+        return 2
     try:
-        validate_path(Path(args.file), Path(args.root))
+        validate_path(
+            Path(args.file), Path(args.root),
+            check_refs=args.check_refs,
+            check_receipts=args.check_receipts,
+        )
     except ValidateError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except OSError as exc:
-        print(f"I-JSON: {exc}", file=sys.stderr)
+        print(f"I-REFS: {exc}", file=sys.stderr)
         return 1
     return 0
 
